@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
-from agentic_os.domain.models import Artifact, AuditEvent, Goal, Run, Task
+from agentic_os.domain.models import Artifact, AuditEvent, CostLedgerEntry, Goal, Run, Task
 
 router = APIRouter(tags=["state"])
 
@@ -68,6 +68,21 @@ class AuditEventRead(BaseModel):
     event_type: str
     payload: dict
     occurred_at: datetime
+
+
+class CostLedgerEntryRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    budget_id: uuid.UUID | None
+    run_id: uuid.UUID | None
+    action_type: str
+    reserved_amount_minor_units: int
+    actual_amount_minor_units: int | None
+    currency: str
+    is_zero_cost: bool
+    status: str
+    created_at: datetime
 
 
 @router.get("/goals/{goal_id}/tasks", response_model=list[TaskRead])
@@ -149,4 +164,20 @@ def list_audit_events(
     if run_id is not None:
         stmt = stmt.where(AuditEvent.run_id == run_id)
     stmt = stmt.order_by(AuditEvent.sequence_number).limit(limit)
+    return list(session.execute(stmt).scalars())
+
+
+@router.get("/cost-ledger-entries", response_model=list[CostLedgerEntryRead])
+def list_cost_ledger_entries(
+    run_id: uuid.UUID | None = None,
+    budget_id: uuid.UUID | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    session: Session = Depends(get_session),
+) -> list[CostLedgerEntry]:
+    stmt = select(CostLedgerEntry)
+    if run_id is not None:
+        stmt = stmt.where(CostLedgerEntry.run_id == run_id)
+    if budget_id is not None:
+        stmt = stmt.where(CostLedgerEntry.budget_id == budget_id)
+    stmt = stmt.order_by(CostLedgerEntry.created_at).limit(limit)
     return list(session.execute(stmt).scalars())

@@ -154,7 +154,7 @@ class ApiWorkflowTests(unittest.TestCase):
 
     def test_state_inspection_reads_persisted_records(self) -> None:
         from agentic_os.domain import create_database_engine, session_factory
-        from agentic_os.domain.models import AuditEvent, Task
+        from agentic_os.domain.models import AuditEvent, CostLedgerEntry, Task
 
         project = client.post("/api/v1/projects", json={"name": "Inspect Project"}).json()
         goal = client.post(f"/api/v1/projects/{project['id']}/goals", json={"title": "Inspect goal"}).json()
@@ -172,6 +172,17 @@ class ApiWorkflowTests(unittest.TestCase):
                     payload={"task_id": str(task.id)},
                 )
             )
+            session.add(
+                CostLedgerEntry(
+                    run_id=None,
+                    action_type="mcp_tool_call",
+                    reserved_amount_minor_units=0,
+                    actual_amount_minor_units=0,
+                    currency="USD",
+                    is_zero_cost=True,
+                    status="reconciled",
+                )
+            )
             session.commit()
             task_id = task.id
         engine.dispose()
@@ -186,6 +197,11 @@ class ApiWorkflowTests(unittest.TestCase):
         events = client.get("/api/v1/audit-events", params={"project_id": project["id"]}).json()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["event_type"], "task.created")
+
+        ledger = client.get("/api/v1/cost-ledger-entries").json()
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["action_type"], "mcp_tool_call")
+        self.assertTrue(ledger[0]["is_zero_cost"])
 
 
 if __name__ == "__main__":
