@@ -3,6 +3,73 @@
 Agentic OS is a local-first, self-hostable environment for durable, governed
 agent work. See [VISION.md](VISION.md) for the product and architecture direction.
 
+## Local development
+
+Agentic OS currently has two app surfaces:
+
+- `backend/` — Python 3.12 + FastAPI API and worker code.
+- `frontend/` — Next.js/shadcn operator console.
+
+Run backend and frontend commands in separate terminal sessions.
+
+### Backend setup
+
+Create and activate a repository-local virtual environment, then install the
+backend package with development dependencies:
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+The backend defaults to PostgreSQL at:
+
+```text
+postgresql+psycopg://agentic_os:agentic_os@localhost:5432/agentic_os
+```
+
+Override that for local development by setting `DATABASE_URL` when needed.
+Some API flows that store encrypted credentials also require
+`AGENTIC_OS_MASTER_KEY`.
+
+Start the FastAPI development server from `backend/` with the virtual
+environment active:
+
+```bash
+uvicorn agentic_os.api.app:create_app --factory --reload --host 127.0.0.1 --port 8000
+```
+
+The API is rooted under `/api/v1`; the health check is available at:
+
+```text
+http://127.0.0.1:8000/api/v1/health
+```
+
+### Frontend setup
+
+Install frontend dependencies:
+
+```bash
+cd frontend
+pnpm install
+```
+
+Start the Next.js development server from `frontend/`:
+
+```bash
+pnpm dev
+```
+
+The operator console proxies API requests to
+`http://127.0.0.1:8000/api/v1` by default. If the backend is running elsewhere,
+set `AGENTIC_OS_API_URL` before starting the frontend:
+
+```bash
+AGENTIC_OS_API_URL=http://127.0.0.1:8000/api/v1 pnpm dev
+```
+
 ## Restart recovery verification
 
 See [docs/restart-recovery-verification.md](docs/restart-recovery-verification.md)
