@@ -203,6 +203,169 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(ledger[0]["action_type"], "mcp_tool_call")
         self.assertTrue(ledger[0]["is_zero_cost"])
 
+    def _make_goal(self) -> dict:
+        project = client.post("/api/v1/projects", json={"name": f"Project {uuid.uuid4()}"}).json()
+        return client.post(f"/api/v1/projects/{project['id']}/goals", json={"title": "Ship the feature"}).json()
+
+    def _make_budget(self) -> dict:
+        agent = client.post("/api/v1/agents", json={"name": f"Agent {uuid.uuid4()}"}).json()
+        return client.post(
+            f"/api/v1/agents/{agent['id']}/budgets",
+            json={"currency": "USD", "amount_minor_units": 10_000, "enforcement_mode": "warning"},
+        ).json()
+
+    def test_create_and_read_task_graph_with_dependencies_and_context(self) -> None:
+        goal = self._make_goal()
+        budget = self._make_budget()
+
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={
+                "tasks": [
+                    {
+                        "client_id": "research",
+                        "title": "Research the approach",
+                        "required_capabilities": {"web_search": True},
+                        "expected_outputs": [{"name": "research-notes", "kind": "artifact"}],
+                        "resource_intent": [{"resource_key": "notes/research.md", "intent": "write"}],
+                        "budget_id": budget["id"],
+                    },
+                    {
+                        "client_id": "implement",
+                        "title": "Implement the change",
+                        "required_capabilities": {"code_edit": True},
+                        "resource_intent": [{"resource_key": "src/main.py", "intent": "write"}],
+                        "depends_on": ["research"],
+                    },
+                ]
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(len(body["tasks"]), 2)
+        self.assertEqual(len(body["dependencies"]), 1)
+
+        tasks_by_title = {task["title"]: task for task in body["tasks"]}
+        research_task = tasks_by_title["Research the approach"]
+        implement_task = tasks_by_title["Implement the change"]
+        self.assertEqual(research_task["budget_id"], budget["id"])
+        self.assertEqual(
+            research_task["expected_outputs"],
+            [{"name": "research-notes", "kind": "artifact", "description": None}],
+        )
+        self.assertEqual(
+            body["dependencies"],
+            [{"task_id": implement_task["id"], "depends_on_task_id": research_task["id"]}],
+        )
+
+        read_back = client.get(f"/api/v1/goals/{goal['id']}/task-graph").json()
+        self.assertEqual({task["id"] for task in read_back["tasks"]}, {research_task["id"], implement_task["id"]})
+        self.assertEqual(read_back["dependencies"], body["dependencies"])
+
+    def test_task_graph_extends_with_stable_identifiers(self) -> None:
+        goal = self._make_goal()
+        first = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={"tasks": [{"client_id": "a", "title": "First task"}]},
+        ).json()
+        first_task_id = first["tasks"][0]["id"]
+
+        second = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={"tasks": [{"client_id": "b", "title": "Second task", "depends_on": [first_task_id]}]},
+        )
+        self.assertEqual(second.status_code, 201, second.text)
+        second_body = second.json()
+        second_task_id = next(t["id"] for t in second_body["tasks"] if t["title"] == "Second task")
+
+        graph = client.get(f"/api/v1/goals/{goal['id']}/task-graph").json()
+        self.assertEqual(len(graph["tasks"]), 2)
+        self.assertIn({"task_id": second_task_id, "depends_on_task_id": first_task_id}, graph["dependencies"])
+
+    def test_task_graph_rejects_cyclic_dependency_graph(self) -> None:
+        goal = self._make_goal()
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={
+                "tasks": [
+                    {"client_id": "a", "title": "Task A", "depends_on": ["b"]},
+                    {"client_id": "b", "title": "Task B", "depends_on": ["a"]},
+                ]
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("cycle", response.json()["detail"])
+
+        graph = client.get(f"/api/v1/goals/{goal['id']}/task-graph").json()
+        self.assertEqual(graph["tasks"], [])
+
+    def test_task_graph_diamond_dependencies_do_not_false_positive_on_cycles(self) -> None:
+        goal = self._make_goal()
+        first = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={
+                "tasks": [
+                    {"client_id": "a", "title": "Task A"},
+                    {"client_id": "b", "title": "Task B", "depends_on": ["a"]},
+                ]
+            },
+        ).json()
+        task_a_id = next(t["id"] for t in first["tasks"] if t["title"] == "Task A")
+        task_b_id = next(t["id"] for t in first["tasks"] if t["title"] == "Task B")
+
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={"tasks": [{"client_id": "d", "title": "Task D", "depends_on": [task_a_id, task_b_id]}]},
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        graph = client.get(f"/api/v1/goals/{goal['id']}/task-graph").json()
+        self.assertEqual(len(graph["tasks"]), 3)
+        self.assertEqual(len(graph["dependencies"]), 3)
+
+    def test_task_graph_rejects_malformed_resource_key(self) -> None:
+        goal = self._make_goal()
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={
+                "tasks": [
+                    {
+                        "client_id": "a",
+                        "title": "Bad resource key",
+                        "resource_intent": [{"resource_key": "/etc/passwd", "intent": "write"}],
+                    }
+                ]
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_task_graph_rejects_malformed_required_capabilities(self) -> None:
+        goal = self._make_goal()
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={"tasks": [{"client_id": "a", "title": "Bad capability", "required_capabilities": {"": True}}]},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_task_graph_rejects_unknown_budget_reference(self) -> None:
+        goal = self._make_goal()
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={"tasks": [{"client_id": "a", "title": "Unknown budget", "budget_id": str(uuid.uuid4())}]},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_task_graph_rejects_unknown_dependency_reference(self) -> None:
+        goal = self._make_goal()
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={"tasks": [{"client_id": "a", "title": "Dangling dependency", "depends_on": [str(uuid.uuid4())]}]},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_task_graph_not_found_for_unknown_goal(self) -> None:
+        response = client.get(f"/api/v1/goals/{uuid.uuid4()}/task-graph")
+        self.assertEqual(response.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

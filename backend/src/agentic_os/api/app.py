@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from agentic_os.api.routers import agents, budgets, goals, mcp_servers, model_profiles, projects, skills, state
+from agentic_os.api.routers import (
+    agents,
+    budgets,
+    goals,
+    mcp_servers,
+    model_profiles,
+    projects,
+    skills,
+    state,
+    task_graph,
+)
 
 API_V1_PREFIX = "/api/v1"
 
@@ -22,5 +32,6 @@ def create_app() -> FastAPI:
     app.include_router(mcp_servers.router, prefix=API_V1_PREFIX)
     app.include_router(budgets.router, prefix=API_V1_PREFIX)
     app.include_router(state.router, prefix=API_V1_PREFIX)
+    app.include_router(task_graph.router, prefix=API_V1_PREFIX)
 
     return app

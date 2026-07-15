@@ -23,6 +23,10 @@ class TaskRead(BaseModel):
     description: str | None
     status: str
     required_capabilities: dict
+    expected_outputs: list
+    resource_intent: list
+    policy_ids: list
+    budget_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
 
