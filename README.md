@@ -77,6 +77,15 @@ for how to run the automated and manual demonstrations that a deliberate
 mid-run worker process kill resumes from the last committed PostgreSQL
 boundary without losing or duplicating acknowledged work.
 
+## Multi-agent scheduling, conflict, and restart-recovery verification
+
+See [docs/multi-agent-verification.md](docs/multi-agent-verification.md)
+for how to run the automated and manual demonstrations that dependent
+tasks wait, independent safe tasks run concurrently, a conflicting
+resource-key pair is safely serialized, and a mid-run restart while
+several multi-agent tasks are in flight recovers without losing or
+duplicating acknowledged work.
+
 ## Deterministic code index
 
 The committed `.code-index/` covers tracked Python backend and TypeScript/TSX or
