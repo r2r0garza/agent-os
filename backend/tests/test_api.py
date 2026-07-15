@@ -366,6 +366,91 @@ class ApiWorkflowTests(unittest.TestCase):
         response = client.get(f"/api/v1/goals/{uuid.uuid4()}/task-graph")
         self.assertEqual(response.status_code, 404)
 
+    def test_decompose_goal_creates_inspectable_multi_task_dag(self) -> None:
+        goal = self._make_goal()
+
+        response = client.post(f"/api/v1/goals/{goal['id']}/task-graph/decompose", json={})
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(len(body["tasks"]), 3)
+        self.assertEqual(len(body["dependencies"]), 2)
+
+        tasks_by_client_title = {task["title"]: task for task in body["tasks"]}
+        research_task = tasks_by_client_title[f"Research: {goal['title']}"]
+        draft_task = tasks_by_client_title[f"Draft: {goal['title']}"]
+        review_task = tasks_by_client_title[f"Review: {goal['title']}"]
+
+        self.assertEqual(research_task["required_capabilities"], {"research": True})
+        self.assertIn("research", research_task["capability_rationale"])
+        self.assertTrue(research_task["capability_rationale"]["research"]["reason"])
+        self.assertTrue(research_task["capability_rationale"]["research"]["evidence"])
+
+        self.assertIn(
+            {"task_id": draft_task["id"], "depends_on_task_id": research_task["id"]}, body["dependencies"]
+        )
+        self.assertIn(
+            {"task_id": review_task["id"], "depends_on_task_id": draft_task["id"]}, body["dependencies"]
+        )
+
+        read_back = client.get(f"/api/v1/goals/{goal['id']}/task-graph").json()
+        self.assertEqual({task["id"] for task in read_back["tasks"]}, {task["id"] for task in body["tasks"]})
+
+        fetched_task = client.get(f"/api/v1/tasks/{research_task['id']}").json()
+        self.assertEqual(fetched_task["capability_rationale"], research_task["capability_rationale"])
+
+    def test_decompose_goal_rejects_second_decomposition(self) -> None:
+        goal = self._make_goal()
+        first = client.post(f"/api/v1/goals/{goal['id']}/task-graph/decompose", json={})
+        self.assertEqual(first.status_code, 201, first.text)
+
+        second = client.post(f"/api/v1/goals/{goal['id']}/task-graph/decompose", json={})
+        self.assertEqual(second.status_code, 409, second.text)
+
+    def test_decompose_goal_rejects_unsupported_workflow(self) -> None:
+        goal = self._make_goal()
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph/decompose", json={"workflow": "not-a-real-workflow"}
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_decompose_goal_not_found_for_unknown_goal(self) -> None:
+        response = client.post(f"/api/v1/goals/{uuid.uuid4()}/task-graph/decompose", json={})
+        self.assertEqual(response.status_code, 404)
+
+    def test_task_graph_rejects_capability_rationale_for_unrequired_capability(self) -> None:
+        goal = self._make_goal()
+        response = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={
+                "tasks": [
+                    {
+                        "client_id": "a",
+                        "title": "Mismatched rationale",
+                        "required_capabilities": {"web_search": True},
+                        "capability_rationale": {"code_edit": {"reason": "unrelated capability"}},
+                    }
+                ]
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_agent_version_accepts_known_declared_capabilities(self) -> None:
+        agent = client.post("/api/v1/agents", json={"name": f"Agent {uuid.uuid4()}"}).json()
+        response = client.post(
+            f"/api/v1/agents/{agent['id']}/versions",
+            json={"capability_manifest": {"capabilities": ["research", "writing"]}},
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["capability_manifest"]["capabilities"], ["research", "writing"])
+
+    def test_agent_version_rejects_unknown_declared_capability(self) -> None:
+        agent = client.post("/api/v1/agents", json={"name": f"Agent {uuid.uuid4()}"}).json()
+        response = client.post(
+            f"/api/v1/agents/{agent['id']}/versions",
+            json={"capability_manifest": {"capabilities": ["telekinesis"]}},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,11 +5,12 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
+from agentic_os.domain.decomposition import TaskBlueprint, UnknownCapabilityError, UnsupportedWorkflowError, decompose_goal
 from agentic_os.domain.models import Budget, Goal, Policy, Task, TaskDependency
 
 router = APIRouter(tags=["task-graph"])
@@ -55,11 +56,24 @@ class ExpectedOutputEntry(BaseModel):
         return value
 
 
+class CapabilityRationaleEntry(BaseModel):
+    reason: str
+    evidence: list[str] = []
+
+    @field_validator("reason")
+    @classmethod
+    def _validate_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("capability rationale reason must not be empty")
+        return value
+
+
 class TaskGraphNodeCreate(BaseModel):
     client_id: str
     title: str
     description: str | None = None
     required_capabilities: dict = {}
+    capability_rationale: dict[str, CapabilityRationaleEntry] = {}
     expected_outputs: list[ExpectedOutputEntry] = []
     resource_intent: list[ResourceIntentEntry] = []
     policy_ids: list[uuid.UUID] = []
@@ -81,6 +95,15 @@ class TaskGraphNodeCreate(BaseModel):
                 raise ValueError("required_capabilities keys must be non-empty capability names")
         return value
 
+    @model_validator(mode="after")
+    def _validate_rationale_covers_known_capabilities(self) -> "TaskGraphNodeCreate":
+        unexplained = set(self.capability_rationale) - set(self.required_capabilities)
+        if unexplained:
+            raise ValueError(
+                f"capability_rationale references capabilities not in required_capabilities: {sorted(unexplained)}"
+            )
+        return self
+
 
 class TaskGraphCreate(BaseModel):
     tasks: list[TaskGraphNodeCreate]
@@ -95,6 +118,7 @@ class TaskGraphNodeRead(BaseModel):
     description: str | None
     status: str
     required_capabilities: dict
+    capability_rationale: dict
     expected_outputs: list
     resource_intent: list
     policy_ids: list
@@ -159,13 +183,7 @@ def _detect_cycle(adjacency: dict[uuid.UUID, set[uuid.UUID]]) -> list[uuid.UUID]
     return None
 
 
-@router.post("/goals/{goal_id}/task-graph", response_model=TaskGraphRead, status_code=201)
-def create_task_graph(
-    goal_id: uuid.UUID, payload: TaskGraphCreate, session: Session = Depends(get_session)
-) -> TaskGraphRead:
-    goal = session.get(Goal, goal_id)
-    if goal is None:
-        raise HTTPException(status_code=404, detail="goal not found")
+def _persist_task_graph(session: Session, goal_id: uuid.UUID, payload: TaskGraphCreate) -> TaskGraphRead:
     if not payload.tasks:
         raise HTTPException(status_code=422, detail="tasks must not be empty")
 
@@ -231,6 +249,7 @@ def create_task_graph(
                 title=node.title,
                 description=node.description,
                 required_capabilities=node.required_capabilities,
+                capability_rationale={name: entry.model_dump() for name, entry in node.capability_rationale.items()},
                 expected_outputs=[entry.model_dump() for entry in node.expected_outputs],
                 resource_intent=[entry.model_dump() for entry in node.resource_intent],
                 policy_ids=[str(policy_id) for policy_id in node.policy_ids],
@@ -246,9 +265,68 @@ def create_task_graph(
     return _load_graph(session, goal_id)
 
 
+@router.post("/goals/{goal_id}/task-graph", response_model=TaskGraphRead, status_code=201)
+def create_task_graph(
+    goal_id: uuid.UUID, payload: TaskGraphCreate, session: Session = Depends(get_session)
+) -> TaskGraphRead:
+    goal = session.get(Goal, goal_id)
+    if goal is None:
+        raise HTTPException(status_code=404, detail="goal not found")
+    return _persist_task_graph(session, goal_id, payload)
+
+
 @router.get("/goals/{goal_id}/task-graph", response_model=TaskGraphRead)
 def get_task_graph(goal_id: uuid.UUID, session: Session = Depends(get_session)) -> TaskGraphRead:
     goal = session.get(Goal, goal_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not found")
     return _load_graph(session, goal_id)
+
+
+def _blueprint_to_node(blueprint: TaskBlueprint) -> TaskGraphNodeCreate:
+    return TaskGraphNodeCreate(
+        client_id=blueprint.client_id,
+        title=blueprint.title,
+        description=blueprint.description,
+        required_capabilities=dict(blueprint.required_capabilities),
+        capability_rationale={
+            name: CapabilityRationaleEntry(reason=rationale.reason, evidence=list(rationale.evidence))
+            for name, rationale in blueprint.capability_rationale.items()
+        },
+        expected_outputs=[
+            ExpectedOutputEntry(name=output.name, kind=output.kind, description=output.description)
+            for output in blueprint.expected_outputs
+        ],
+        resource_intent=[
+            ResourceIntentEntry(resource_key=intent.resource_key, intent=intent.intent)
+            for intent in blueprint.resource_intent
+        ],
+        depends_on=list(blueprint.depends_on),
+    )
+
+
+class DecomposeGoalRequest(BaseModel):
+    workflow: str = "research_brief"
+
+
+@router.post("/goals/{goal_id}/task-graph/decompose", response_model=TaskGraphRead, status_code=201)
+def decompose_goal_task_graph(
+    goal_id: uuid.UUID,
+    payload: DecomposeGoalRequest = DecomposeGoalRequest(),
+    session: Session = Depends(get_session),
+) -> TaskGraphRead:
+    goal = session.get(Goal, goal_id)
+    if goal is None:
+        raise HTTPException(status_code=404, detail="goal not found")
+    if session.execute(select(Task.id).where(Task.goal_id == goal_id)).first() is not None:
+        raise HTTPException(status_code=409, detail="goal already has a persisted task graph")
+
+    try:
+        blueprints = decompose_goal(title=goal.title, description=goal.description, workflow=payload.workflow)
+    except UnsupportedWorkflowError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except UnknownCapabilityError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    graph_create = TaskGraphCreate(tasks=[_blueprint_to_node(blueprint) for blueprint in blueprints])
+    return _persist_task_graph(session, goal_id, graph_create)

@@ -4,12 +4,13 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
 from agentic_os.api.deps import get_session
+from agentic_os.domain.capabilities import CAPABILITY_CATALOG
 from agentic_os.domain.models import Agent, AgentVersion, Budget, ModelProfile
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -35,6 +36,21 @@ class AgentVersionCreate(BaseModel):
     capability_manifest: dict = {}
     model_profile_id: uuid.UUID | None = None
     default_budget_id: uuid.UUID | None = None
+
+    @field_validator("capability_manifest")
+    @classmethod
+    def _validate_capability_manifest(cls, value: dict) -> dict:
+        declared_capabilities = value.get("capabilities")
+        if declared_capabilities is None:
+            return value
+        if not isinstance(declared_capabilities, list) or not all(
+            isinstance(name, str) and name for name in declared_capabilities
+        ):
+            raise ValueError("capability_manifest.capabilities must be a list of non-empty capability names")
+        unknown = sorted(set(declared_capabilities) - set(CAPABILITY_CATALOG))
+        if unknown:
+            raise ValueError(f"capability_manifest declares unknown capabilities: {unknown}")
+        return value
 
 
 class AgentVersionRead(BaseModel):

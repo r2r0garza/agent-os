@@ -118,6 +118,7 @@ class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(TaskStatus, nullable=False, server_default="pending")
     required_capabilities: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    capability_rationale: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     expected_outputs: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     resource_intent: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     policy_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")

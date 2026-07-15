@@ -23,6 +23,7 @@ class TaskRead(BaseModel):
     description: str | None
     status: str
     required_capabilities: dict
+    capability_rationale: dict
     expected_outputs: list
     resource_intent: list
     policy_ids: list
