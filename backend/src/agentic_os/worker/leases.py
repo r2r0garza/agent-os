@@ -7,6 +7,11 @@ from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql import exists
 
 from agentic_os.domain.models import Task, TaskDependency
+from agentic_os.worker.workspace import (
+    acquire_resource_leases,
+    release_resource_leases,
+    renew_resource_leases,
+)
 
 DEFAULT_LEASE_SECONDS = 60
 
@@ -36,11 +41,12 @@ def _try_lock_resource_keys(session: Session, task: Task) -> bool:
     to the enclosing SAVEPOINT, or when the winning transaction eventually
     commits or rolls back.
 
-    Every declared resource key takes the same exclusive lock regardless of
-    read/write intent. VISION.md explicitly allows this: "Inferred intent
-    may make locking more conservative but cannot weaken an existing lock."
-    The finer-grained read/write, revision, and fencing-token workspace
-    protocol is the dedicated scope of a later workspace-locking milestone.
+    Every declared resource key takes the same short-lived claim mutex
+    regardless of read/write intent. VISION.md explicitly allows this:
+    "Inferred intent may make locking more conservative but cannot weaken an
+    existing lock." Mutating intents additionally acquire durable resource
+    leases below; the advisory mutex only closes the race while those rows
+    are created or reassigned.
     """
     keys = sorted(
         {entry.get("resource_key") for entry in (task.resource_intent or []) if entry.get("resource_key")}
@@ -106,6 +112,12 @@ def claim_ready_task(
         task.lease_owner = worker_id
         task.lease_token = task.lease_token + 1
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        if not acquire_resource_leases(
+            session, task, worker_id, expires_at=task.lease_expires_at
+        ):
+            excluded_ids.add(task.id)
+            savepoint.rollback()
+            continue
         session.flush()
         savepoint.commit()
         return task
@@ -117,12 +129,14 @@ def renew_lease(session: Session, task: Task, worker_id: str, *, lease_seconds: 
     if task.lease_owner != worker_id:
         raise LeaseLostError(f"task {task.id} is no longer leased by worker {worker_id!r}")
     task.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    renew_resource_leases(session, task, worker_id, expires_at=task.lease_expires_at)
     session.flush()
 
 
 def release_lease(session: Session, task: Task, worker_id: str, *, status: str) -> None:
     if task.lease_owner != worker_id:
         raise LeaseLostError(f"task {task.id} is no longer leased by worker {worker_id!r}")
+    release_resource_leases(session, task, worker_id)
     task.status = status
     task.lease_owner = None
     task.lease_expires_at = None

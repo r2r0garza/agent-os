@@ -110,6 +110,9 @@ class DomainMigrationTests(unittest.TestCase):
             "artifacts",
             "artifact_versions",
             "audit_events",
+            "workspace_resources",
+            "workspace_resource_leases",
+            "workspace_promotions",
         }
         with self.engine.connect() as connection:
             rows = connection.execute(

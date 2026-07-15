@@ -137,6 +137,69 @@ class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class WorkspaceResource(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "workspace_resources"
+    __table_args__ = (
+        UniqueConstraint("project_id", "resource_key", name="uq_workspace_resources_project_key"),
+        CheckConstraint("revision >= 0", name="workspace_resource_revision_non_negative"),
+        CheckConstraint("last_fencing_token >= 0", name="workspace_resource_fencing_non_negative"),
+    )
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    resource_key: Mapped[str] = mapped_column(Text, nullable=False)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    last_fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class WorkspaceResourceLease(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "workspace_resource_leases"
+    __table_args__ = (
+        UniqueConstraint("resource_id", name="uq_workspace_resource_leases_resource"),
+        CheckConstraint("fencing_token > 0", name="workspace_resource_lease_fencing_positive"),
+        CheckConstraint("expected_revision >= 0", name="workspace_resource_lease_revision_non_negative"),
+    )
+
+    resource_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_resources.id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
+    lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_lease_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expected_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkspacePromotion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "workspace_promotions"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_workspace_promotions_run"),
+        CheckConstraint(
+            "status in ('promoted', 'conflict', 'denied')",
+            name="workspace_promotion_status_valid",
+        ),
+    )
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_revisions: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    resulting_revisions: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    conflict_details: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
 class TaskDependency(Base):
     __tablename__ = "task_dependencies"
     __table_args__ = (

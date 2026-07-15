@@ -27,6 +27,7 @@ from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, re
 from agentic_os.worker.policy import evaluate_policy
 from agentic_os.worker.sandbox_execution import execute_task_sandbox
 from agentic_os.worker.tools import invoke_tool
+from agentic_os.worker.workspace import promote_workspace_changes
 
 
 class TaskExecutionError(RuntimeError):
@@ -196,11 +197,10 @@ def _execute_claimed_task(
         # Commit so the run's "running" state is durably visible to other
         # connections (e.g. a verification harness polling for the process
         # to reach this point) before the callback potentially blocks. A
-        # resource key's exclusivity does not depend on this: it is held by
-        # a transaction-scoped advisory lock acquired at claim time (see
-        # ``claim_ready_task``), which stays held for this whole attempt
-        # regardless of when/whether an intermediate commit happens, and is
-        # released only when this transaction finally commits or rolls back.
+        # Resource exclusivity survives this commit through the durable
+        # workspace resource-lease rows acquired with the task. The
+        # transaction-scoped advisory locks used during claim are only race
+        # guards and may be released here safely.
         session.commit()
         on_run_started()
 
@@ -260,6 +260,8 @@ def _execute_claimed_task(
         tool_results["sandbox"] = sandbox_result
 
     renew_lease(session, task, worker_id)
+
+    promote_workspace_changes(session, task, run, worker_id)
 
     artifact_payload = json.dumps(
         {"task_id": str(task.id), "run_id": str(run.id), "tool_results": tool_results}, sort_keys=True

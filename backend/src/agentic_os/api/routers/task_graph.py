@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from agentic_os.api.deps import get_session
 from agentic_os.domain.decomposition import TaskBlueprint, UnknownCapabilityError, UnsupportedWorkflowError, decompose_goal
 from agentic_os.domain.models import Budget, Goal, Policy, Task, TaskDependency
+from agentic_os.worker.workspace import InvalidResourceKeyError, canonical_resource_key
 
 router = APIRouter(tags=["task-graph"])
 
@@ -33,7 +34,10 @@ class ResourceIntentEntry(BaseModel):
             or not RESOURCE_KEY_PATTERN.match(value)
         ):
             raise ValueError(f"invalid project-relative resource key: {value!r}")
-        return value
+        try:
+            return canonical_resource_key(value)
+        except InvalidResourceKeyError as error:
+            raise ValueError(str(error)) from error
 
     @field_validator("intent")
     @classmethod
