@@ -31,6 +31,17 @@ export interface Agent {
   created_at: string
 }
 
+export interface AgentVersion {
+  id: Identifier
+  agent_id: Identifier
+  version_number: number
+  instructions: string | null
+  capability_manifest: Record<string, unknown>
+  model_profile_id: Identifier | null
+  default_budget_id: Identifier | null
+  created_at: string
+}
+
 export interface Skill {
   id: Identifier
   name: string
@@ -45,30 +56,71 @@ export interface McpServer {
   created_at: string
 }
 
+export interface AssignmentCandidate {
+  agent_id: Identifier
+  agent_version_id: Identifier
+  agent_version_number: number
+  eligible: boolean
+  matched_capabilities: string[]
+  missing_capabilities: string[]
+  policy_decision: string
+  budget_id: Identifier | null
+  rejection_reasons: string[]
+}
+
 export interface Task {
   id: Identifier
   goal_id: Identifier
   title: string
   description: string | null
   status: string
+  required_capabilities: Record<string, unknown>
+  capability_rationale: Record<string, unknown>
+  expected_outputs: unknown[]
+  resource_intent: { resource_key: string; intent: string }[]
+  policy_ids: string[]
+  budget_id: Identifier | null
+  assigned_agent_version_id: Identifier | null
+  assignment_status: string
+  assignment_candidates: AssignmentCandidate[]
+  assignment_rationale: Record<string, unknown>
+  assignment_updated_at: string | null
+  lease_owner: string | null
+  lease_token: number
+  lease_expires_at: string | null
   created_at: string
   updated_at: string
+}
+
+export interface TaskDependency {
+  task_id: Identifier
+  depends_on_task_id: Identifier
+}
+
+export interface TaskGraph {
+  tasks: Task[]
+  dependencies: TaskDependency[]
 }
 
 export interface Run {
   id: Identifier
   task_id: Identifier
   attempt_number: number
+  idempotency_key: string
+  agent_version_id: Identifier
+  langgraph_thread_id: string | null
   status: string
   snapshot: Record<string, unknown>
   started_at: string | null
   completed_at: string | null
   created_at: string
+  updated_at: string
 }
 
 export interface Artifact {
   id: Identifier
   goal_id: Identifier | null
+  task_id: Identifier | null
   run_id: Identifier | null
   name: string
   created_at: string
@@ -77,7 +129,9 @@ export interface Artifact {
 export interface AuditEvent {
   id: Identifier
   sequence_number: number
+  project_id: Identifier | null
   goal_id: Identifier | null
+  task_id: Identifier | null
   run_id: Identifier | null
   event_type: string
   payload: Record<string, unknown>

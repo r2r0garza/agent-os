@@ -19,6 +19,7 @@ import {
   ServerCog,
   ShieldCheck,
   Sparkles,
+  Workflow,
   Wrench,
 } from "lucide-react"
 
@@ -34,9 +35,11 @@ import {
   Run,
   Skill,
   Task,
+  TaskDependency,
   api,
   jsonBody,
 } from "@/lib/api"
+import { TaskGraphPanel } from "@/components/task-graph-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -75,13 +78,6 @@ function displayDate(value: string | null) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value))
-}
-
-function statusVariant(status: string) {
-  if (status === "completed" || status === "active") return "default" as const
-  if (status === "failed" || status === "cancelled")
-    return "destructive" as const
-  return "secondary" as const
 }
 
 function EmptyState({ children }: { children: React.ReactNode }) {
@@ -136,12 +132,15 @@ export function OperatorWorkspace() {
   const [selectedGoalId, setSelectedGoalId] = useState("")
   const [goals, setGoals] = useState<Goal[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
+  const [dependencies, setDependencies] = useState<TaskDependency[]>([])
   const [runs, setRuns] = useState<Run[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [ledger, setLedger] = useState<CostLedgerEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [goalLoading, setGoalLoading] = useState(false)
+  const [goalStateError, setGoalStateError] = useState("")
   const [mutation, setMutation] = useState("")
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
@@ -171,6 +170,7 @@ export function OperatorWorkspace() {
       setGoals([])
       setSelectedGoalId("")
       setTasks([])
+      setDependencies([])
       setRuns([])
       setArtifacts([])
       setEvents([])
@@ -200,15 +200,18 @@ export function OperatorWorkspace() {
   const loadGoalState = useCallback(async (goalId: string) => {
     if (!goalId) {
       setTasks([])
+      setDependencies([])
       setRuns([])
       setLedger([])
       return
     }
 
-    const goalTasks = await api<Task[]>(`/goals/${goalId}/tasks`)
+    const graph = await api<{ tasks: Task[]; dependencies: TaskDependency[] }>(
+      `/goals/${goalId}/task-graph`
+    )
     const taskRuns = (
       await Promise.all(
-        goalTasks.map((task) => api<Run[]>(`/tasks/${task.id}/runs`))
+        graph.tasks.map((task) => api<Run[]>(`/tasks/${task.id}/runs`))
       )
     ).flat()
     const runLedger = (
@@ -218,7 +221,8 @@ export function OperatorWorkspace() {
         )
       )
     ).flat()
-    setTasks(goalTasks)
+    setTasks(graph.tasks)
+    setDependencies(graph.dependencies)
     setRuns(taskRuns)
     setLedger(runLedger)
   }, [])
@@ -230,7 +234,10 @@ export function OperatorWorkspace() {
       try {
         await loadInventory()
         if (selectedProjectId) await loadProjectState(selectedProjectId)
-        if (selectedGoalId) await loadGoalState(selectedGoalId)
+        if (selectedGoalId) {
+          setGoalStateError("")
+          await loadGoalState(selectedGoalId)
+        }
       } catch (reason) {
         setError(
           reason instanceof Error ? reason.message : "Unable to load workspace"
@@ -248,6 +255,19 @@ export function OperatorWorkspace() {
       selectedProjectId,
     ]
   )
+
+  const retryGoalState = useCallback(() => {
+    if (!selectedGoalId) return
+    setGoalStateError("")
+    setGoalLoading(true)
+    void loadGoalState(selectedGoalId)
+      .catch((reason: unknown) =>
+        setGoalStateError(
+          reason instanceof Error ? reason.message : "Unable to load the task graph"
+        )
+      )
+      .finally(() => setGoalLoading(false))
+  }, [loadGoalState, selectedGoalId])
 
   useEffect(() => {
     const timer = window.setTimeout(() => void refreshAll(false), 0)
@@ -273,11 +293,15 @@ export function OperatorWorkspace() {
     if (!selectedGoalId) return
     window.localStorage.setItem(GOAL_STORAGE_KEY, selectedGoalId)
     const timer = window.setTimeout(() => {
-      void loadGoalState(selectedGoalId).catch((reason: unknown) =>
-        setError(
-          reason instanceof Error ? reason.message : "Unable to load goal"
+      setGoalStateError("")
+      setGoalLoading(true)
+      void loadGoalState(selectedGoalId)
+        .catch((reason: unknown) =>
+          setGoalStateError(
+            reason instanceof Error ? reason.message : "Unable to load the task graph"
+          )
         )
-      )
+        .finally(() => setGoalLoading(false))
     }, 0)
     return () => window.clearTimeout(timer)
   }, [loadGoalState, selectedGoalId])
@@ -367,6 +391,18 @@ export function OperatorWorkspace() {
     })
   }
 
+  async function decomposeGoal() {
+    if (!selectedGoalId) return
+    await mutate("decompose", async () => {
+      await api(
+        `/goals/${selectedGoalId}/task-graph/decompose`,
+        jsonBody({ workflow: "research_brief" })
+      )
+      await loadGoalState(selectedGoalId)
+      setNotice("Goal decomposed into an inspectable task graph.")
+    })
+  }
+
   async function provisionAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const formElement = event.currentTarget
@@ -450,10 +486,10 @@ export function OperatorWorkspace() {
     (project) => project.id === selectedProjectId
   )
   const selectedGoal = goals.find((goal) => goal.id === selectedGoalId)
-  const visibleEvents = events
-    .filter((event) => !selectedGoalId || event.goal_id === selectedGoalId)
-    .slice(-12)
-    .reverse()
+  const goalEvents = events.filter(
+    (event) => !selectedGoalId || event.goal_id === selectedGoalId
+  )
+  const visibleEvents = goalEvents.slice(-12).reverse()
   const visibleArtifacts = artifacts.filter(
     (artifact) => !selectedGoalId || artifact.goal_id === selectedGoalId
   )
@@ -471,9 +507,7 @@ export function OperatorWorkspace() {
     [actualCost, currency]
   )
   const activeRun = runs.find((run) => run.status === "running")
-  const recoverable = runs.find((run) =>
-    ["failed", "interrupted", "cancelled"].includes(run.status)
-  )
+  const recoverable = runs.find((run) => ["failed", "cancelled"].includes(run.status))
 
   if (loading) {
     return (
@@ -562,6 +596,95 @@ export function OperatorWorkspace() {
             icon={<CircleDollarSign className="size-4" />}
           />
         </section>
+
+        <Card className="mb-6">
+          <CardHeader>
+            <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+              <Activity className="size-4" /> TASK GRAPH & MULTI-AGENT PROGRESS
+            </div>
+            <CardTitle>{selectedGoal?.title ?? "Run progress"}</CardTitle>
+            <CardDescription>
+              {selectedProject
+                ? `${selectedProject.name} · polled every 5 seconds`
+                : "Select a project to inspect persisted work."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div className="max-w-md flex-1">
+                <Field label="Goal">
+                  <select
+                    className="h-9 w-full rounded-lg border bg-background px-3 text-sm"
+                    value={selectedGoalId}
+                    onChange={(event) => setSelectedGoalId(event.target.value)}
+                    disabled={!goals.length}
+                  >
+                    <option value="">
+                      {goals.length
+                        ? "Select a goal"
+                        : "No goals in this project"}
+                    </option>
+                    {goals.map((goal) => (
+                      <option key={goal.id} value={goal.id}>
+                        {goal.title}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+              {selectedGoalId && !goalLoading && tasks.length === 0 ? (
+                <Button
+                  variant="outline"
+                  onClick={() => void decomposeGoal()}
+                  disabled={mutation === "decompose"}
+                >
+                  {mutation === "decompose" ? (
+                    <LoaderCircle className="animate-spin" />
+                  ) : (
+                    <Workflow />
+                  )}
+                  Decompose into task graph
+                </Button>
+              ) : null}
+            </div>
+
+            {activeRun ? (
+              <div className="flex items-center gap-3 rounded-xl border border-blue-500/20 bg-blue-500/5 p-3 text-sm">
+                <LoaderCircle className="size-4 animate-spin text-blue-600" />
+                Run attempt {activeRun.attempt_number} is active. Progress will
+                reconnect automatically.
+              </div>
+            ) : null}
+            {recoverable ? (
+              <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+                <RotateCcw className="mt-0.5 size-4 text-amber-600" />
+                <span>
+                  Execution stopped in a recoverable state. Restart or resume
+                  the worker, then refresh; persisted history remains visible.
+                </span>
+              </div>
+            ) : null}
+
+            {!selectedGoalId ? (
+              <EmptyState>
+                Submit or select a goal to inspect its task graph and run
+                attempts.
+              </EmptyState>
+            ) : (
+              <TaskGraphPanel
+                loading={goalLoading && tasks.length === 0}
+                error={goalStateError}
+                onRetry={retryGoalState}
+                tasks={tasks}
+                dependencies={dependencies}
+                runs={runs}
+                ledger={ledger}
+                events={goalEvents}
+                agents={inventory.agents}
+              />
+            )}
+          </CardContent>
+        </Card>
 
         <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(360px,0.78fr)]">
           <div className="grid content-start gap-6">
@@ -824,98 +947,6 @@ export function OperatorWorkspace() {
           </div>
 
           <div className="grid content-start gap-6 lg:sticky lg:top-6 lg:self-start">
-            <Card>
-              <CardHeader>
-                <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
-                  <Activity className="size-4" /> LIVE INSPECTION
-                </div>
-                <CardTitle>{selectedGoal?.title ?? "Run progress"}</CardTitle>
-                <CardDescription>
-                  {selectedProject
-                    ? `${selectedProject.name} · polled every 5 seconds`
-                    : "Select a project to inspect persisted work."}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="grid gap-4">
-                <Field label="Goal">
-                  <select
-                    className="h-9 w-full rounded-lg border bg-background px-3 text-sm"
-                    value={selectedGoalId}
-                    onChange={(event) => setSelectedGoalId(event.target.value)}
-                    disabled={!goals.length}
-                  >
-                    <option value="">
-                      {goals.length
-                        ? "Select a goal"
-                        : "No goals in this project"}
-                    </option>
-                    {goals.map((goal) => (
-                      <option key={goal.id} value={goal.id}>
-                        {goal.title}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-
-                {activeRun ? (
-                  <div className="flex items-center gap-3 rounded-xl border border-blue-500/20 bg-blue-500/5 p-3 text-sm">
-                    <LoaderCircle className="size-4 animate-spin text-blue-600" />
-                    Run attempt {activeRun.attempt_number} is active. Progress
-                    will reconnect automatically.
-                  </div>
-                ) : null}
-                {recoverable ? (
-                  <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
-                    <RotateCcw className="mt-0.5 size-4 text-amber-600" />
-                    <span>
-                      Execution stopped in a recoverable state. Restart or
-                      resume the worker, then refresh; persisted history remains
-                      visible.
-                    </span>
-                  </div>
-                ) : null}
-
-                {!selectedGoalId ? (
-                  <EmptyState>
-                    Submit or select a goal to inspect its task graph and run
-                    attempts.
-                  </EmptyState>
-                ) : tasks.length === 0 ? (
-                  <EmptyState>
-                    The goal is persisted. No task has been decomposed for it
-                    yet.
-                  </EmptyState>
-                ) : (
-                  <div className="grid gap-2">
-                    {tasks.map((task) => {
-                      const taskRuns = runs.filter(
-                        (run) => run.task_id === task.id
-                      )
-                      return (
-                        <div key={task.id} className="rounded-xl border p-3">
-                          <div className="flex items-start justify-between gap-3">
-                            <div>
-                              <p className="font-medium">{task.title}</p>
-                              <p className="mt-1 text-xs text-muted-foreground">
-                                Updated {displayDate(task.updated_at)}
-                              </p>
-                            </div>
-                            <Badge variant={statusVariant(task.status)}>
-                              {task.status}
-                            </Badge>
-                          </div>
-                          <p className="mt-3 text-xs text-muted-foreground">
-                            {taskRuns.length} run attempt
-                            {taskRuns.length === 1 ? "" : "s"}
-                          </p>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">

@@ -33,6 +33,9 @@ class TaskRead(BaseModel):
     assignment_candidates: list
     assignment_rationale: dict
     assignment_updated_at: datetime | None
+    lease_owner: str | None
+    lease_token: int
+    lease_expires_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
