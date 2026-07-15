@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: code-index
+        name: refresh deterministic code index
+        entry: ./agentic-os index pre-commit
+        language: system
+        pass_filenames: false
+        always_run: true
