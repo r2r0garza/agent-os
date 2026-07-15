@@ -195,7 +195,12 @@ def _execute_claimed_task(
     if on_run_started is not None:
         # Commit so the run's "running" state is durably visible to other
         # connections (e.g. a verification harness polling for the process
-        # to reach this point) before the callback potentially blocks.
+        # to reach this point) before the callback potentially blocks. A
+        # resource key's exclusivity does not depend on this: it is held by
+        # a transaction-scoped advisory lock acquired at claim time (see
+        # ``claim_ready_task``), which stays held for this whole attempt
+        # regardless of when/whether an intermediate commit happens, and is
+        # released only when this transaction finally commits or rolls back.
         session.commit()
         on_run_started()
 

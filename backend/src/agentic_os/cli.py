@@ -37,12 +37,18 @@ def parser() -> argparse.ArgumentParser:
     run_once_parser.add_argument(
         "--lease-seconds", type=int, default=None, help="defaults to the worker's standard lease duration"
     )
+    run_once_parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="number of concurrent local worker loops to run (default 1)",
+    )
     return root
 
 
-def _run_worker_run_once(worker_id: str | None, lease_seconds: int | None) -> int:
+def _run_worker_run_once(worker_id: str | None, lease_seconds: int | None, workers: int) -> int:
     from agentic_os.domain import create_database_engine, session_factory
-    from agentic_os.worker import run_task_worker_once
+    from agentic_os.worker import run_scheduler_once
     from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS
 
     resolved_worker_id = worker_id or f"cli-{uuid.uuid4()}"
@@ -59,36 +65,31 @@ def _run_worker_run_once(worker_id: str | None, lease_seconds: int | None) -> in
 
     engine = create_database_engine()
     session_maker = session_factory(engine)
-    claimed = 0
     try:
-        while True:
-            with session_maker() as session:
-                try:
-                    task = run_task_worker_once(
-                        session,
-                        resolved_worker_id,
-                        lease_seconds=resolved_lease_seconds,
-                        on_run_started=on_run_started,
-                    )
-                except Exception as error:
-                    session.commit()
-                    print(f"task execution failed: {error}", file=sys.stderr)
-                    return 1
-                session.commit()
-                if task is None:
-                    break
-                claimed += 1
-                print(json.dumps({"task_id": str(task.id), "status": task.status}, sort_keys=True))
+        result = run_scheduler_once(
+            session_maker,
+            resolved_worker_id,
+            worker_count=workers,
+            lease_seconds=resolved_lease_seconds,
+            on_run_started=on_run_started,
+        )
     finally:
         engine.dispose()
-    print(f"claimed and processed {claimed} task(s)")
+
+    for task_id, status in result.claimed:
+        print(json.dumps({"task_id": task_id, "status": status}, sort_keys=True))
+    if result.errors:
+        for error in result.errors:
+            print(f"task execution failed: {error}", file=sys.stderr)
+        return 1
+    print(f"claimed and processed {len(result.claimed)} task(s)")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "worker":
-        return _run_worker_run_once(args.worker_id, args.lease_seconds)
+        return _run_worker_run_once(args.worker_id, args.lease_seconds, args.workers)
     try:
         if args.index_command == "build":
             result = build(args.repository, incremental=args.incremental)

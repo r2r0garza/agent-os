@@ -8,6 +8,7 @@ from agentic_os.worker.leases import (
 from agentic_os.worker.policy import evaluate_policy
 from agentic_os.worker.runner import TaskExecutionError, run_task_worker_once
 from agentic_os.worker.sandbox_execution import SandboxUnavailableError, execute_task_sandbox
+from agentic_os.worker.scheduler import SchedulerResult, run_scheduler_once
 from agentic_os.worker.tools import TOOL_REGISTRY, ToolNotFoundError, invoke_tool
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "LeaseLostError",
     "TOOL_REGISTRY",
     "SandboxUnavailableError",
+    "SchedulerResult",
     "TaskExecutionError",
     "ToolNotFoundError",
     "claim_ready_task",
@@ -23,5 +25,6 @@ __all__ = [
     "invoke_tool",
     "release_lease",
     "renew_lease",
+    "run_scheduler_once",
     "run_task_worker_once",
 ]
