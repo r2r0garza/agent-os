@@ -736,7 +736,7 @@ export function OperatorWorkspace() {
                         ? `${inventory.models.length} persisted profile${inventory.models.length === 1 ? "" : "s"} available.`
                         : "No model profile configured yet."}
                     </p>
-                    <Button disabled={mutation === "model"}>
+                    <Button type="submit" disabled={mutation === "model"}>
                       {mutation === "model" ? (
                         <LoaderCircle className="animate-spin" />
                       ) : (
@@ -771,7 +771,7 @@ export function OperatorWorkspace() {
                       />
                     </Field>
                   </div>
-                  <Button disabled={mutation === "project"}>
+                  <Button type="submit" disabled={mutation === "project"}>
                     {mutation === "project" ? (
                       <LoaderCircle className="animate-spin" />
                     ) : (
@@ -816,6 +816,7 @@ export function OperatorWorkspace() {
                     />
                   </Field>
                   <Button
+                    type="submit"
                     className="justify-self-end"
                     disabled={!selectedProjectId || mutation === "goal"}
                   >
@@ -929,6 +930,7 @@ export function OperatorWorkspace() {
                       {inventory.agents.length} agents persisted
                     </p>
                     <Button
+                      type="submit"
                       disabled={
                         !inventory.models.length || mutation === "agent"
                       }
