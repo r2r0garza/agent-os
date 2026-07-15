@@ -118,6 +118,12 @@ class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(TaskStatus, nullable=False, server_default="pending")
     required_capabilities: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    assigned_agent_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=True
+    )
+    lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_token: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class TaskDependency(Base):
@@ -265,17 +271,23 @@ class Budget(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 class Run(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "runs"
-    __table_args__ = (UniqueConstraint("task_id", "attempt_number", name="uq_runs_task_attempt"),)
+    __table_args__ = (
+        UniqueConstraint("task_id", "attempt_number", name="uq_runs_task_attempt"),
+        UniqueConstraint("task_id", "idempotency_key", name="uq_runs_task_idempotency_key"),
+    )
 
     task_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
     )
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    lease_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
     agent_version_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False
     )
     langgraph_thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(RunStatus, nullable=False, server_default="queued")
+    snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

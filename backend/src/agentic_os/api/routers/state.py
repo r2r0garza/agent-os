@@ -33,9 +33,11 @@ class RunRead(BaseModel):
     id: uuid.UUID
     task_id: uuid.UUID
     attempt_number: int
+    idempotency_key: str
     agent_version_id: uuid.UUID
     langgraph_thread_id: str | None
     status: str
+    snapshot: dict
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime

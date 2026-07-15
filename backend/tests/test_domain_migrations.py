@@ -234,7 +234,14 @@ class DomainMigrationTests(unittest.TestCase):
             )
             session.commit()
 
-            run = Run(task_id=task.id, attempt_number=1, agent_version_id=agent_version.id, status="running")
+            run = Run(
+                task_id=task.id,
+                attempt_number=1,
+                idempotency_key=f"{task.id}:1",
+                lease_token=1,
+                agent_version_id=agent_version.id,
+                status="running",
+            )
             session.add(run)
             session.flush()
 

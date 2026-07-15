@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from pathlib import Path
 
 from agentic_os.code_index import IndexError, build, check, explain, pre_commit
@@ -24,11 +25,48 @@ def parser() -> argparse.ArgumentParser:
     actions.add_parser("pre-commit", help="refresh and require generated changes to be staged")
     explain_parser = actions.add_parser("explain", help="explain an indexed symbol")
     explain_parser.add_argument("qualified_name")
+
+    worker = commands.add_parser("worker", help="run the durable task worker")
+    worker_actions = worker.add_subparsers(dest="worker_command", required=True)
+    run_once_parser = worker_actions.add_parser(
+        "run-once", help="claim and execute ready tasks until none remain"
+    )
+    run_once_parser.add_argument("--worker-id", default=None, help="defaults to a random worker id")
     return root
+
+
+def _run_worker_run_once(worker_id: str | None) -> int:
+    from agentic_os.domain import create_database_engine, session_factory
+    from agentic_os.worker import run_task_worker_once
+
+    resolved_worker_id = worker_id or f"cli-{uuid.uuid4()}"
+    engine = create_database_engine()
+    session_maker = session_factory(engine)
+    claimed = 0
+    try:
+        while True:
+            with session_maker() as session:
+                try:
+                    task = run_task_worker_once(session, resolved_worker_id)
+                except Exception as error:
+                    session.commit()
+                    print(f"task execution failed: {error}", file=sys.stderr)
+                    return 1
+                session.commit()
+                if task is None:
+                    break
+                claimed += 1
+                print(json.dumps({"task_id": str(task.id), "status": task.status}, sort_keys=True))
+    finally:
+        engine.dispose()
+    print(f"claimed and processed {claimed} task(s)")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "worker":
+        return _run_worker_run_once(args.worker_id)
     try:
         if args.index_command == "build":
             result = build(args.repository, incremental=args.incremental)
