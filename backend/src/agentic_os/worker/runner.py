@@ -4,6 +4,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
+from typing import Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -32,13 +33,25 @@ class TaskExecutionError(RuntimeError):
     """Raised when a claimed task cannot be executed to completion."""
 
 
-def run_task_worker_once(session: Session, worker_id: str, *, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> Task | None:
+def run_task_worker_once(
+    session: Session,
+    worker_id: str,
+    *,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    on_run_started: Callable[[], None] | None = None,
+) -> Task | None:
     """Claim and execute at most one ready task.
 
     Returns the claimed task (completed or failed), or ``None`` if no task
     was eligible to claim. A task left ``running`` by a prior attempt whose
     lease expired is reconciled as an interrupted run before the new
     attempt starts, so restarts never silently duplicate a completed step.
+
+    ``on_run_started``, when provided, is invoked once the new run has been
+    durably committed with ``status="running"`` and before any further work
+    happens. It exists so restart-recovery verification can pause a real
+    worker process at a controlled, persisted mid-run point before killing
+    it.
     """
     task = claim_ready_task(session, worker_id, lease_seconds=lease_seconds)
     if task is None:
@@ -50,7 +63,7 @@ def run_task_worker_once(session: Session, worker_id: str, *, lease_seconds: int
     _fail_interrupted_previous_attempt(session, task, project_id=project_id)
 
     try:
-        _execute_claimed_task(session, task, worker_id, project_id=project_id)
+        _execute_claimed_task(session, task, worker_id, project_id=project_id, on_run_started=on_run_started)
     except Exception as error:
         # Reconcile a run created earlier in this same failed attempt so it
         # never lingers as "running" once the attempt has already failed.
@@ -94,7 +107,14 @@ def _fail_interrupted_previous_attempt(session: Session, task: Task, *, project_
     session.flush()
 
 
-def _execute_claimed_task(session: Session, task: Task, worker_id: str, *, project_id: uuid.UUID | None) -> None:
+def _execute_claimed_task(
+    session: Session,
+    task: Task,
+    worker_id: str,
+    *,
+    project_id: uuid.UUID | None,
+    on_run_started: Callable[[], None] | None = None,
+) -> None:
     if project_id is None:
         raise TaskExecutionError(f"task {task.id} has no resolvable project through its goal")
 
@@ -169,6 +189,13 @@ def _execute_claimed_task(session: Session, task: Task, worker_id: str, *, proje
         )
     )
     session.flush()
+
+    if on_run_started is not None:
+        # Commit so the run's "running" state is durably visible to other
+        # connections (e.g. a verification harness polling for the process
+        # to reach this point) before the callback potentially blocks.
+        session.commit()
+        on_run_started()
 
     if policy_decision == "deny":
         raise TaskExecutionError(f"policy denied execution for agent {agent.id}")

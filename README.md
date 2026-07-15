@@ -3,6 +3,13 @@
 Agentic OS is a local-first, self-hostable environment for durable, governed
 agent work. See [VISION.md](VISION.md) for the product and architecture direction.
 
+## Restart recovery verification
+
+See [docs/restart-recovery-verification.md](docs/restart-recovery-verification.md)
+for how to run the automated and manual demonstrations that a deliberate
+mid-run worker process kill resumes from the last committed PostgreSQL
+boundary without losing or duplicating acknowledged work.
+
 ## Deterministic code index
 
 The committed `.code-index/` covers tracked Python backend and TypeScript/TSX or

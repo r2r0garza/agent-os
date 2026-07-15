@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -32,14 +34,29 @@ def parser() -> argparse.ArgumentParser:
         "run-once", help="claim and execute ready tasks until none remain"
     )
     run_once_parser.add_argument("--worker-id", default=None, help="defaults to a random worker id")
+    run_once_parser.add_argument(
+        "--lease-seconds", type=int, default=None, help="defaults to the worker's standard lease duration"
+    )
     return root
 
 
-def _run_worker_run_once(worker_id: str | None) -> int:
+def _run_worker_run_once(worker_id: str | None, lease_seconds: int | None) -> int:
     from agentic_os.domain import create_database_engine, session_factory
     from agentic_os.worker import run_task_worker_once
+    from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS
 
     resolved_worker_id = worker_id or f"cli-{uuid.uuid4()}"
+    resolved_lease_seconds = lease_seconds if lease_seconds is not None else DEFAULT_LEASE_SECONDS
+
+    pause_seconds_raw = os.environ.get("AGENTIC_OS_WORKER_TEST_PAUSE_AFTER_RUN_STARTED_SECONDS")
+    on_run_started = None
+    if pause_seconds_raw:
+        pause_seconds = float(pause_seconds_raw)
+
+        def on_run_started() -> None:
+            print(f"run started; pausing {pause_seconds}s for restart-recovery verification", file=sys.stderr)
+            time.sleep(pause_seconds)
+
     engine = create_database_engine()
     session_maker = session_factory(engine)
     claimed = 0
@@ -47,7 +64,12 @@ def _run_worker_run_once(worker_id: str | None) -> int:
         while True:
             with session_maker() as session:
                 try:
-                    task = run_task_worker_once(session, resolved_worker_id)
+                    task = run_task_worker_once(
+                        session,
+                        resolved_worker_id,
+                        lease_seconds=resolved_lease_seconds,
+                        on_run_started=on_run_started,
+                    )
                 except Exception as error:
                     session.commit()
                     print(f"task execution failed: {error}", file=sys.stderr)
@@ -66,7 +88,7 @@ def _run_worker_run_once(worker_id: str | None) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "worker":
-        return _run_worker_run_once(args.worker_id)
+        return _run_worker_run_once(args.worker_id, args.lease_seconds)
     try:
         if args.index_command == "build":
             result = build(args.repository, incremental=args.incremental)
