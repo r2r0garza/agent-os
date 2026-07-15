@@ -33,6 +33,7 @@ from agentic_os.domain.models import (
     Team,
     User,
 )
+from agentic_os.sandbox import runtime_available
 from agentic_os.worker import claim_ready_task, run_task_worker_once
 from agentic_os.worker.runner import TaskExecutionError
 
@@ -82,7 +83,9 @@ class WorkerTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         self.engine.dispose()
 
-    def _build_ready_task(self, session, *, tools: tuple[str, ...] = ("echo",)) -> Task:
+    def _build_ready_task(
+        self, session, *, tools: tuple[str, ...] = ("echo",), sandbox: dict | None = None
+    ) -> Task:
         team = Team(name=f"Team {uuid.uuid4()}")
         session.add(team)
         session.flush()
@@ -125,14 +128,18 @@ class WorkerTestCase(unittest.TestCase):
         session.add(budget)
         session.flush()
 
+        capability_manifest = {
+            "skill_version_id": str(skill_version.id),
+            "mcp_server_version_id": str(mcp_server_version.id),
+            "enabled_tools": list(tools),
+        }
+        if sandbox is not None:
+            capability_manifest["sandbox"] = sandbox
+
         agent_version = AgentVersion(
             agent_id=agent.id,
             version_number=1,
-            capability_manifest={
-                "skill_version_id": str(skill_version.id),
-                "mcp_server_version_id": str(mcp_server_version.id),
-                "enabled_tools": list(tools),
-            },
+            capability_manifest=capability_manifest,
             model_profile_id=None,
             default_budget_id=budget.id,
         )
@@ -215,6 +222,73 @@ class WorkerTestCase(unittest.TestCase):
         with self.Session() as session:
             runs = list(session.execute(select(Run).where(Run.task_id == task_id)).scalars())
             self.assertEqual(len(runs), 1)
+
+    def test_worker_executes_task_with_sandbox_and_persists_lifecycle_events(self) -> None:
+        available, reason = runtime_available("docker")
+        if not available:
+            available, reason = runtime_available("podman")
+            if not available:
+                self.skipTest(f"no sandbox runtime available: {reason}")
+
+        sandbox_config = {
+            "image": "alpine:latest",
+            "command": ["true"],
+            "network_policy": "none",
+            "cpu_limit": 1.0,
+            "memory_limit_mb": 256,
+            "timeout_seconds": 30,
+        }
+
+        with self.Session() as session:
+            task = self._build_ready_task(session, sandbox=sandbox_config)
+            task_id = task.id
+
+        with self.Session() as session:
+            claimed = run_task_worker_once(session, "worker-sandbox")
+            session.commit()
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.status, "completed")
+
+        with self.Session() as session:
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "completed")
+
+            event_types = [
+                row.event_type
+                for row in session.execute(
+                    select(AuditEvent).where(AuditEvent.run_id == run.id).order_by(AuditEvent.sequence_number)
+                ).scalars()
+            ]
+            self.assertEqual(
+                event_types,
+                [
+                    "run.started",
+                    "policy.decision",
+                    "tool.invoked",
+                    "skill.invoked",
+                    "sandbox.created",
+                    "sandbox.started",
+                    "sandbox.exited",
+                    "sandbox.stopped",
+                    "sandbox.cleaned_up",
+                    "run.completed",
+                ],
+            )
+
+            sandbox_events = list(
+                session.execute(
+                    select(AuditEvent).where(
+                        AuditEvent.run_id == run.id, AuditEvent.event_type.like("sandbox.%")
+                    )
+                ).scalars()
+            )
+            for event in sandbox_events:
+                self.assertEqual(event.task_id, task_id)
+                self.assertEqual(event.goal_id, task.goal_id)
+                self.assertIsNotNone(event.project_id)
+            exited_event = next(e for e in sandbox_events if e.event_type == "sandbox.exited")
+            self.assertEqual(exited_event.payload["exit_code"], 0)
+            self.assertFalse(exited_event.payload["timed_out"])
 
     def test_lease_prevents_concurrent_claim_until_expiry(self) -> None:
         with self.Session() as session:

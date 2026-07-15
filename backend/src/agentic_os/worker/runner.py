@@ -24,6 +24,7 @@ from agentic_os.domain.models import (
 )
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, release_lease, renew_lease
 from agentic_os.worker.policy import evaluate_policy
+from agentic_os.worker.sandbox_execution import execute_task_sandbox
 from agentic_os.worker.tools import invoke_tool
 
 
@@ -212,6 +213,17 @@ def _execute_claimed_task(session: Session, task: Task, worker_id: str, *, proje
             )
         )
     session.flush()
+
+    sandbox_config = capability_manifest.get("sandbox")
+    if sandbox_config:
+        sandbox_result = execute_task_sandbox(
+            session, task, run.id, sandbox_config, project_id=project_id
+        )
+        if sandbox_result["exit_code"] != 0 or sandbox_result["timed_out"]:
+            raise TaskExecutionError(
+                f"sandbox execution for task {task.id} did not succeed: {sandbox_result}"
+            )
+        tool_results["sandbox"] = sandbox_result
 
     renew_lease(session, task, worker_id)
 
