@@ -153,6 +153,8 @@ def _execute_claimed_task(
         "mcp_server_version_number": mcp_server_version.version_number if mcp_server_version else None,
         "enabled_tools": enabled_tools,
         "policy_decision": policy_decision,
+        "assignment_rationale": task.assignment_rationale,
+        "capability_manifest": capability_manifest,
     }
 
     run = Run(

@@ -151,6 +151,8 @@ class WorkerTestCase(unittest.TestCase):
             title="Governed worker task",
             status="pending",
             assigned_agent_version_id=agent_version.id,
+            assignment_status="assigned",
+            assignment_rationale={"selected_agent_version_id": str(agent_version.id)},
         )
         session.add(task)
         session.flush()
@@ -184,6 +186,15 @@ class WorkerTestCase(unittest.TestCase):
             self.assertEqual(run.snapshot["enabled_tools"], ["echo"])
             self.assertIsNotNone(run.snapshot["skill_version_id"])
             self.assertIsNotNone(run.snapshot["mcp_server_version_id"])
+            self.assertEqual(run.snapshot["agent_version_id"], str(run.agent_version_id))
+            self.assertEqual(
+                run.snapshot["assignment_rationale"]["selected_agent_version_id"],
+                str(run.agent_version_id),
+            )
+            self.assertEqual(
+                run.snapshot["capability_manifest"]["skill_version_id"],
+                run.snapshot["skill_version_id"],
+            )
 
             event_types = [
                 row.event_type

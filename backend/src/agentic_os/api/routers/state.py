@@ -28,6 +28,11 @@ class TaskRead(BaseModel):
     resource_intent: list
     policy_ids: list
     budget_id: uuid.UUID | None
+    assigned_agent_version_id: uuid.UUID | None
+    assignment_status: str
+    assignment_candidates: list
+    assignment_rationale: dict
+    assignment_updated_at: datetime | None
     created_at: datetime
     updated_at: datetime
 

@@ -128,6 +128,10 @@ class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     assigned_agent_version_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=True
     )
+    assignment_status: Mapped[str] = mapped_column(Text, nullable=False, server_default="unassigned")
+    assignment_candidates: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    assignment_rationale: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    assignment_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_token: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

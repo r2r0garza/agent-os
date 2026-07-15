@@ -451,6 +451,49 @@ class ApiWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422, response.text)
 
+    def test_assignment_api_exposes_selected_version_and_candidate_rationale(self) -> None:
+        goal = self._make_goal()
+        agent = client.post("/api/v1/agents", json={"name": f"Research Agent {uuid.uuid4()}"}).json()
+        version = client.post(
+            f"/api/v1/agents/{agent['id']}/versions",
+            json={"capability_manifest": {"capabilities": ["research"]}},
+        ).json()
+        graph = client.post(
+            f"/api/v1/goals/{goal['id']}/task-graph",
+            json={
+                "tasks": [
+                    {
+                        "client_id": "research",
+                        "title": "Research assignment",
+                        "required_capabilities": {"research": True},
+                    }
+                ]
+            },
+        ).json()
+        task_id = graph["tasks"][0]["id"]
+
+        response = client.post(f"/api/v1/tasks/{task_id}/assignment")
+        self.assertEqual(response.status_code, 200, response.text)
+        assignment = response.json()
+        self.assertEqual(assignment["status"], "assigned")
+        self.assertIsNotNone(assignment["selected_agent_version_id"])
+        self.assertTrue(
+            any(candidate["agent_version_id"] == version["id"] for candidate in assignment["candidates"])
+        )
+        selected = next(
+            candidate
+            for candidate in assignment["candidates"]
+            if candidate["agent_version_id"] == assignment["selected_agent_version_id"]
+        )
+        self.assertEqual(selected["matched_capabilities"], ["research"])
+        self.assertEqual(selected["rejection_reasons"], [])
+
+        inspected = client.get(f"/api/v1/tasks/{task_id}/assignment").json()
+        self.assertEqual(inspected, assignment)
+        task_state = client.get(f"/api/v1/tasks/{task_id}").json()
+        self.assertEqual(task_state["assigned_agent_version_id"], assignment["selected_agent_version_id"])
+        self.assertEqual(task_state["assignment_status"], "assigned")
+
 
 if __name__ == "__main__":
     unittest.main()
