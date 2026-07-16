@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -14,15 +15,20 @@ from sqlalchemy.exc import IntegrityError
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
+    AdminOverride,
     Agent,
     AgentVersion,
     AgentVersionMcpServer,
     AgentVersionPolicySet,
     AgentVersionSkill,
+    ApprovalDecisionRecord,
+    ApprovalModeConfiguration,
+    ApprovalRequest,
     Artifact,
     ArtifactVersion,
     AuditEvent,
     Budget,
+    BudgetReservation,
     Credential,
     CostLedgerEntry,
     Goal,
@@ -130,6 +136,11 @@ class DomainMigrationTests(unittest.TestCase):
             "policy_set_versions",
             "agent_version_policy_sets",
             "run_configuration_snapshots",
+            "approval_mode_configurations",
+            "approval_requests",
+            "approval_decisions",
+            "admin_overrides",
+            "budget_reservations",
         }
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -356,6 +367,316 @@ class DomainMigrationTests(unittest.TestCase):
             session.add(
                 Budget(agent_id=agent.id, currency="USD", amount_minor_units=-1, enforcement_mode="warning")
             )
+            with self.assertRaises(IntegrityError):
+                session.commit()
+
+    def test_approval_records_pin_configuration_and_policy_evidence_by_scope(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Approval Evidence Team")
+            operator = User(
+                email=f"approval-operator-{uuid.uuid4()}@example.test",
+                display_name="Approval Operator",
+            )
+            admin = User(
+                email=f"approval-admin-{uuid.uuid4()}@example.test",
+                display_name="Approval Admin",
+                role="admin",
+            )
+            session.add_all([team, operator, admin])
+            session.flush()
+            session.add_all(
+                [
+                    TeamMembership(team_id=team.id, user_id=operator.id),
+                    TeamMembership(team_id=team.id, user_id=admin.id),
+                ]
+            )
+            project = Project(team_id=team.id, created_by=operator.id, name="Approval Project")
+            session.add(project)
+            session.flush()
+            goal = Goal(project_id=project.id, created_by=operator.id, title="Approval Goal")
+            session.add(goal)
+            session.flush()
+            agent = Agent(team_id=team.id, created_by=operator.id, name="Approval Agent")
+            session.add(agent)
+            session.flush()
+            agent_version = AgentVersion(agent_id=agent.id, version_number=1, capability_manifest={})
+            session.add(agent_version)
+            session.flush()
+            task = Task(
+                goal_id=goal.id,
+                title="Approval Task",
+                assigned_agent_version_id=agent_version.id,
+            )
+            session.add(task)
+            session.flush()
+            run = Run(
+                task_id=task.id,
+                attempt_number=1,
+                idempotency_key=f"{task.id}:approval:1",
+                lease_token=1,
+                agent_version_id=agent_version.id,
+            )
+            session.add(run)
+            session.flush()
+
+            policy_set = PolicySet(team_id=team.id, created_by=admin.id, name="Approval policy")
+            session.add(policy_set)
+            session.flush()
+            policy_version = PolicySetVersion(
+                policy_set_id=policy_set.id,
+                version_number=1,
+                rules=[{"action": "tool.publish", "decision": "approval_required"}],
+            )
+            session.add(policy_version)
+            session.flush()
+
+            config_v1 = ApprovalModeConfiguration(
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                configured_by=operator.id,
+                version_number=1,
+                mode="consequential",
+                consequential_action_types=["tool.publish"],
+                context={"source": "goal"},
+            )
+            session.add(config_v1)
+            session.flush()
+            expires_at = datetime.now(UTC) + timedelta(hours=1)
+            request = ApprovalRequest(
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                agent_version_id=agent_version.id,
+                configuration_id=config_v1.id,
+                requested_by=operator.id,
+                mode=config_v1.mode,
+                action_type="tool.publish",
+                action_preview={"destination": "staging", "credential": "[REDACTED]"},
+                policy_version_ids=[str(policy_version.id)],
+                policy_evidence={"decision": "approval_required", "secret": "[REDACTED]"},
+                expires_at=expires_at,
+            )
+            session.add(request)
+            session.flush()
+            request.status = "approved"
+            request.resolved_at = datetime.now(UTC)
+            session.add(
+                ApprovalDecisionRecord(
+                    approval_request_id=request.id,
+                    decision="approved",
+                    actor_id=operator.id,
+                    reason="Reviewed destination and payload",
+                    context={"channel": "operator_queue"},
+                    evaluated_policy_version_ids=[str(policy_version.id)],
+                )
+            )
+            override = AdminOverride(
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                created_by=admin.id,
+                scope_type="run",
+                scope_id=run.id,
+                reason="Bounded incident response override",
+                starts_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(minutes=30),
+                evaluated_policy_version_ids=[str(policy_version.id)],
+                context={"ticket": "INC-42"},
+            )
+            session.add(override)
+
+            # A later edit creates a new configuration record. Existing requests
+            # continue to point at the version they evaluated before interruption.
+            config_v2 = ApprovalModeConfiguration(
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                configured_by=admin.id,
+                version_number=2,
+                mode="every_tool_call",
+                consequential_action_types=[],
+                context={"source": "admin_edit"},
+            )
+            session.add(config_v2)
+            session.commit()
+            request_id = request.id
+
+        with self.Session() as session:
+            scoped = session.execute(
+                text(
+                    "SELECT id, configuration_id, run_id, action_preview, policy_evidence "
+                    "FROM approval_requests "
+                    "WHERE team_id = :team_id AND project_id = :project_id AND run_id = :run_id"
+                ),
+                {"team_id": team.id, "project_id": project.id, "run_id": run.id},
+            ).one()
+            self.assertEqual(scoped.id, request_id)
+            self.assertEqual(scoped.configuration_id, config_v1.id)
+            self.assertEqual(scoped.action_preview["credential"], "[REDACTED]")
+            self.assertEqual(scoped.policy_evidence["secret"], "[REDACTED]")
+            self.assertEqual(
+                session.execute(
+                    text("SELECT count(*) FROM approval_mode_configurations WHERE goal_id = :goal_id"),
+                    {"goal_id": goal.id},
+                ).scalar_one(),
+                2,
+            )
+            decision = session.execute(
+                text(
+                    "SELECT actor_id, reason, evaluated_policy_version_ids "
+                    "FROM approval_decisions WHERE approval_request_id = :request_id"
+                ),
+                {"request_id": request_id},
+            ).one()
+            self.assertEqual(decision.actor_id, operator.id)
+            self.assertEqual(decision.evaluated_policy_version_ids, [str(policy_version.id)])
+            persisted_override = session.execute(
+                text("SELECT created_by, reason, scope_id FROM admin_overrides WHERE run_id = :run_id"),
+                {"run_id": run.id},
+            ).one()
+            self.assertEqual(persisted_override.created_by, admin.id)
+            self.assertEqual(persisted_override.scope_id, run.id)
+
+    def test_budget_reservations_and_reconciled_ledger_are_durable_integer_evidence(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Budget Evidence Team")
+            user = User(
+                email=f"budget-evidence-{uuid.uuid4()}@example.test",
+                display_name="Budget Operator",
+            )
+            session.add_all([team, user])
+            session.flush()
+            project = Project(team_id=team.id, created_by=user.id, name="Budget Project")
+            session.add(project)
+            session.flush()
+            goal = Goal(project_id=project.id, created_by=user.id, title="Budget Goal")
+            session.add(goal)
+            session.flush()
+            agent = Agent(team_id=team.id, created_by=user.id, name="Budget Agent")
+            session.add(agent)
+            session.flush()
+            budget = Budget(
+                agent_id=agent.id,
+                currency="USD",
+                amount_minor_units=10_000,
+                enforcement_mode="hard_stop",
+                warning_threshold_percent=80,
+            )
+            session.add(budget)
+            session.flush()
+            agent_version = AgentVersion(
+                agent_id=agent.id,
+                version_number=1,
+                capability_manifest={},
+                default_budget_id=budget.id,
+            )
+            session.add(agent_version)
+            session.flush()
+            task = Task(goal_id=goal.id, title="Budget Task", assigned_agent_version_id=agent_version.id)
+            session.add(task)
+            session.flush()
+            run = Run(
+                task_id=task.id,
+                attempt_number=1,
+                idempotency_key=f"{task.id}:budget:1",
+                lease_token=1,
+                agent_version_id=agent_version.id,
+            )
+            session.add(run)
+            session.flush()
+
+            reservation = BudgetReservation(
+                budget_id=budget.id,
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                agent_version_id=agent_version.id,
+                requested_by=user.id,
+                action_type="model_call",
+                amount_minor_units=300,
+                currency="USD",
+                status="reconciled",
+                warning_triggered=True,
+                pricing_evidence={"pricing_version": "2026-07", "maximum_tokens": 1000},
+                policy_version_ids=[str(uuid.uuid4())],
+                reconciled_at=datetime.now(UTC),
+            )
+            session.add(reservation)
+            session.flush()
+            ledger = CostLedgerEntry(
+                budget_id=budget.id,
+                run_id=run.id,
+                reservation_id=reservation.id,
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                agent_version_id=agent_version.id,
+                actor_id=user.id,
+                action_type="model_call",
+                reserved_amount_minor_units=300,
+                actual_amount_minor_units=275,
+                currency="USD",
+                warning_triggered=True,
+                evidence={"provider_usage": {"input_tokens": 250, "output_tokens": 50}},
+                status="reconciled",
+            )
+            session.add(ledger)
+            session.commit()
+            reservation_id = reservation.id
+            ledger_id = ledger.id
+
+            # Later budget configuration edits do not rewrite historical money evidence.
+            budget.amount_minor_units = 20_000
+            budget.warning_threshold_percent = 90
+            session.commit()
+
+        with self.Session() as session:
+            scoped_reservation = session.execute(
+                text(
+                    "SELECT id, amount_minor_units, status FROM budget_reservations "
+                    "WHERE team_id = :team_id AND project_id = :project_id AND run_id = :run_id"
+                ),
+                {"team_id": team.id, "project_id": project.id, "run_id": run.id},
+            ).one()
+            self.assertEqual(scoped_reservation.id, reservation_id)
+            self.assertEqual(scoped_reservation.amount_minor_units, 300)
+            scoped_ledger = session.execute(
+                text(
+                    "SELECT id, reserved_amount_minor_units, actual_amount_minor_units, actor_id "
+                    "FROM cost_ledger_entries "
+                    "WHERE team_id = :team_id AND project_id = :project_id AND run_id = :run_id"
+                ),
+                {"team_id": team.id, "project_id": project.id, "run_id": run.id},
+            ).one()
+            self.assertEqual(scoped_ledger.id, ledger_id)
+            self.assertEqual(scoped_ledger.reserved_amount_minor_units, 300)
+            self.assertEqual(scoped_ledger.actual_amount_minor_units, 275)
+            self.assertIsInstance(scoped_ledger.actual_amount_minor_units, int)
+            self.assertEqual(scoped_ledger.actor_id, user.id)
+
+            invalid = BudgetReservation(
+                budget_id=budget.id,
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                agent_version_id=agent_version.id,
+                action_type="unpriced_tool",
+                amount_minor_units=1,
+                currency="USD",
+                is_unpriced=True,
+                status="rejected",
+            )
+            session.add(invalid)
             with self.assertRaises(IntegrityError):
                 session.commit()
 

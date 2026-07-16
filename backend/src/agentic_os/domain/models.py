@@ -11,6 +11,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Identity,
+    Index,
     Integer,
     String,
     Text,
@@ -42,6 +43,21 @@ PolicyScopeType = Enum(
 PolicyDecision = Enum("deny", "approval_required", "allow", name="policy_decision", validate_strings=True)
 BudgetEnforcementMode = Enum("warning", "hard_stop", name="budget_enforcement_mode", validate_strings=True)
 LedgerEntryStatus = Enum("reserved", "reconciled", "void", name="ledger_entry_status", validate_strings=True)
+ApprovalMode = Enum(
+    "auto", "consequential", "every_tool_call", name="approval_mode", validate_strings=True
+)
+ApprovalRequestStatus = Enum(
+    "pending", "approved", "denied", "expired", "cancelled",
+    name="approval_request_status", validate_strings=True,
+)
+ApprovalDecisionType = Enum(
+    "approved", "denied", "expired", "cancelled",
+    name="approval_decision_type", validate_strings=True,
+)
+BudgetReservationStatus = Enum(
+    "active", "reconciled", "released", "rejected",
+    name="budget_reservation_status", validate_strings=True,
+)
 ArtifactStorageState = Enum(
     "staged", "finalized", "missing", "orphaned", name="artifact_storage_state", validate_strings=True
 )
@@ -544,10 +560,208 @@ class RunConfigurationSnapshot(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     configuration: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
 
+class ApprovalModeConfiguration(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "approval_mode_configurations"
+    __table_args__ = (
+        CheckConstraint("version_number > 0", name="version_positive"),
+        CheckConstraint(
+            "project_id IS NOT NULL OR goal_id IS NULL",
+            name="goal_configuration_requires_project",
+        ),
+        Index(
+            "ix_approval_mode_configurations_scope",
+            "team_id",
+            "project_id",
+            "goal_id",
+            "version_number",
+        ),
+    )
+
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="RESTRICT"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=True
+    )
+    goal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="RESTRICT"), nullable=True
+    )
+    configured_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    mode: Mapped[str] = mapped_column(ApprovalMode, nullable=False)
+    consequential_action_types: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class ApprovalRequest(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "approval_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "resolved_at IS NULL OR resolved_at >= created_at",
+            name="resolution_not_before_creation",
+        ),
+        Index("ix_approval_requests_scope", "team_id", "project_id", "run_id", "status"),
+    )
+
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="RESTRICT"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False
+    )
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="RESTRICT"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    configuration_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("approval_mode_configurations.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    mode: Mapped[str] = mapped_column(ApprovalMode, nullable=False)
+    status: Mapped[str] = mapped_column(ApprovalRequestStatus, nullable=False, server_default="pending")
+    action_type: Mapped[str] = mapped_column(Text, nullable=False)
+    action_preview: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    policy_version_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    policy_evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ApprovalDecisionRecord(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "approval_decisions"
+    __table_args__ = (
+        Index("ix_approval_decisions_request", "approval_request_id", "created_at"),
+    )
+
+    approval_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("approval_requests.id", ondelete="RESTRICT"), nullable=False
+    )
+    decision: Mapped[str] = mapped_column(ApprovalDecisionType, nullable=False)
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    evaluated_policy_version_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+
+
+class AdminOverride(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "admin_overrides"
+    __table_args__ = (
+        CheckConstraint("expires_at > starts_at", name="expiry_after_start"),
+        Index("ix_admin_overrides_scope", "team_id", "project_id", "scope_type", "scope_id"),
+    )
+
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="RESTRICT"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=True
+    )
+    goal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="RESTRICT"), nullable=True
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=True
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=True
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    scope_type: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evaluated_policy_version_ids: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class BudgetReservation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "budget_reservations"
+    __table_args__ = (
+        CheckConstraint("amount_minor_units >= 0", name="amount_non_negative"),
+        CheckConstraint(
+            "NOT is_unpriced OR amount_minor_units = 0",
+            name="unpriced_amount_is_zero",
+        ),
+        Index("ix_budget_reservations_scope", "team_id", "project_id", "run_id", "status"),
+    )
+
+    budget_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("budgets.id", ondelete="RESTRICT"), nullable=False
+    )
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="RESTRICT"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False
+    )
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="RESTRICT"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    action_type: Mapped[str] = mapped_column(Text, nullable=False)
+    amount_minor_units: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(
+        BudgetReservationStatus, nullable=False, server_default="active"
+    )
+    is_unpriced: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    warning_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    hard_stop_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    pricing_evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    policy_version_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class CostLedgerEntry(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     __tablename__ = "cost_ledger_entries"
     __table_args__ = (
         CheckConstraint("reserved_amount_minor_units >= 0", name="reserved_non_negative"),
+        CheckConstraint(
+            "actual_amount_minor_units IS NULL OR actual_amount_minor_units >= 0",
+            name="actual_non_negative",
+        ),
+        CheckConstraint(
+            "NOT is_unpriced OR (reserved_amount_minor_units = 0 "
+            "AND COALESCE(actual_amount_minor_units, 0) = 0)",
+            name="unpriced_amount_is_zero",
+        ),
+        Index("ix_cost_ledger_entries_scope", "team_id", "project_id", "run_id", "status"),
     )
 
     budget_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -556,11 +770,36 @@ class CostLedgerEntry(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
     )
+    reservation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("budget_reservations.id", ondelete="SET NULL"), nullable=True
+    )
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="SET NULL"), nullable=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True
+    )
+    goal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="SET NULL"), nullable=True
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
+    agent_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="SET NULL"), nullable=True
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     action_type: Mapped[str] = mapped_column(Text, nullable=False)
     reserved_amount_minor_units: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     actual_amount_minor_units: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
     is_zero_cost: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    is_unpriced: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    warning_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    hard_stop_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     status: Mapped[str] = mapped_column(LedgerEntryStatus, nullable=False, server_default="reserved")
 
 
