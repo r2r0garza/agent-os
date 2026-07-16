@@ -26,6 +26,8 @@ from agentic_os.domain import create_database_engine, database_url, session_fact
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
+    AgentVersionMcpServer,
+    AgentVersionSkill,
     Artifact,
     ArtifactCitation,
     ArtifactVersion,
@@ -38,6 +40,7 @@ from agentic_os.domain.models import (
     Policy,
     Project,
     Run,
+    RunConfigurationSnapshot,
     Skill,
     SkillVersion,
     Task,
@@ -171,6 +174,21 @@ class WorkerTestCase(unittest.TestCase):
         )
         session.add(agent_version)
         session.flush()
+        session.add(
+            AgentVersionSkill(
+                agent_version_id=agent_version.id,
+                skill_version_id=skill_version.id,
+                attachment_config={},
+            )
+        )
+        session.add(
+            AgentVersionMcpServer(
+                agent_version_id=agent_version.id,
+                mcp_server_version_id=mcp_server_version.id,
+                attachment_config={},
+            )
+        )
+        session.flush()
 
         task = Task(
             goal_id=goal.id,
@@ -240,6 +258,15 @@ class WorkerTestCase(unittest.TestCase):
             self.assertIsNotNone(run.snapshot["skill_version_id"])
             self.assertIsNotNone(run.snapshot["mcp_server_version_id"])
             self.assertEqual(run.snapshot["agent_version_id"], str(run.agent_version_id))
+            configuration_snapshot = session.get(
+                RunConfigurationSnapshot, uuid.UUID(run.snapshot["configuration_snapshot_id"])
+            )
+            self.assertIsNotNone(configuration_snapshot)
+            self.assertEqual(configuration_snapshot.run_id, run.id)
+            self.assertEqual(
+                configuration_snapshot.configuration["snapshot_id"],
+                run.snapshot["configuration_snapshot_id"],
+            )
             self.assertEqual(
                 run.snapshot["assignment_rationale"]["selected_agent_version_id"],
                 str(run.agent_version_id),
@@ -276,6 +303,23 @@ class WorkerTestCase(unittest.TestCase):
                 ).scalars()
             )
             self.assertEqual(len(artifact_versions), 1)
+
+            evidence_events = list(
+                session.execute(
+                    select(AuditEvent).where(
+                        AuditEvent.run_id == run.id,
+                        AuditEvent.event_type.in_(["run.started", "policy.decision", "tool.invoked"]),
+                    )
+                ).scalars()
+            )
+            self.assertTrue(evidence_events)
+            self.assertTrue(
+                all(
+                    event.payload["configuration_snapshot_id"]
+                    == run.snapshot["configuration_snapshot_id"]
+                    for event in evidence_events
+                )
+            )
 
         # Re-running the worker must not duplicate the already-completed task.
         with self.Session() as session:
@@ -321,6 +365,103 @@ class WorkerTestCase(unittest.TestCase):
             self.assertEqual(task.status, "failed")
             self.assertEqual(run.status, "failed")
             self.assertEqual(versions, [])
+
+    def test_unconfigured_tool_access_fails_before_invocation_with_audit_state(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session, tools=("not-attached",))
+            task_id = task.id
+
+        with self.Session() as session:
+            with mock.patch("agentic_os.worker.runner.invoke_tool") as invoke:
+                with self.assertRaisesRegex(TaskExecutionError, "unconfigured tools"):
+                    run_task_worker_once(session, "worker-unconfigured")
+                invoke.assert_not_called()
+            session.commit()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(task.status, "failed")
+            self.assertEqual(run.status, "failed")
+            self.assertIn("assigned_agent_version_id", run.snapshot)
+            event_types = {
+                event.event_type
+                for event in session.execute(
+                    select(AuditEvent).where(AuditEvent.task_id == task_id)
+                ).scalars()
+            }
+            self.assertIn("task.failed", event_types)
+            self.assertNotIn("tool.invoked", event_types)
+
+    def test_retry_reuses_snapshot_after_configuration_rows_change(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id = task.id
+
+        with self.Session() as session:
+            with mock.patch(
+                "agentic_os.worker.runner.invoke_tool", side_effect=RuntimeError("simulated crash")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                    run_task_worker_once(session, "worker-first")
+            session.commit()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            first_run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            snapshot_id = first_run.snapshot["configuration_snapshot_id"]
+            agent_version = session.get(AgentVersion, task.assigned_agent_version_id)
+            agent_version.capability_manifest = {"enabled_tools": []}
+            budget = session.get(Budget, uuid.UUID(first_run.snapshot["default_budget_id"]))
+            budget.amount_minor_units = 0
+            session.add(
+                Policy(scope_type="agent", scope_id=agent_version.agent_id, decision="deny", rule={})
+            )
+            mcp_attachment = session.execute(
+                select(AgentVersionMcpServer).where(
+                    AgentVersionMcpServer.agent_version_id == agent_version.id
+                )
+            ).scalar_one()
+            mcp_version = session.get(McpServerVersion, mcp_attachment.mcp_server_version_id)
+            mcp_version.connection_config = {"tools": []}
+            skill_attachment = session.execute(
+                select(AgentVersionSkill).where(AgentVersionSkill.agent_version_id == agent_version.id)
+            ).scalar_one()
+            skill_version = session.get(SkillVersion, skill_attachment.skill_version_id)
+            skill_version.content_ref = "skills/changed-after-snapshot/v2"
+            task.status = "pending"
+            session.commit()
+
+        with self.Session() as session:
+            claimed = run_task_worker_once(session, "worker-retry")
+            session.commit()
+            self.assertEqual(claimed.status, "completed")
+
+        with self.Session() as session:
+            runs = list(
+                session.execute(
+                    select(Run).where(Run.task_id == task_id).order_by(Run.attempt_number)
+                ).scalars()
+            )
+            self.assertEqual([run.status for run in runs], ["failed", "completed"])
+            self.assertEqual(runs[0].snapshot["configuration_snapshot_id"], snapshot_id)
+            self.assertEqual(runs[1].snapshot["configuration_snapshot_id"], snapshot_id)
+            self.assertEqual(runs[1].snapshot["enabled_tools"], ["echo"])
+            self.assertEqual(runs[1].snapshot["policy_decision"], "allow")
+            snapshots = list(
+                session.execute(
+                    select(RunConfigurationSnapshot)
+                    .join(Run, RunConfigurationSnapshot.run_id == Run.id)
+                    .where(Run.task_id == task_id)
+                ).scalars()
+            )
+            self.assertEqual(len(snapshots), 1)
+            retry_skill_event = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.run_id == runs[1].id, AuditEvent.event_type == "skill.invoked"
+                )
+            ).scalar_one()
+            self.assertEqual(retry_skill_event.payload["content_ref"], "skills/worker/v1")
 
     def test_worker_consumes_project_knowledge_and_publishes_cited_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

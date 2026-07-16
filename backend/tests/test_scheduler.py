@@ -18,6 +18,8 @@ from agentic_os.domain import create_database_engine, database_url, session_fact
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
+    AgentVersionMcpServer,
+    AgentVersionSkill,
     Budget,
     Goal,
     McpServer,
@@ -139,6 +141,21 @@ class SchedulerTestCase(unittest.TestCase):
             default_budget_id=budget.id,
         )
         session.add(agent_version)
+        session.flush()
+        session.add_all(
+            [
+                AgentVersionSkill(
+                    agent_version_id=agent_version.id,
+                    skill_version_id=skill_version.id,
+                    attachment_config={},
+                ),
+                AgentVersionMcpServer(
+                    agent_version_id=agent_version.id,
+                    mcp_server_version_id=mcp_server_version.id,
+                    attachment_config={},
+                ),
+            ]
+        )
         session.flush()
         session.commit()
         return goal, agent_version

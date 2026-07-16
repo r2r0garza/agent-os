@@ -174,6 +174,8 @@ class MultiAgentVerificationTests(unittest.TestCase):
                         "enabled_tools": ["echo"],
                     },
                     "default_budget_id": budget["id"],
+                    "skill_attachments": [{"version_id": skill_version["id"], "config": {}}],
+                    "mcp_server_attachments": [{"version_id": mcp_version["id"], "config": {}}],
                 },
             ).json()
             agent_versions[capability] = agent_version["id"]

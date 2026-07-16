@@ -16,22 +16,17 @@ from agentic_os.artifacts import (
     verify_artifact_version,
 )
 from agentic_os.domain.models import (
-    Agent,
-    AgentVersion,
     Artifact,
     AuditEvent,
-    Budget,
     Goal,
-    McpServerVersion,
+    Project,
     Run,
-    SkillVersion,
     Task,
 )
+from agentic_os.worker.configuration import ConfigurationSnapshotError, resolve_run_configuration
 from agentic_os.worker.governance import (
     BudgetExhaustedError,
-    evaluate_action_policy,
     reserve_action_cost,
-    resolve_tool_pricing,
 )
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, release_lease, renew_lease
 from agentic_os.worker.sandbox_execution import execute_task_sandbox
@@ -128,23 +123,9 @@ def _execute_claimed_task(
     if project_id is None:
         raise TaskExecutionError(f"task {task.id} has no resolvable project through its goal")
 
-    agent_version = session.get(AgentVersion, task.assigned_agent_version_id)
-    if agent_version is None:
-        raise TaskExecutionError(f"assigned agent version {task.assigned_agent_version_id} not found")
-    agent = session.get(Agent, agent_version.agent_id)
-    if agent is None:
-        raise TaskExecutionError(f"agent {agent_version.agent_id} not found")
-
-    capability_manifest = agent_version.capability_manifest or {}
-    skill_version = _load_ref(session, SkillVersion, capability_manifest.get("skill_version_id"))
-    mcp_server_version = _load_ref(session, McpServerVersion, capability_manifest.get("mcp_server_version_id"))
-    budget = session.get(Budget, agent_version.default_budget_id) if agent_version.default_budget_id else None
-    enabled_tools = list(capability_manifest.get("enabled_tools") or [])
-
-    mcp_server_id = mcp_server_version.mcp_server_id if mcp_server_version is not None else None
-    policy_decision, policy_evaluations = evaluate_action_policy(
-        session, agent_id=agent.id, mcp_server_id=mcp_server_id
-    )
+    project = session.get(Project, project_id)
+    if project is None:
+        raise TaskExecutionError(f"project {project_id} not found")
 
     attempt_number = (
         session.execute(
@@ -154,34 +135,54 @@ def _execute_claimed_task(
     )
     idempotency_key = f"{task.id}:{attempt_number}"
 
-    snapshot = {
-        "agent_id": str(agent.id),
-        "agent_version_id": str(agent_version.id),
-        "agent_version_number": agent_version.version_number,
-        "model_profile_id": str(agent_version.model_profile_id) if agent_version.model_profile_id else None,
-        "default_budget_id": str(agent_version.default_budget_id) if agent_version.default_budget_id else None,
-        "skill_version_id": str(skill_version.id) if skill_version else None,
-        "skill_version_number": skill_version.version_number if skill_version else None,
-        "mcp_server_version_id": str(mcp_server_version.id) if mcp_server_version else None,
-        "mcp_server_version_number": mcp_server_version.version_number if mcp_server_version else None,
-        "enabled_tools": enabled_tools,
-        "policy_decision": policy_decision,
-        "policy_evaluations": policy_evaluations,
-        "assignment_rationale": task.assignment_rationale,
-        "capability_manifest": capability_manifest,
-    }
-
     run = Run(
         task_id=task.id,
         attempt_number=attempt_number,
         idempotency_key=idempotency_key,
         lease_token=task.lease_token,
-        agent_version_id=agent_version.id,
+        agent_version_id=task.assigned_agent_version_id,
         status="running",
-        snapshot=snapshot,
+        snapshot={"assigned_agent_version_id": str(task.assigned_agent_version_id)},
         started_at=datetime.now(timezone.utc),
     )
     session.add(run)
+    session.flush()
+
+    try:
+        resolved = resolve_run_configuration(session, task=task, run=run, project=project)
+    except ConfigurationSnapshotError as error:
+        raise TaskExecutionError(str(error)) from error
+    configuration = resolved.configuration
+    agent = configuration["agent"]
+    budget = resolved.budget
+    enabled_tools = resolved.enabled_tools
+    policy_decision = resolved.policy_decision
+    policy_evaluations = resolved.policy_evaluations
+    capability_manifest = agent["capability_manifest"]
+    skills = configuration["skills"]
+    mcp_servers = configuration["mcp_servers"]
+    run.agent_version_id = uuid.UUID(agent["version_id"])
+
+    snapshot = {
+        "configuration_snapshot_id": str(resolved.snapshot_id),
+        "agent_id": agent["id"],
+        "agent_version_id": agent["version_id"],
+        "agent_version_number": agent["version_number"],
+        "model_profile_version_id": (
+            configuration["model_profile"]["id"] if configuration["model_profile"] else None
+        ),
+        "default_budget_id": configuration["budget"]["id"] if configuration["budget"] else None,
+        "skill_version_ids": [item["id"] for item in skills],
+        "skill_version_id": skills[0]["id"] if len(skills) == 1 else None,
+        "mcp_server_version_ids": [item["id"] for item in mcp_servers],
+        "mcp_server_version_id": mcp_servers[0]["id"] if len(mcp_servers) == 1 else None,
+        "enabled_tools": enabled_tools,
+        "policy_decision": policy_decision,
+        "policy_evaluations": policy_evaluations,
+        "assignment_rationale": configuration["assignment_rationale"],
+        "capability_manifest": capability_manifest,
+    }
+    run.snapshot = snapshot
     session.flush()
 
     session.add(
@@ -191,7 +192,13 @@ def _execute_claimed_task(
             task_id=task.id,
             run_id=run.id,
             event_type="run.started",
-            payload={"attempt_number": attempt_number, "worker_id": worker_id},
+            payload={
+                "attempt_number": attempt_number,
+                "worker_id": worker_id,
+                "configuration_snapshot_id": str(resolved.snapshot_id),
+                "agent_version_id": agent["version_id"],
+                "model_profile_version_id": snapshot["model_profile_version_id"],
+            },
         )
     )
     session.add(
@@ -201,7 +208,11 @@ def _execute_claimed_task(
             task_id=task.id,
             run_id=run.id,
             event_type="policy.decision",
-            payload={"decision": policy_decision, "evaluations": policy_evaluations},
+            payload={
+                "decision": policy_decision,
+                "evaluations": policy_evaluations,
+                "configuration_snapshot_id": str(resolved.snapshot_id),
+            },
         )
     )
     session.flush()
@@ -218,7 +229,7 @@ def _execute_claimed_task(
         on_run_started()
 
     if policy_decision == "deny":
-        raise TaskExecutionError(f"policy denied execution for agent {agent.id}")
+        raise TaskExecutionError(f"policy denied execution for agent {agent['id']}")
 
     if policy_decision == "approval_required":
         # A durable interrupt: leave the run and task in an explicit,
@@ -233,7 +244,11 @@ def _execute_claimed_task(
                 task_id=task.id,
                 run_id=run.id,
                 event_type="policy.approval_required",
-                payload={"decision": policy_decision, "evaluations": policy_evaluations},
+                payload={
+                    "decision": policy_decision,
+                    "evaluations": policy_evaluations,
+                    "configuration_snapshot_id": str(resolved.snapshot_id),
+                },
             )
         )
         session.flush()
@@ -246,9 +261,10 @@ def _execute_claimed_task(
     default_currency = budget.currency if budget else "USD"
     tool_results: dict[str, dict] = {}
     for tool_name in enabled_tools:
-        amount_minor_units, currency = resolve_tool_pricing(
-            mcp_server_version, tool_name, default_currency=default_currency
-        )
+        descriptor = resolved.tool_descriptor(tool_name)
+        pricing = descriptor.get("pricing") or {}
+        amount_minor_units = int(pricing.get("amount_minor_units", 0)) if pricing.get("chargeable") else 0
+        currency = pricing.get("currency", default_currency)
         try:
             reserve_action_cost(
                 session,
@@ -270,6 +286,7 @@ def _execute_claimed_task(
                         "tool": tool_name,
                         "budget_id": str(budget.id) if budget else None,
                         "reason": str(error),
+                        "configuration_snapshot_id": str(resolved.snapshot_id),
                     },
                 )
             )
@@ -285,12 +302,16 @@ def _execute_claimed_task(
                 task_id=task.id,
                 run_id=run.id,
                 event_type="tool.invoked",
-                payload={"tool": tool_name, "result": result},
+                payload={
+                    "tool": tool_name,
+                    "result": result,
+                    "configuration_snapshot_id": str(resolved.snapshot_id),
+                },
             )
         )
     session.flush()
 
-    if skill_version is not None:
+    for skill in skills:
         session.add(
             AuditEvent(
                 project_id=project_id,
@@ -298,7 +319,11 @@ def _execute_claimed_task(
                 task_id=task.id,
                 run_id=run.id,
                 event_type="skill.invoked",
-                payload={"skill_version_id": str(skill_version.id), "content_ref": skill_version.content_ref},
+                payload={
+                    "skill_version_id": skill["id"],
+                    "content_ref": skill["content_ref"],
+                    "configuration_snapshot_id": str(resolved.snapshot_id),
+                },
             )
         )
     session.flush()
@@ -384,9 +409,3 @@ def _execute_claimed_task(
     session.flush()
 
     release_lease(session, task, worker_id, status="completed")
-
-
-def _load_ref(session: Session, model: type, raw_id: object) -> object | None:
-    if not raw_id:
-        return None
-    return session.get(model, uuid.UUID(str(raw_id)))

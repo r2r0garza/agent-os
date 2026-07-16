@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, select
@@ -18,6 +19,16 @@ class BudgetExhaustedError(RuntimeError):
     Raised before any ``CostLedgerEntry`` records the rejected amount as
     spent, and before the caller performs the action's external side effect.
     """
+
+
+@dataclass(frozen=True)
+class BudgetLimit:
+    """Immutable budget fields copied into a run configuration snapshot."""
+
+    id: uuid.UUID
+    currency: str
+    amount_minor_units: int
+    enforcement_mode: str
 
 
 def combine_decisions(decisions: list[str]) -> str:
@@ -116,7 +127,7 @@ def _budget_consumed_minor_units(session: Session, budget_id: uuid.UUID) -> int:
 def reserve_action_cost(
     session: Session,
     *,
-    budget: Budget | None,
+    budget: Budget | BudgetLimit | None,
     run_id: uuid.UUID,
     action_type: str,
     amount_minor_units: int,

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from sqlalchemy import create_engine, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
-from agentic_os.domain.models import Run, Task
+from agentic_os.domain.models import Run, RunConfigurationSnapshot, Task
 from agentic_os.sandbox import runtime_available
 
 BACKEND_ROOT = Path(__file__).parents[1]
@@ -125,7 +125,7 @@ class RestartRecoveryTests(unittest.TestCase):
         budget through the versioned API, then persists a ready task directly
         (there is no task-creation endpoint yet). Returns (project_id, task_id).
         """
-        client.post(
+        model_profile = client.post(
             "/api/v1/model-profiles",
             json={
                 "name": "restart-verify-profile",
@@ -133,7 +133,9 @@ class RestartRecoveryTests(unittest.TestCase):
                 "model_identifier": "gpt-test",
                 "api_key": "sk-test-only",
             },
-        ).raise_for_status()
+        )
+        model_profile.raise_for_status()
+        model_profile = model_profile.json()
 
         project = client.post("/api/v1/projects", json={"name": "Restart Recovery Project"}).json()
         goal = client.post(
@@ -171,7 +173,10 @@ class RestartRecoveryTests(unittest.TestCase):
             json={
                 "instructions": "Use the echo tool.",
                 "capability_manifest": capability_manifest,
+                "model_profile_id": model_profile["id"],
                 "default_budget_id": budget["id"],
+                "skill_attachments": [{"version_id": skill_version["id"], "config": {}}],
+                "mcp_server_attachments": [{"version_id": mcp_version["id"], "config": {}}],
             },
         ).json()
 
@@ -265,6 +270,23 @@ class RestartRecoveryTests(unittest.TestCase):
             self.assertEqual(runs[1].status, "completed")
             self.assertEqual(runs[1].attempt_number, 2)
             self.assertEqual(runs[1].idempotency_key, f"{task_id}:2")
+            self.assertEqual(
+                runs[0].snapshot["configuration_snapshot_id"],
+                runs[1].snapshot["configuration_snapshot_id"],
+            )
+            self.assertIsNotNone(runs[0].snapshot["model_profile_version_id"])
+            self.assertEqual(
+                runs[0].snapshot["model_profile_version_id"],
+                runs[1].snapshot["model_profile_version_id"],
+            )
+            snapshots = list(
+                session.execute(
+                    select(RunConfigurationSnapshot)
+                    .join(Run, RunConfigurationSnapshot.run_id == Run.id)
+                    .where(Run.task_id == task_id)
+                ).scalars()
+            )
+            self.assertEqual(len(snapshots), 1)
             completed_run_id = runs[1].id
 
         # Progress/audit/cost/artifact evidence remains inspectable through
