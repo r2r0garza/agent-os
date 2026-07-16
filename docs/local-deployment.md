@@ -30,8 +30,8 @@ Compose creates explicit named volumes:
 - `agentic-os-telemetry-data` for optional telemetry state.
 
 Stopping the stack preserves these volumes. Do not use `compose down --volumes`
-unless intentionally destroying all local state. Backup, restore, master-key,
-and upgrade procedures are delivered by later Sprint 7 issues.
+unless intentionally destroying all local state. Use the operations commands
+below before upgrades or any intentional volume replacement.
 
 ## Docker
 
@@ -153,3 +153,83 @@ Each application role restarts independently. The API runs migrations only
 after PostgreSQL is healthy, the worker starts only after both API and sandbox
 runtime health checks pass, and the frontend starts only after the API is
 healthy.
+
+## Setup, migrations, backup, restore, and upgrade
+
+Run operational commands in the API image so the PostgreSQL client version and
+application migration code match the deployment:
+
+```bash
+docker compose run --rm api agentic-os operations setup-check
+docker compose run --rm api agentic-os operations migrations status
+docker compose run --rm api agentic-os operations migrations apply
+```
+
+Create the backup on a bind-mounted operator directory. The command creates a
+new gzip archive and refuses to replace an existing file:
+
+```bash
+mkdir -p ./local-backups
+docker compose run --rm \
+  -v "$PWD/local-backups:/backups" \
+  api agentic-os operations backup --output /backups/agentic-os-$(date +%Y%m%dT%H%M%S).tar.gz
+docker compose run --rm \
+  -v "$PWD/local-backups:/backups:ro" \
+  api agentic-os operations verify-backup /backups/agentic-os-YYYYMMDDTHHMMSS.tar.gz
+```
+
+The archive contains a PostgreSQL custom-format dump, all artifact bytes, a
+sanitized configuration description, and SHA-256 integrity evidence for every
+payload. It deliberately does **not** include master-key bytes or database
+credentials. Back up the matching `agentic-os-configuration` volume (or the
+`AGENTIC_OS_MASTER_KEY` secret) separately to encrypted, access-controlled
+storage, and label it with the backup timestamp. Never paste key material into
+command output, tickets, or logs.
+
+Restore into a clean, isolated PostgreSQL database and artifact directory
+first. The command verifies every payload before invoking `pg_restore` and
+refuses an active or non-empty target unless `--confirm-overwrite` is explicit:
+
+```bash
+docker compose run --rm \
+  -v "$PWD/local-backups:/backups:ro" \
+  -v "$PWD/local-restore-artifacts:/restore-artifacts" \
+  api agentic-os operations restore /backups/agentic-os-YYYYMMDDTHHMMSS.tar.gz \
+  --target-database-url 'postgresql+psycopg://agentic_os:RESTORE_PASSWORD@restore-postgres:5432/agentic_os_restore' \
+  --target-artifact-root /restore-artifacts
+```
+
+Restore the matching master key through the secret channel before starting an
+API or worker against the restored state. Then run `operations setup-check`
+and `operations migrations status`, inspect artifacts and acknowledged goals,
+and only then switch the deployment to the restored database and artifact
+root. `--confirm-overwrite` adds `pg_restore --clean --if-exists` and removes
+the target artifact directory; use it only after independently verifying the
+target and backup names.
+
+Before an upgrade, stop the worker from accepting new work, create and verify a
+backup, then run:
+
+```bash
+docker compose run --rm api agentic-os operations upgrade-preflight
+```
+
+Apply migrations only after preflight succeeds. If the upgrade must be rolled
+back, stop application services and restore the database dump, artifact bytes,
+configuration, and matching master key as one recovery set before starting the
+previous application image. Database rollback through Alembic downgrade is not
+the supported recovery path.
+
+### Manual backup/restore smoke test
+
+1. Start the stack, create a goal, and upload or produce an artifact.
+2. Run `operations setup-check`, create a backup, and run `verify-backup`.
+3. Provision an empty PostgreSQL database and empty artifact directory that are
+   not used by the running stack.
+4. Run `operations restore` against those isolated targets and restore the
+   matching master key separately.
+5. Point a stopped API/worker pair at the restored targets, run migration
+   status, start them, and verify the goal, artifact bytes, audit events, and
+   budget/approval state are present.
+6. For the failure check, alter a copied archive payload or choose the active
+   artifact root; verification or restore must exit non-zero before mutation.

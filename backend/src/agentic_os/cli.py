@@ -45,6 +45,28 @@ def parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="overwrite an existing key file"
     )
 
+    operations = commands.add_parser("operations", help="run bounded local deployment operations")
+    operation_actions = operations.add_subparsers(dest="operations_command", required=True)
+    operation_actions.add_parser("setup-check", help="validate setup and backup prerequisites")
+    migrations = operation_actions.add_parser(
+        "migrations", help="inspect or apply database migrations"
+    )
+    migrations.add_argument("action", choices=("status", "apply"))
+    backup = operation_actions.add_parser("backup", help="create an integrity-checked local backup")
+    backup.add_argument("--output", required=True, help="new .tar.gz backup path")
+    verify = operation_actions.add_parser(
+        "verify-backup", help="verify a backup without restoring it"
+    )
+    verify.add_argument("backup", help="backup .tar.gz path")
+    restore = operation_actions.add_parser("restore", help="restore a verified backup")
+    restore.add_argument("backup", help="backup .tar.gz path")
+    restore.add_argument("--target-database-url", required=True)
+    restore.add_argument("--target-artifact-root", required=True)
+    restore.add_argument("--confirm-overwrite", action="store_true")
+    operation_actions.add_parser(
+        "upgrade-preflight", help="check configuration and migrations before upgrade"
+    )
+
     worker = commands.add_parser("worker", help="run the durable task worker")
     worker_actions = worker.add_subparsers(dest="worker_command", required=True)
     run_once_parser = worker_actions.add_parser(
@@ -128,12 +150,61 @@ def _run_config_command(args: argparse.Namespace) -> int:
     raise AssertionError(f"unknown config command {args.config_command!r}")
 
 
+def _run_operations_command(args: argparse.Namespace) -> int:
+    import tempfile
+
+    from agentic_os.operations import (
+        OperationError,
+        apply_migrations,
+        create_backup,
+        migration_status,
+        restore_backup,
+        setup_check,
+        upgrade_preflight,
+        verify_backup,
+    )
+
+    try:
+        if args.operations_command == "setup-check":
+            print(setup_check())
+        elif args.operations_command == "migrations":
+            print(migration_status() if args.action == "status" else apply_migrations())
+        elif args.operations_command == "backup":
+            print(json.dumps(create_backup(args.output), sort_keys=True))
+        elif args.operations_command == "verify-backup":
+            with tempfile.TemporaryDirectory() as temporary:
+                _, manifest = verify_backup(args.backup, Path(temporary))
+            print(json.dumps({"verified": True, "manifest": manifest}, sort_keys=True))
+        elif args.operations_command == "restore":
+            print(
+                json.dumps(
+                    restore_backup(
+                        args.backup,
+                        target_database_url=args.target_database_url,
+                        target_artifact_root=args.target_artifact_root,
+                        confirm_overwrite=args.confirm_overwrite,
+                    ),
+                    sort_keys=True,
+                )
+            )
+        elif args.operations_command == "upgrade-preflight":
+            print(json.dumps(upgrade_preflight(), sort_keys=True))
+        else:
+            raise AssertionError(f"unknown operations command {args.operations_command!r}")
+    except OperationError as error:
+        print(f"operations error: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "worker":
         return _run_worker_run_once(args.worker_id, args.lease_seconds, args.workers)
     if args.command == "config":
         return _run_config_command(args)
+    if args.command == "operations":
+        return _run_operations_command(args)
     try:
         if args.index_command == "build":
             result = build(args.repository, incremental=args.incremental)
@@ -162,4 +233,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
