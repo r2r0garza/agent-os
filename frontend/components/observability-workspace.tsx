@@ -4,16 +4,20 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   Activity,
   AlertTriangle,
+  ArchiveRestore,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   CircleOff,
   Database,
   ExternalLink,
+  FileCheck2,
+  HardDrive,
   LoaderCircle,
   Radio,
   RefreshCw,
   ServerCog,
+  Settings,
   ShieldCheck,
   Workflow,
 } from "lucide-react"
@@ -398,6 +402,15 @@ export function ObservabilityWorkspace({
         ).length,
     [records]
   )
+  const recoveryEvidence = useMemo(() => {
+    const checkpointRecords = records.filter((record) => record.checkpoint_id)
+    const durableRuns = runs.filter((run) => run.langgraph_thread_id)
+    return {
+      checkpointCount: checkpointRecords.length,
+      durableRunCount: durableRuns.length,
+      latestRecordAt: records[0]?.occurred_at ?? null,
+    }
+  }, [records, runs])
 
   return (
     <section className="mb-6 grid gap-6">
@@ -500,6 +513,67 @@ export function ObservabilityWorkspace({
       <Card>
         <CardHeader>
           <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+            <ArchiveRestore className="size-4" /> OPERATOR RECOVERY EVIDENCE
+          </div>
+          <CardTitle>Durable work and restart readiness</CardTitle>
+          <CardDescription>
+            Goal-scoped evidence available to permitted operators. Deployment
+            configuration remains restricted to administrators.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {!goalId ? (
+            <div className="rounded-xl border border-dashed p-7 text-center text-sm text-muted-foreground">
+              Select a goal to inspect its persisted recovery evidence.
+            </div>
+          ) : timelineLoading && records.length === 0 ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <LoaderCircle className="animate-spin" /> Loading recovery
+              evidence…
+            </div>
+          ) : timelineError && records.length === 0 ? (
+            <Alert variant="destructive">
+              <AlertTriangle />
+              <AlertTitle>Recovery evidence unavailable</AlertTitle>
+              <AlertDescription>{timelineError}</AlertDescription>
+            </Alert>
+          ) : records.length === 0 ? (
+            <div className="rounded-xl border border-dashed p-7 text-center text-sm text-muted-foreground">
+              No durable execution evidence exists yet. Start or resume the
+              selected goal, then refresh.
+            </div>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-3">
+              <HealthTile
+                label="Canonical records"
+                status="available"
+                detail={`${records.length} persisted timeline record${records.length === 1 ? "" : "s"}`}
+                icon={<HardDrive className="size-4" />}
+              />
+              <HealthTile
+                label="Checkpoint links"
+                status={
+                  recoveryEvidence.checkpointCount ? "available" : "pending"
+                }
+                detail={`${recoveryEvidence.checkpointCount} resumable checkpoint reference${recoveryEvidence.checkpointCount === 1 ? "" : "s"}`}
+                icon={<FileCheck2 className="size-4" />}
+              />
+              <HealthTile
+                label="Durable run threads"
+                status={
+                  recoveryEvidence.durableRunCount ? "available" : "pending"
+                }
+                detail={`${recoveryEvidence.durableRunCount} run thread${recoveryEvidence.durableRunCount === 1 ? "" : "s"} · latest ${displayDate(recoveryEvidence.latestRecordAt)}`}
+                icon={<Workflow className="size-4" />}
+              />
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
             <ServerCog className="size-4" /> ADMIN OBSERVABILITY HEALTH
           </div>
           <CardTitle>Delivery and system health</CardTitle>
@@ -552,6 +626,17 @@ export function ObservabilityWorkspace({
               </div>
 
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {Object.entries(health.deployment.checks).map(
+                  ([name, check]) => (
+                    <HealthTile
+                      key={name}
+                      label={name.replaceAll("_", " ")}
+                      status={check.status}
+                      detail={check.detail}
+                      icon={<Settings className="size-4" />}
+                    />
+                  )
+                )}
                 <HealthTile
                   label="Database"
                   status={health.database.status}
@@ -594,6 +679,61 @@ export function ObservabilityWorkspace({
                   detail={`${health.telemetry.exporters.length} exporter${health.telemetry.exporters.length === 1 ? "" : "s"} configured`}
                   icon={<ExternalLink className="size-4" />}
                 />
+              </div>
+
+              <div className="grid gap-3 lg:grid-cols-2">
+                <div className="rounded-xl border bg-background p-3">
+                  <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+                    <ArchiveRestore className="size-4" /> Backup, restore, and
+                    upgrade commands
+                  </div>
+                  <div className="grid gap-2 font-mono text-xs text-muted-foreground">
+                    {Object.entries(health.maintenance.commands).map(
+                      ([name, command]) => (
+                        <div key={name} className="rounded-lg bg-muted/40 p-2">
+                          <span className="font-sans font-medium text-foreground">
+                            {name.replaceAll("_", " ")}
+                          </span>
+                          <p className="mt-1 break-all">{command}</p>
+                        </div>
+                      )
+                    )}
+                  </div>
+                </div>
+                <div className="rounded-xl border bg-background p-3">
+                  <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+                    <FileCheck2 className="size-4" /> Latest maintenance
+                    evidence
+                  </div>
+                  {health.maintenance.events.length ? (
+                    <div className="grid gap-2">
+                      {health.maintenance.events.map((event) => (
+                        <div
+                          key={event.id}
+                          className="rounded-lg bg-muted/40 p-2 text-xs"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-medium">
+                              {event.event_type
+                                .replace("operations.", "")
+                                .replaceAll("_", " ")}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {displayDate(event.occurred_at)}
+                            </span>
+                          </div>
+                          <p className="mt-1 line-clamp-2 font-mono text-[11px] break-all text-muted-foreground">
+                            {JSON.stringify(event.evidence)}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-dashed p-5 text-center text-sm text-muted-foreground">
+                      No maintenance command evidence has been recorded yet.
+                    </div>
+                  )}
+                </div>
               </div>
 
               {health.telemetry.exporters.length === 0 ? (

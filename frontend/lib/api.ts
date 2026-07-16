@@ -419,6 +419,25 @@ export interface ObservabilityRecord {
 export interface ObservabilityHealth {
   status: string
   checked_at: string
+  deployment: {
+    status: string
+    checks: Record<string, { status: string; detail: string }>
+  }
+  maintenance: {
+    events: Array<{
+      id: Identifier
+      event_type: string
+      occurred_at: string
+      evidence: Record<string, unknown>
+    }>
+    commands: {
+      setup_check: string
+      migration_status: string
+      backup: string
+      restore: string
+      upgrade_preflight: string
+    }
+  }
   database: { status: string; latency_ms: number }
   queues: {
     status: string

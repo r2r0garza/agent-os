@@ -15,6 +15,7 @@ from sqlalchemy import create_engine, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
+    AuditEvent,
     ObservabilityRecord,
     ProjectMember,
     Run,
@@ -223,6 +224,13 @@ class ObservabilityApiTests(unittest.TestCase):
         self.assertEqual(attempts.status_code, 403)
 
     def test_admin_health_and_failed_delivery_views_are_safe(self) -> None:
+        with SessionLocal.begin() as session:
+            session.add(
+                AuditEvent(
+                    event_type="operations.backup_created",
+                    payload={"backup": "/tmp/backup.tar.gz", "api_key": "do-not-expose"},
+                )
+            )
         with mock.patch(
             "agentic_os.api.routers.observability.runtime_available",
             side_effect=[(True, ""), (False, "podman unavailable")],
@@ -232,6 +240,17 @@ class ObservabilityApiTests(unittest.TestCase):
         health = response.json()
         self.assertEqual(health["database"]["status"], "healthy")
         self.assertGreaterEqual(health["database"]["latency_ms"], 0)
+        self.assertIn("migrations", health["deployment"]["checks"])
+        self.assertIn("master_key", health["deployment"]["checks"])
+        self.assertEqual(
+            health["maintenance"]["events"][0]["event_type"],
+            "operations.backup_created",
+        )
+        self.assertEqual(
+            health["maintenance"]["events"][0]["evidence"]["api_key"],
+            "[REDACTED]",
+        )
+        self.assertIn("operations backup", health["maintenance"]["commands"]["backup"])
         self.assertEqual(health["sandbox"]["status"], "degraded")
         self.assertEqual(health["sandbox"]["runtimes"]["docker"]["status"], "available")
         self.assertEqual(

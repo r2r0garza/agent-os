@@ -17,8 +17,9 @@ python -m pytest tests/test_observability_api.py tests/test_worker.py \
 
 - `test_observability_api.py` covers redaction of secrets in timeline and
   detail responses, project/task/run ownership authorization, admin-only
-  health and failed-delivery views, and degraded/stale health reporting for
-  workers, sandboxes, telemetry, and the event stream.
+  health and failed-delivery views, deployment/configuration checks, redacted
+  maintenance evidence, and degraded/stale health reporting for workers,
+  sandboxes, telemetry, and the event stream.
 - `test_worker.py` covers correlated evidence persisted by a real worker run
   (`test_worker_persists_correlated_records_when_export_is_disabled`) and
   telemetry export failure isolation from the completed product transaction
@@ -68,6 +69,9 @@ timing, browser reload behavior).
 5. Reload the browser. Confirm the persisted project/goal selection is restored
    and the same timeline is refetched from the backend rather than retained only
    in client memory.
+6. Confirm **Durable work and restart readiness** summarizes canonical records,
+   checkpoint links, and durable run threads for the selected goal. Select a
+   goal without execution evidence and confirm the empty guidance is shown.
 
 ## Telemetry disabled, delayed, failed, and recovered
 
@@ -89,15 +93,20 @@ timing, browser reload behavior).
    depth, active/stale workers, retry/failure counts, Docker/Podman availability,
    latest event-stream record, delivery counts, and exporter status from
    `/api/v1/admin/observability/health`.
-2. Create or use fixtures for a stale worker, failed run, delayed event stream,
+2. Confirm the same response drives database migration, artifact-root, and
+   master-key checks plus the backup/restore/upgrade command reference and the
+   latest redacted `operations.*` maintenance evidence. Run an operations
+   command from `docs/local-deployment.md`, refresh, and confirm its evidence
+   appears without credentials or secret material.
+3. Create or use fixtures for a stale worker, failed run, delayed event stream,
    unavailable sandbox runtime, and failed telemetry delivery. Confirm each state
    is visibly distinct and the overall health state is degraded appropriately.
-3. Restart the worker and repair telemetry delivery. Confirm retry/recovery state
+4. Restart the worker and repair telemetry delivery. Confirm retry/recovery state
    updates without losing the prior canonical history.
-4. Restart the frontend with `AGENTIC_OS_USER_ID` set to a regular project member.
+5. Restart the frontend with `AGENTIC_OS_USER_ID` set to a regular project member.
    Confirm the operator timeline remains available but the installation health
    panel shows **Admin role required**.
-5. Use a regular user without project membership and confirm the timeline shows
+6. Use a regular user without project membership and confirm the timeline shows
    the backend authorization error with a refresh/retry action available.
 
 ## Frontend checks

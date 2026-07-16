@@ -14,6 +14,7 @@ from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.domain.models import (
+    AuditEvent,
     Goal,
     ObservabilityRecord,
     Project,
@@ -25,6 +26,7 @@ from agentic_os.domain.models import (
     TelemetryExportSetting,
     User,
 )
+from agentic_os.health import deployment_health
 from agentic_os.sandbox.availability import runtime_available
 
 router = APIRouter(tags=["observability"])
@@ -329,6 +331,7 @@ def observability_health(
     actor: User = Depends(current_actor),
 ) -> dict:
     _require_admin(actor)
+    deployment = deployment_health(session.get_bind())
     database_check_started = perf_counter()
     session.execute(text("SELECT 1"))
     database_latency_ms = round((perf_counter() - database_check_started) * 1000, 3)
@@ -394,6 +397,14 @@ def observability_health(
             | TelemetryExportSetting.team_id.is_(None)
         ).order_by(TelemetryExportSetting.created_at)
     ).scalars()
+    maintenance_events = list(
+        session.execute(
+            select(AuditEvent)
+            .where(AuditEvent.event_type.like("operations.%"))
+            .order_by(AuditEvent.sequence_number.desc())
+            .limit(10)
+        ).scalars()
+    )
     sandbox = {}
     for runtime in ("docker", "podman"):
         available, reason = runtime_available(runtime)
@@ -436,6 +447,7 @@ def observability_health(
         else "healthy"
     )
     component_statuses = (
+        deployment["status"],
         "healthy",
         "degraded" if queue_counts.get("failed", 0) else "healthy",
         workers_status,
@@ -454,6 +466,25 @@ def observability_health(
     return {
         "status": overall_status,
         "checked_at": now,
+        "deployment": deployment,
+        "maintenance": {
+            "events": [
+                {
+                    "id": event.id,
+                    "event_type": event.event_type,
+                    "occurred_at": event.occurred_at,
+                    "evidence": redact_mapping(event.payload or {}),
+                }
+                for event in maintenance_events
+            ],
+            "commands": {
+                "setup_check": "./agentic-os operations setup-check",
+                "migration_status": "./agentic-os operations migrations status",
+                "backup": "./agentic-os operations backup --output <backup.tar.gz>",
+                "restore": "./agentic-os operations restore <backup.tar.gz> --target-database-url <url> --target-artifact-root <path>",
+                "upgrade_preflight": "./agentic-os operations upgrade-preflight",
+            },
+        },
         "database": {"status": "healthy", "latency_ms": database_latency_ms},
         "queues": {
             "status": "degraded" if queue_counts.get("failed", 0) else "healthy",
