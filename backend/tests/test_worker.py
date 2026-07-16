@@ -95,7 +95,14 @@ class WorkerTestCase(unittest.TestCase):
         self.engine.dispose()
 
     def _build_ready_task(
-        self, session, *, tools: tuple[str, ...] = ("echo",), sandbox: dict | None = None
+        self,
+        session,
+        *,
+        tools: tuple[str, ...] = ("echo",),
+        sandbox: dict | None = None,
+        tool_pricing: dict | None = None,
+        budget_amount_minor_units: int = 10_00,
+        budget_enforcement_mode: str = "hard_stop",
     ) -> Task:
         team = Team(name=f"Team {uuid.uuid4()}")
         session.add(team)
@@ -123,10 +130,13 @@ class WorkerTestCase(unittest.TestCase):
         mcp_server = McpServer(team_id=team.id, created_by=user.id, name="Worker MCP Server")
         session.add(mcp_server)
         session.flush()
+        echo_tool_descriptor: dict = {"name": "echo", "description": "Echo input"}
+        if tool_pricing is not None:
+            echo_tool_descriptor["pricing"] = tool_pricing
         mcp_server_version = McpServerVersion(
             mcp_server_id=mcp_server.id,
             version_number=1,
-            connection_config={"tools": [{"name": "echo", "description": "Echo input"}]},
+            connection_config={"tools": [echo_tool_descriptor]},
         )
         session.add(mcp_server_version)
         session.flush()
@@ -135,7 +145,12 @@ class WorkerTestCase(unittest.TestCase):
         session.add(agent)
         session.flush()
 
-        budget = Budget(agent_id=agent.id, currency="USD", amount_minor_units=10_00, enforcement_mode="hard_stop")
+        budget = Budget(
+            agent_id=agent.id,
+            currency="USD",
+            amount_minor_units=budget_amount_minor_units,
+            enforcement_mode=budget_enforcement_mode,
+        )
         session.add(budget)
         session.flush()
 
@@ -623,6 +638,152 @@ class WorkerTestCase(unittest.TestCase):
             self.assertIn("policy.decision", event_types)
             self.assertIn("task.failed", event_types)
             self.assertNotIn("tool.invoked", event_types)
+
+    def test_mcp_server_policy_deny_blocks_execution_before_tool_invocation(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id = task.id
+            agent_version = session.get(AgentVersion, task.assigned_agent_version_id)
+            mcp_server_version_id = uuid.UUID(agent_version.capability_manifest["mcp_server_version_id"])
+            mcp_server_version = session.get(McpServerVersion, mcp_server_version_id)
+            session.add(
+                Policy(scope_type="mcp_server", scope_id=mcp_server_version.mcp_server_id, decision="deny", rule={})
+            )
+            session.commit()
+
+        with self.Session() as session:
+            with self.assertRaises(TaskExecutionError):
+                run_task_worker_once(session, "worker-a")
+            session.commit()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.snapshot["policy_decision"], "deny")
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertIn("policy.decision", event_types)
+            self.assertNotIn("tool.invoked", event_types)
+
+    def test_policy_approval_required_blocks_task_in_safe_state(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id = task.id
+            agent_version = session.get(AgentVersion, task.assigned_agent_version_id)
+            session.add(
+                Policy(
+                    scope_type="agent",
+                    scope_id=agent_version.agent_id,
+                    decision="approval_required",
+                    rule={},
+                )
+            )
+            session.commit()
+
+        with self.Session() as session:
+            claimed = run_task_worker_once(session, "worker-a")
+            session.commit()
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.status, "blocked")
+            self.assertIsNone(claimed.lease_owner)
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "blocked")
+            self.assertIsNone(task.lease_owner)
+
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "waiting_approval")
+            self.assertIsNone(run.completed_at)
+            self.assertEqual(run.snapshot["policy_decision"], "approval_required")
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertIn("policy.approval_required", event_types)
+            self.assertNotIn("tool.invoked", event_types)
+            self.assertNotIn("task.failed", event_types)
+
+    def test_budget_hard_stop_blocks_chargeable_tool_before_invocation(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(
+                session,
+                tool_pricing={"chargeable": True, "amount_minor_units": 5_00, "currency": "USD"},
+                budget_amount_minor_units=3_00,
+            )
+            task_id = task.id
+
+        with self.Session() as session:
+            with self.assertRaises(TaskExecutionError):
+                run_task_worker_once(session, "worker-a")
+            session.commit()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.snapshot["policy_decision"], "allow")
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertIn("budget.exhausted", event_types)
+            self.assertIn("task.failed", event_types)
+            self.assertNotIn("tool.invoked", event_types)
+
+            ledger_entries = list(
+                session.execute(select(CostLedgerEntry).where(CostLedgerEntry.run_id == run.id)).scalars()
+            )
+            self.assertEqual(len(ledger_entries), 1)
+            self.assertEqual(ledger_entries[0].status, "void")
+            self.assertEqual(ledger_entries[0].reserved_amount_minor_units, 500)
+            self.assertIsNone(ledger_entries[0].actual_amount_minor_units)
+            self.assertFalse(ledger_entries[0].is_zero_cost)
+
+    def test_budget_warning_mode_allows_chargeable_tool_past_threshold(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(
+                session,
+                tool_pricing={"chargeable": True, "amount_minor_units": 5_00, "currency": "USD"},
+                budget_amount_minor_units=3_00,
+                budget_enforcement_mode="warning",
+            )
+            task_id = task.id
+
+        with self.Session() as session:
+            claimed = run_task_worker_once(session, "worker-a")
+            session.commit()
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.status, "completed")
+
+        with self.Session() as session:
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "completed")
+
+            ledger_entries = list(
+                session.execute(select(CostLedgerEntry).where(CostLedgerEntry.run_id == run.id)).scalars()
+            )
+            self.assertEqual(len(ledger_entries), 1)
+            self.assertEqual(ledger_entries[0].status, "reconciled")
+            self.assertEqual(ledger_entries[0].reserved_amount_minor_units, 500)
+            self.assertEqual(ledger_entries[0].actual_amount_minor_units, 500)
+            self.assertFalse(ledger_entries[0].is_zero_cost)
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertIn("tool.invoked", event_types)
 
     def test_claim_ignores_tasks_without_assigned_agent(self) -> None:
         with self.Session() as session:

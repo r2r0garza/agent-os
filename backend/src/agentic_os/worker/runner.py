@@ -21,15 +21,19 @@ from agentic_os.domain.models import (
     Artifact,
     AuditEvent,
     Budget,
-    CostLedgerEntry,
     Goal,
     McpServerVersion,
     Run,
     SkillVersion,
     Task,
 )
+from agentic_os.worker.governance import (
+    BudgetExhaustedError,
+    evaluate_action_policy,
+    reserve_action_cost,
+    resolve_tool_pricing,
+)
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, release_lease, renew_lease
-from agentic_os.worker.policy import evaluate_policy
 from agentic_os.worker.sandbox_execution import execute_task_sandbox
 from agentic_os.worker.tools import invoke_tool
 from agentic_os.worker.workspace import promote_workspace_changes
@@ -137,7 +141,10 @@ def _execute_claimed_task(
     budget = session.get(Budget, agent_version.default_budget_id) if agent_version.default_budget_id else None
     enabled_tools = list(capability_manifest.get("enabled_tools") or [])
 
-    policy_decision = evaluate_policy(session, scope_type="agent", scope_id=agent.id)
+    mcp_server_id = mcp_server_version.mcp_server_id if mcp_server_version is not None else None
+    policy_decision, policy_evaluations = evaluate_action_policy(
+        session, agent_id=agent.id, mcp_server_id=mcp_server_id
+    )
 
     attempt_number = (
         session.execute(
@@ -159,6 +166,7 @@ def _execute_claimed_task(
         "mcp_server_version_number": mcp_server_version.version_number if mcp_server_version else None,
         "enabled_tools": enabled_tools,
         "policy_decision": policy_decision,
+        "policy_evaluations": policy_evaluations,
         "assignment_rationale": task.assignment_rationale,
         "capability_manifest": capability_manifest,
     }
@@ -193,7 +201,7 @@ def _execute_claimed_task(
             task_id=task.id,
             run_id=run.id,
             event_type="policy.decision",
-            payload={"scope_type": "agent", "scope_id": str(agent.id), "decision": policy_decision},
+            payload={"decision": policy_decision, "evaluations": policy_evaluations},
         )
     )
     session.flush()
@@ -212,11 +220,62 @@ def _execute_claimed_task(
     if policy_decision == "deny":
         raise TaskExecutionError(f"policy denied execution for agent {agent.id}")
 
+    if policy_decision == "approval_required":
+        # A durable interrupt: leave the run and task in an explicit,
+        # inspectable safe state rather than proceeding to any tool, skill,
+        # or sandbox side effect. Resuming after approval is a separate,
+        # future concern; this run attempt stops here.
+        run.status = "waiting_approval"
+        session.add(
+            AuditEvent(
+                project_id=project_id,
+                goal_id=task.goal_id,
+                task_id=task.id,
+                run_id=run.id,
+                event_type="policy.approval_required",
+                payload={"decision": policy_decision, "evaluations": policy_evaluations},
+            )
+        )
+        session.flush()
+        release_lease(session, task, worker_id, status="blocked")
+        return
+
     storage = artifact_storage()
     consumed_knowledge = consume_task_knowledge(session, storage, task, run, project_id=project_id)
 
+    default_currency = budget.currency if budget else "USD"
     tool_results: dict[str, dict] = {}
     for tool_name in enabled_tools:
+        amount_minor_units, currency = resolve_tool_pricing(
+            mcp_server_version, tool_name, default_currency=default_currency
+        )
+        try:
+            reserve_action_cost(
+                session,
+                budget=budget,
+                run_id=run.id,
+                action_type="mcp_tool_call",
+                amount_minor_units=amount_minor_units,
+                currency=currency,
+            )
+        except BudgetExhaustedError as error:
+            session.add(
+                AuditEvent(
+                    project_id=project_id,
+                    goal_id=task.goal_id,
+                    task_id=task.id,
+                    run_id=run.id,
+                    event_type="budget.exhausted",
+                    payload={
+                        "tool": tool_name,
+                        "budget_id": str(budget.id) if budget else None,
+                        "reason": str(error),
+                    },
+                )
+            )
+            session.flush()
+            raise TaskExecutionError(str(error)) from error
+
         result = invoke_tool(tool_name, {"task_id": str(task.id), "run_id": str(run.id)})
         tool_results[tool_name] = result
         session.add(
@@ -227,18 +286,6 @@ def _execute_claimed_task(
                 run_id=run.id,
                 event_type="tool.invoked",
                 payload={"tool": tool_name, "result": result},
-            )
-        )
-        session.add(
-            CostLedgerEntry(
-                budget_id=budget.id if budget else None,
-                run_id=run.id,
-                action_type="mcp_tool_call",
-                reserved_amount_minor_units=0,
-                actual_amount_minor_units=0,
-                currency=budget.currency if budget else "USD",
-                is_zero_cost=True,
-                status="reconciled",
             )
         )
     session.flush()
