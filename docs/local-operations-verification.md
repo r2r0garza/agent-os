@@ -214,6 +214,11 @@ code index is current
 
 This confirms that `.code-index/dependencies.jsonl` and the related generated
 index artifacts match the tracked source after the final operations changes.
+A subsequent milestone audit reported one stale-dependency result, so the
+index was also rebuilt without incremental reuse. The full rebuild reparsed
+all 168 files, produced the same tracked artifacts, and three consecutive
+`./agentic-os index check` runs then passed. This rules out a committed index
+diff while preserving the observed audit result in the verification record.
 
 ## Interpreting failures
 
