@@ -120,22 +120,32 @@ class RestartRecoveryTests(unittest.TestCase):
             time.sleep(0.2)
         self.fail(f"run for task {task_id} did not reach status {status!r} within {timeout}s")
 
-    def _configure_workflow_task(self, *, sandbox: dict | None) -> tuple[uuid.UUID, uuid.UUID]:
+    def _configure_workflow_task(
+        self, *, sandbox: dict | None
+    ) -> tuple[uuid.UUID, uuid.UUID, dict[str, str]]:
         """Configures model profile, project, goal, skill, MCP tool, agent, and
         budget through the versioned API, then persists a ready task directly
         (there is no task-creation endpoint yet). Returns (project_id, task_id).
         """
-        model_profile = client.post(
+        model_secret = "sk-restart-verification-secret"
+        model_profile_response = client.post(
             "/api/v1/model-profiles",
             json={
                 "name": "restart-verify-profile",
                 "base_url": "https://api.example.com/v1",
                 "model_identifier": "gpt-test",
-                "api_key": "sk-test-only",
+                "api_key": model_secret,
             },
         )
-        model_profile.raise_for_status()
-        model_profile = model_profile.json()
+        model_profile_response.raise_for_status()
+        self.assertNotIn(model_secret, model_profile_response.text)
+        model_profile = model_profile_response.json()
+        profile_versions_response = client.get(
+            f"/api/v1/model-profiles/{model_profile['id']}/versions"
+        )
+        profile_versions_response.raise_for_status()
+        self.assertNotIn(model_secret, profile_versions_response.text)
+        model_profile_version = profile_versions_response.json()[0]
 
         project = client.post("/api/v1/projects", json={"name": "Restart Recovery Project"}).json()
         goal = client.post(
@@ -151,7 +161,29 @@ class RestartRecoveryTests(unittest.TestCase):
         mcp_server = client.post("/api/v1/mcp-servers", json={"name": "Restart Verification MCP Server"}).json()
         mcp_version = client.post(
             f"/api/v1/mcp-servers/{mcp_server['id']}/versions",
-            json={"connection_config": {"tools": [{"name": "echo", "description": "Echo input"}]}},
+            json={
+                "connection_config": {
+                    "tools": [
+                        {
+                            "name": "echo",
+                            "description": "Echo input",
+                            "pricing": {
+                                "chargeable": True,
+                                "amount_minor_units": 25,
+                                "currency": "USD",
+                            },
+                        }
+                    ]
+                }
+            },
+        ).json()
+
+        policy_set = client.post(
+            "/api/v1/policy-sets", json={"name": "Restart Verification Policy"}
+        ).json()
+        policy_version = client.post(
+            f"/api/v1/policy-sets/{policy_set['id']}/versions",
+            json={"rules": [{"action": "mcp_tool_call", "decision": "allow"}]},
         ).json()
 
         agent = client.post("/api/v1/agents", json={"name": "Restart Verification Agent"}).json()
@@ -177,8 +209,11 @@ class RestartRecoveryTests(unittest.TestCase):
                 "default_budget_id": budget["id"],
                 "skill_attachments": [{"version_id": skill_version["id"], "config": {}}],
                 "mcp_server_attachments": [{"version_id": mcp_version["id"], "config": {}}],
+                "policy_set_version_ids": [policy_version["id"]],
             },
-        ).json()
+        )
+        agent_version.raise_for_status()
+        agent_version = agent_version.json()
 
         with self.Session() as session:
             task = Task(
@@ -191,7 +226,19 @@ class RestartRecoveryTests(unittest.TestCase):
             session.commit()
             task_id = task.id
 
-        return uuid.UUID(project["id"]), task_id
+        return (
+            uuid.UUID(project["id"]),
+            task_id,
+            {
+                "model_secret": model_secret,
+                "model_profile_version_id": model_profile_version["id"],
+                "skill_version_id": skill_version["id"],
+                "mcp_server_version_id": mcp_version["id"],
+                "policy_set_version_id": policy_version["id"],
+                "budget_id": budget["id"],
+                "agent_version_id": agent_version["id"],
+            },
+        )
 
     def test_worker_process_kill_and_restart_resumes_without_duplicating_work(self) -> None:
         sandbox_config = None
@@ -208,7 +255,7 @@ class RestartRecoveryTests(unittest.TestCase):
                 "timeout_seconds": 30,
             }
 
-        project_id, task_id = self._configure_workflow_task(sandbox=sandbox_config)
+        project_id, task_id, expected = self._configure_workflow_task(sandbox=sandbox_config)
 
         with self.Session() as session:
             task = session.get(Task, task_id)
@@ -279,6 +326,19 @@ class RestartRecoveryTests(unittest.TestCase):
                 runs[0].snapshot["model_profile_version_id"],
                 runs[1].snapshot["model_profile_version_id"],
             )
+            self.assertEqual(
+                runs[1].snapshot["model_profile_version_id"],
+                expected["model_profile_version_id"],
+            )
+            self.assertEqual(runs[1].snapshot["skill_version_ids"], [expected["skill_version_id"]])
+            self.assertEqual(
+                runs[1].snapshot["mcp_server_version_ids"],
+                [expected["mcp_server_version_id"]],
+            )
+            self.assertEqual(runs[1].snapshot["default_budget_id"], expected["budget_id"])
+            self.assertEqual(runs[1].snapshot["agent_version_id"], expected["agent_version_id"])
+            self.assertEqual(runs[1].snapshot["enabled_tools"], ["echo"])
+            self.assertEqual(runs[1].snapshot["policy_decision"], "allow")
             snapshots = list(
                 session.execute(
                     select(RunConfigurationSnapshot)
@@ -287,6 +347,12 @@ class RestartRecoveryTests(unittest.TestCase):
                 ).scalars()
             )
             self.assertEqual(len(snapshots), 1)
+            snapshot_configuration = snapshots[0].configuration
+            self.assertEqual(
+                [item["id"] for item in snapshot_configuration["policy_sets"]],
+                [expected["policy_set_version_id"]],
+            )
+            self.assertNotIn(expected["model_secret"], str(snapshot_configuration))
             completed_run_id = runs[1].id
 
         # Progress/audit/cost/artifact evidence remains inspectable through
@@ -295,11 +361,18 @@ class RestartRecoveryTests(unittest.TestCase):
         self.assertEqual(len(api_runs), 2)
         self.assertEqual(api_runs[0]["status"], "failed")
         self.assertEqual(api_runs[1]["status"], "completed")
+        self.assertEqual(
+            api_runs[0]["snapshot"]["configuration_snapshot_id"],
+            api_runs[1]["snapshot"]["configuration_snapshot_id"],
+        )
+        self.assertNotIn(expected["model_secret"], str(api_runs))
 
         audit_events = client.get("/api/v1/audit-events", params={"task_id": str(task_id)}).json()
         event_types = [event["event_type"] for event in audit_events]
         self.assertIn("run.interrupted", event_types)
         self.assertIn("run.completed", event_types)
+        self.assertIn("policy.decision", event_types)
+        self.assertIn("tool.invoked", event_types)
         interrupted_event = next(event for event in audit_events if event["event_type"] == "run.interrupted")
         self.assertEqual(interrupted_event["run_id"], str(first_attempt.id))
 
@@ -310,7 +383,12 @@ class RestartRecoveryTests(unittest.TestCase):
         self.assertEqual(artifacts[0]["run_id"], str(completed_run_id))
 
         ledger_entries = client.get("/api/v1/cost-ledger-entries", params={"run_id": str(completed_run_id)}).json()
-        self.assertTrue(ledger_entries)
+        self.assertEqual(len(ledger_entries), 1)
+        self.assertEqual(ledger_entries[0]["budget_id"], expected["budget_id"])
+        self.assertEqual(ledger_entries[0]["reserved_amount_minor_units"], 25)
+        self.assertEqual(ledger_entries[0]["actual_amount_minor_units"], 25)
+        self.assertEqual(ledger_entries[0]["status"], "reconciled")
+        self.assertFalse(ledger_entries[0]["is_zero_cost"])
 
         # Duplicate execution is prevented: the completed task is no longer
         # claimable, so a further worker restart finds nothing to do.

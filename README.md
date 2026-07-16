@@ -81,6 +81,13 @@ for how to run the automated and manual demonstrations that a deliberate
 mid-run worker process kill resumes from the last committed PostgreSQL
 boundary without losing or duplicating acknowledged work.
 
+## Governed agent configuration verification
+
+See [docs/governed-configuration-verification.md](docs/governed-configuration-verification.md)
+for the Sprint 4 automated suite and manual demonstration covering versioned
+agent configuration, credential redaction, policy and budget enforcement,
+pinned worker snapshots, frontend evidence, and restart continuity.
+
 ## Multi-agent scheduling, conflict, and restart-recovery verification
 
 See [docs/multi-agent-verification.md](docs/multi-agent-verification.md)

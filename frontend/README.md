@@ -10,6 +10,10 @@ The operator console proxies its requests to the versioned FastAPI backend. Set
 
 Manual smoke check:
 
+For the complete governed-configuration setup, restart, enforcement, and
+evidence checklist, see
+[`docs/governed-configuration-verification.md`](../docs/governed-configuration-verification.md).
+
 1. Start PostgreSQL and the backend API, then start this app with `pnpm dev`.
 2. Create a model profile, project, and goal from the console.
 3. Provision the skill, test MCP server, lifetime budget, and agent version.
