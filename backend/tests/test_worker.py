@@ -98,6 +98,7 @@ def setUpModule() -> None:
             "AGENTIC_OS_DATABASE_URL to run worker tests: "
             f"{error}"
         )
+    os.environ["AGENTIC_OS_DATABASE_URL"] = TEST_DATABASE_URL
     _apply_migrations_from_zero(TEST_DATABASE_URL)
 
 
@@ -120,9 +121,11 @@ class WorkerTestCase(unittest.TestCase):
         budget_enforcement_mode: str = "hard_stop",
         budget_warning_threshold_percent: int | None = None,
     ) -> Task:
-        team = Team(name=f"Team {uuid.uuid4()}")
-        session.add(team)
-        session.flush()
+        team = session.execute(select(Team).where(Team.name == "Default Team")).scalar_one_or_none()
+        if team is None:
+            team = Team(name="Default Team")
+            session.add(team)
+            session.flush()
 
         user = User(email=f"operator-{uuid.uuid4()}@example.test", display_name="Operator")
         session.add(user)
@@ -981,9 +984,15 @@ class WorkerTestCase(unittest.TestCase):
             )
             self.assertTrue(all(request.status == "pending" for request in requests))
 
-    def test_every_tool_call_mode_gates_each_tool_before_dispatch(self) -> None:
+    def test_every_tool_call_mode_resumes_through_api_with_budget_evidence(self) -> None:
         with self.Session() as session:
-            task = self._build_ready_task(session)
+            task = self._build_ready_task(
+                session,
+                tool_pricing={"chargeable": True, "amount_minor_units": 250, "currency": "USD"},
+                budget_amount_minor_units=1_000,
+                budget_enforcement_mode="warning",
+                budget_warning_threshold_percent=20,
+            )
             goal = session.get(Goal, task.goal_id)
             project = session.get(Project, goal.project_id)
             session.add(
@@ -996,6 +1005,8 @@ class WorkerTestCase(unittest.TestCase):
                 )
             )
             task_id = task.id
+            project_id = project.id
+            actor_id = project.created_by
             session.commit()
 
         with self.Session() as session:
@@ -1012,6 +1023,74 @@ class WorkerTestCase(unittest.TestCase):
             self.assertEqual(len(requests), 1)
             self.assertEqual(requests[0].action_type, "mcp.call")
             self.assertEqual(requests[0].action_preview["tool"], "echo")
+            approval_id = requests[0].id
+
+        from fastapi.testclient import TestClient
+
+        from agentic_os.api import deps as api_deps
+        from agentic_os.api.app import create_app
+
+        api_deps._engine.cache_clear()
+        headers = {"X-Agentic-User-ID": str(actor_id)}
+        with TestClient(create_app()) as api_client:
+            pending = api_client.get(
+                "/api/v1/approval-requests",
+                params={"project_id": str(project_id), "status": "pending"},
+                headers=headers,
+            )
+            self.assertEqual(pending.status_code, 200, pending.text)
+            self.assertEqual([item["id"] for item in pending.json()], [str(approval_id)])
+
+            decision = api_client.post(
+                f"/api/v1/approval-requests/{approval_id}/approve",
+                json={"reason": "Reviewed worker action"},
+                headers=headers,
+            )
+            self.assertEqual(decision.status_code, 201, decision.text)
+            self.assertEqual(decision.json()["decision"], "approved")
+
+        with self.Session() as session:
+            with mock.patch(
+                "agentic_os.worker.runner.invoke_tool",
+                side_effect=lambda _name, arguments: {"echo": arguments},
+            ) as invoke:
+                resumed = run_task_worker_once(session, "worker-every-tool-resume")
+                session.commit()
+                self.assertEqual(resumed.status, "completed")
+                invoke.assert_called_once()
+
+        with self.Session() as session:
+            completed_run = session.execute(
+                select(Run)
+                .where(Run.task_id == task_id, Run.status == "completed")
+                .order_by(Run.attempt_number.desc())
+            ).scalar_one()
+            completed_run_id = completed_run.id
+
+        with TestClient(create_app()) as api_client:
+            evidence_response = api_client.get(
+                "/api/v1/governance/evidence",
+                params={"task_id": str(task_id)},
+                headers=headers,
+            )
+            self.assertEqual(evidence_response.status_code, 200, evidence_response.text)
+            evidence = evidence_response.json()
+            self.assertEqual(len(evidence["approval_requests"]), 1)
+            self.assertEqual(evidence["approval_decisions"][0]["decision"], "approved")
+            self.assertTrue(
+                any(item["run_id"] == str(completed_run_id) for item in evidence["budget_reservations"])
+            )
+            self.assertTrue(
+                any(
+                    item["run_id"] == str(completed_run_id) and item["status"] == "reconciled"
+                    for item in evidence["cost_ledger_entries"]
+                )
+            )
+            event_types = {item["event_type"] for item in evidence["audit_events"]}
+            self.assertIn("approval.approved", event_types)
+            self.assertIn("approval.resume_ready", event_types)
+            self.assertIn("budget.warning_threshold", event_types)
+            self.assertIn("tool.invoked", event_types)
 
     def test_budget_hard_stop_blocks_chargeable_tool_before_invocation(self) -> None:
         with self.Session() as session:

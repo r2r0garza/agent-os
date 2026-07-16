@@ -88,6 +88,13 @@ for the Sprint 4 automated suite and manual demonstration covering versioned
 agent configuration, credential redaction, policy and budget enforcement,
 pinned worker snapshots, frontend evidence, and restart continuity.
 
+## Durable approvals and budget governance verification
+
+See [docs/durable-approvals-budget-verification.md](docs/durable-approvals-budget-verification.md)
+for the Sprint 5 automated suite and manual demonstration covering approval
+interrupts, approve/deny/expire decisions, restart persistence, budget warnings
+and hard stops, scoped admin overrides, frontend workflows, and evidence review.
+
 ## Multi-agent scheduling, conflict, and restart-recovery verification
 
 See [docs/multi-agent-verification.md](docs/multi-agent-verification.md)
