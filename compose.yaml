@@ -35,7 +35,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - alembic upgrade head && exec uvicorn agentic_os.api.app:create_app --factory --host 0.0.0.0 --port 8000
+      - agentic-os config check && alembic upgrade head && exec uvicorn agentic_os.api.app:create_app --factory --host 0.0.0.0 --port 8000
     volumes: *backend-volumes
     ports:
       - "${AGENTIC_OS_API_PORT:-8000}:8000"

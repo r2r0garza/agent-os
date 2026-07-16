@@ -28,6 +28,23 @@ def parser() -> argparse.ArgumentParser:
     explain_parser = actions.add_parser("explain", help="explain an indexed symbol")
     explain_parser.add_argument("qualified_name")
 
+    config = commands.add_parser(
+        "config", help="validate and manage local configuration and master-key material"
+    )
+    config_actions = config.add_subparsers(dest="config_command", required=True)
+    config_actions.add_parser("check", help="validate local configuration and master-key material")
+    generate_key_parser = config_actions.add_parser(
+        "generate-master-key", help="generate and persist a local master key"
+    )
+    generate_key_parser.add_argument(
+        "--path",
+        default=None,
+        help="defaults to AGENTIC_OS_MASTER_KEY_FILE or the standard local configuration path",
+    )
+    generate_key_parser.add_argument(
+        "--force", action="store_true", help="overwrite an existing key file"
+    )
+
     worker = commands.add_parser("worker", help="run the durable task worker")
     worker_actions = worker.add_subparsers(dest="worker_command", required=True)
     run_once_parser = worker_actions.add_parser(
@@ -86,10 +103,37 @@ def _run_worker_run_once(worker_id: str | None, lease_seconds: int | None, worke
     return 0
 
 
+def _run_config_command(args: argparse.Namespace) -> int:
+    from agentic_os.config import (
+        DEFAULT_MASTER_KEY_FILE,
+        ConfigurationError,
+        format_report,
+        generate_master_key,
+        run_preflight,
+    )
+
+    if args.config_command == "check":
+        results = run_preflight()
+        print(format_report(results))
+        return 0 if all(result.ok for result in results) else 1
+    if args.config_command == "generate-master-key":
+        target_path = args.path or os.environ.get("AGENTIC_OS_MASTER_KEY_FILE", DEFAULT_MASTER_KEY_FILE)
+        try:
+            path = generate_master_key(target_path, force=args.force)
+        except ConfigurationError as error:
+            print(f"config error: {error}", file=sys.stderr)
+            return 2
+        print(f"generated master key at {path} (mode 0600); back it up securely and never commit it to source control")
+        return 0
+    raise AssertionError(f"unknown config command {args.config_command!r}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "worker":
         return _run_worker_run_once(args.worker_id, args.lease_seconds, args.workers)
+    if args.command == "config":
+        return _run_config_command(args)
     try:
         if args.index_command == "build":
             result = build(args.repository, incremental=args.incremental)
