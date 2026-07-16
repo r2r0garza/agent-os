@@ -240,6 +240,62 @@ class ModelProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     pricing_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
 
 
+class Credential(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "credentials"
+    __table_args__ = (
+        CheckConstraint(
+            "(team_id IS NOT NULL) <> (project_id IS NOT NULL)",
+            name="exactly_one_owner_scope",
+        ),
+    )
+
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_type: Mapped[str] = mapped_column(Text, nullable=False)
+    encrypted_material: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, server_default="{}")
+
+    def redacted_metadata(self) -> dict:
+        """Return the safe default representation without secret material."""
+        return {
+            "id": str(self.id),
+            "team_id": str(self.team_id) if self.team_id else None,
+            "project_id": str(self.project_id) if self.project_id else None,
+            "name": self.name,
+            "credential_type": self.credential_type,
+            "metadata": dict(self.metadata_ or {}),
+            "configured": bool(self.encrypted_material),
+        }
+
+
+class ModelProfileVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "model_profile_versions"
+    __table_args__ = (
+        UniqueConstraint("model_profile_id", "version_number", name="uq_model_profile_versions_profile_version"),
+    )
+
+    model_profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    model_identifier: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="RESTRICT"), nullable=True
+    )
+    headers: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    capability_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    pricing_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
 class Agent(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "agents"
 
@@ -265,6 +321,9 @@ class AgentVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_profile_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("model_profiles.id", ondelete="RESTRICT"), nullable=True
+    )
+    model_profile_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_profile_versions.id", ondelete="RESTRICT"), nullable=True
     )
     default_budget_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("budgets.id", ondelete="SET NULL"), nullable=True
@@ -294,6 +353,21 @@ class SkillVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     content_ref: Mapped[str] = mapped_column(Text, nullable=False)
     resource_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class AgentVersionSkill(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "agent_version_skills"
+    __table_args__ = (
+        UniqueConstraint("agent_version_id", "skill_version_id", name="uq_agent_version_skills_attachment"),
+    )
+
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    skill_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("skill_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    attachment_config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
 
 
 class McpServer(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -328,6 +402,26 @@ class McpServerVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     connection_config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="RESTRICT"), nullable=True
+    )
+
+
+class AgentVersionMcpServer(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "agent_version_mcp_servers"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_version_id", "mcp_server_version_id", name="uq_agent_version_mcp_servers_attachment"
+        ),
+    )
+
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    mcp_server_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("mcp_server_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    attachment_config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
 
 
 class Policy(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -337,6 +431,56 @@ class Policy(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     scope_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     decision: Mapped[str] = mapped_column(PolicyDecision, nullable=False)
     rule: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class PolicySet(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "policy_sets"
+    __table_args__ = (
+        CheckConstraint(
+            "(team_id IS NOT NULL) <> (project_id IS NOT NULL)",
+            name="exactly_one_owner_scope",
+        ),
+    )
+
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class PolicySetVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "policy_set_versions"
+    __table_args__ = (
+        UniqueConstraint("policy_set_id", "version_number", name="uq_policy_set_versions_set_version"),
+    )
+
+    policy_set_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("policy_sets.id", ondelete="CASCADE"), nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    rules: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+
+
+class AgentVersionPolicySet(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "agent_version_policy_sets"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_version_id", "policy_set_version_id", name="uq_agent_version_policy_sets_attachment"
+        ),
+    )
+
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    policy_set_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("policy_set_versions.id", ondelete="RESTRICT"), nullable=False
+    )
 
 
 class Budget(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -373,6 +517,31 @@ class Run(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RunConfigurationSnapshot(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "run_configuration_snapshots"
+    __table_args__ = (UniqueConstraint("run_id", name="uq_run_configuration_snapshots_run"),)
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="RESTRICT"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False
+    )
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    model_profile_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("model_profile_versions.id", ondelete="RESTRICT"), nullable=True
+    )
+    budget_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("budgets.id", ondelete="RESTRICT"), nullable=True
+    )
+    configuration: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
 
 class CostLedgerEntry(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):

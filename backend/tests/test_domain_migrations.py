@@ -16,17 +16,25 @@ from agentic_os.domain import create_database_engine, database_url, session_fact
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
+    AgentVersionMcpServer,
+    AgentVersionPolicySet,
+    AgentVersionSkill,
     Artifact,
     ArtifactVersion,
     AuditEvent,
     Budget,
+    Credential,
     CostLedgerEntry,
     Goal,
     McpServer,
     McpServerVersion,
     ModelProfile,
+    ModelProfileVersion,
+    PolicySet,
+    PolicySetVersion,
     Project,
     Run,
+    RunConfigurationSnapshot,
     Skill,
     SkillVersion,
     Task,
@@ -114,6 +122,14 @@ class DomainMigrationTests(unittest.TestCase):
             "workspace_resources",
             "workspace_resource_leases",
             "workspace_promotions",
+            "credentials",
+            "model_profile_versions",
+            "agent_version_skills",
+            "agent_version_mcp_servers",
+            "policy_sets",
+            "policy_set_versions",
+            "agent_version_policy_sets",
+            "run_configuration_snapshots",
         }
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -374,6 +390,266 @@ class DomainMigrationTests(unittest.TestCase):
             session.add(McpServer(created_by=user.id, name="Unscoped MCP server"))
             with self.assertRaises(IntegrityError):
                 session.commit()
+
+    def test_credential_redacted_metadata_excludes_secret_material(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Credential Team")
+            session.add(team)
+            session.flush()
+            user = User(email=f"cred-{uuid.uuid4()}@example.test", display_name="Credential Owner")
+            session.add(user)
+            session.flush()
+
+            credential = Credential(
+                team_id=team.id,
+                created_by=user.id,
+                name="Primary API Key",
+                credential_type="api_key",
+                encrypted_material="ciphertext-not-a-real-secret",
+                metadata_={"provider": "openai-compatible"},
+            )
+            session.add(credential)
+            session.commit()
+
+            redacted = credential.redacted_metadata()
+            self.assertNotIn("encrypted_material", redacted)
+            self.assertTrue(redacted["configured"])
+            self.assertEqual(redacted["name"], "Primary API Key")
+
+    def test_credential_requires_exactly_one_owner_scope(self) -> None:
+        with self.Session() as session:
+            user = User(email=f"cred-scope-{uuid.uuid4()}@example.test", display_name="Scope Owner")
+            session.add(user)
+            session.flush()
+
+            session.add(
+                Credential(
+                    created_by=user.id,
+                    name="Unscoped credential",
+                    credential_type="api_key",
+                    encrypted_material="ciphertext",
+                )
+            )
+            with self.assertRaises(IntegrityError):
+                session.commit()
+
+    def test_run_configuration_snapshot_remains_immutable_after_later_edits(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Snapshot Team")
+            session.add(team)
+            session.flush()
+            user = User(email=f"snap-{uuid.uuid4()}@example.test", display_name="Snapshot Owner")
+            session.add(user)
+            session.flush()
+            project = Project(team_id=team.id, created_by=user.id, name="Snapshot Project")
+            session.add(project)
+            session.flush()
+            goal = Goal(project_id=project.id, created_by=user.id, title="Snapshot Goal")
+            session.add(goal)
+            session.flush()
+            task = Task(goal_id=goal.id, title="Snapshot Task")
+            session.add(task)
+            session.flush()
+
+            credential = Credential(
+                team_id=team.id,
+                created_by=user.id,
+                name="Model credential",
+                credential_type="api_key",
+                encrypted_material="ciphertext",
+            )
+            session.add(credential)
+            session.flush()
+
+            model_profile = ModelProfile(
+                team_id=team.id,
+                created_by=user.id,
+                name="snapshot-profile",
+                base_url="https://example.test/v1",
+                model_identifier="test-model",
+                api_key_ciphertext="ciphertext",
+            )
+            session.add(model_profile)
+            session.flush()
+
+            profile_v1 = ModelProfileVersion(
+                model_profile_id=model_profile.id,
+                version_number=1,
+                base_url="https://v1.example.test/v1",
+                model_identifier="test-model-v1",
+                credential_id=credential.id,
+            )
+            session.add(profile_v1)
+            session.flush()
+
+            agent = Agent(team_id=team.id, created_by=user.id, name="Snapshot Agent")
+            session.add(agent)
+            session.flush()
+            budget = Budget(
+                agent_id=agent.id, currency="USD", amount_minor_units=1000, enforcement_mode="hard_stop"
+            )
+            session.add(budget)
+            session.flush()
+
+            agent_version_1 = AgentVersion(
+                agent_id=agent.id,
+                version_number=1,
+                capability_manifest={"capabilities": ["test"]},
+                model_profile_id=model_profile.id,
+                model_profile_version_id=profile_v1.id,
+                default_budget_id=budget.id,
+            )
+            session.add(agent_version_1)
+            session.flush()
+
+            run = Run(
+                task_id=task.id,
+                attempt_number=1,
+                idempotency_key=f"{task.id}:1",
+                lease_token=1,
+                agent_version_id=agent_version_1.id,
+                status="running",
+            )
+            session.add(run)
+            session.flush()
+
+            snapshot = RunConfigurationSnapshot(
+                run_id=run.id,
+                team_id=team.id,
+                project_id=project.id,
+                agent_version_id=agent_version_1.id,
+                model_profile_version_id=profile_v1.id,
+                budget_id=budget.id,
+                configuration={"base_url": profile_v1.base_url, "model_identifier": profile_v1.model_identifier},
+            )
+            session.add(snapshot)
+            session.commit()
+            snapshot_id = snapshot.id
+
+            # Editing configuration afterwards must create a new version rather than
+            # mutate the version the snapshot already pinned.
+            profile_v2 = ModelProfileVersion(
+                model_profile_id=model_profile.id,
+                version_number=2,
+                base_url="https://v2.example.test/v1",
+                model_identifier="test-model-v2",
+                credential_id=credential.id,
+            )
+            session.add(profile_v2)
+            agent_version_2 = AgentVersion(
+                agent_id=agent.id,
+                version_number=2,
+                capability_manifest={"capabilities": ["test", "more"]},
+                model_profile_id=model_profile.id,
+                model_profile_version_id=profile_v2.id,
+                default_budget_id=budget.id,
+            )
+            session.add(agent_version_2)
+            session.commit()
+
+        with self.Session() as session:
+            reloaded_snapshot = session.get(RunConfigurationSnapshot, snapshot_id)
+            reloaded_profile_v1 = session.get(ModelProfileVersion, profile_v1.id)
+
+            self.assertEqual(reloaded_snapshot.model_profile_version_id, profile_v1.id)
+            self.assertEqual(reloaded_snapshot.agent_version_id, agent_version_1.id)
+            self.assertEqual(reloaded_snapshot.configuration["base_url"], "https://v1.example.test/v1")
+            self.assertEqual(reloaded_profile_v1.base_url, "https://v1.example.test/v1")
+
+            profile_count = session.execute(
+                text("SELECT count(*) FROM model_profile_versions WHERE model_profile_id = :id"),
+                {"id": model_profile.id},
+            ).scalar_one()
+            self.assertEqual(profile_count, 2)
+
+    def test_agent_version_skill_and_mcp_server_attachments_are_versioned(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Attachment Team")
+            session.add(team)
+            session.flush()
+            user = User(email=f"attach-{uuid.uuid4()}@example.test", display_name="Attachment Owner")
+            session.add(user)
+            session.flush()
+
+            agent = Agent(team_id=team.id, created_by=user.id, name="Attachment Agent")
+            session.add(agent)
+            session.flush()
+            agent_version = AgentVersion(agent_id=agent.id, version_number=1, capability_manifest={})
+            session.add(agent_version)
+            session.flush()
+
+            skill = Skill(team_id=team.id, created_by=user.id, name="Attachment Skill")
+            session.add(skill)
+            session.flush()
+            skill_version = SkillVersion(skill_id=skill.id, version_number=1, content_ref="skills/attach/v1")
+            session.add(skill_version)
+            session.flush()
+
+            mcp_server = McpServer(team_id=team.id, created_by=user.id, name="Attachment MCP Server")
+            session.add(mcp_server)
+            session.flush()
+            mcp_server_version = McpServerVersion(
+                mcp_server_id=mcp_server.id, version_number=1, connection_config={"tools": ["echo"]}
+            )
+            session.add(mcp_server_version)
+            session.flush()
+
+            session.add(
+                AgentVersionSkill(agent_version_id=agent_version.id, skill_version_id=skill_version.id)
+            )
+            session.add(
+                AgentVersionMcpServer(
+                    agent_version_id=agent_version.id, mcp_server_version_id=mcp_server_version.id
+                )
+            )
+            session.commit()
+
+            # Re-attaching the same skill version to the same agent version is rejected.
+            session.add(
+                AgentVersionSkill(agent_version_id=agent_version.id, skill_version_id=skill_version.id)
+            )
+            with self.assertRaises(IntegrityError):
+                session.commit()
+
+    def test_policy_set_versions_govern_agent_versions(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Policy Team")
+            session.add(team)
+            session.flush()
+            user = User(email=f"policy-{uuid.uuid4()}@example.test", display_name="Policy Owner")
+            session.add(user)
+            session.flush()
+
+            agent = Agent(team_id=team.id, created_by=user.id, name="Policy Agent")
+            session.add(agent)
+            session.flush()
+            agent_version = AgentVersion(agent_id=agent.id, version_number=1, capability_manifest={})
+            session.add(agent_version)
+            session.flush()
+
+            policy_set = PolicySet(team_id=team.id, created_by=user.id, name="Attachment Policy Set")
+            session.add(policy_set)
+            session.flush()
+            policy_set_version = PolicySetVersion(
+                policy_set_id=policy_set.id,
+                version_number=1,
+                rules=[{"scope": "tool", "decision": "allow"}],
+            )
+            session.add(policy_set_version)
+            session.flush()
+
+            session.add(
+                AgentVersionPolicySet(
+                    agent_version_id=agent_version.id, policy_set_version_id=policy_set_version.id
+                )
+            )
+            session.commit()
+
+            count = session.execute(
+                text("SELECT count(*) FROM agent_version_policy_sets WHERE agent_version_id = :id"),
+                {"id": agent_version.id},
+            ).scalar_one()
+            self.assertEqual(count, 1)
 
     def test_team_membership_uniqueness_is_enforced(self) -> None:
         with self.Session() as session:
