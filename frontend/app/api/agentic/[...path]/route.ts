@@ -10,6 +10,10 @@ async function proxy(
   ).replace(/\/$/, "")
   const incomingUrl = new URL(request.url)
   const upstreamUrl = `${upstreamBase}/${path.join("/")}${incomingUrl.search}`
+  const actorUserId =
+    request.headers.get("x-agentic-user-id") ??
+    process.env.AGENTIC_OS_USER_ID ??
+    null
 
   try {
     const upstream = await fetch(upstreamUrl, {
@@ -23,6 +27,7 @@ async function proxy(
         accept: request.headers.get("accept") ?? "application/json",
         "content-type":
           request.headers.get("content-type") ?? "application/json",
+        ...(actorUserId ? { "x-agentic-user-id": actorUserId } : {}),
       },
       signal: AbortSignal.timeout(15_000),
     })

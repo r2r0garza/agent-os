@@ -280,8 +280,91 @@ export interface CostLedgerEntry {
   actual_amount_minor_units: number | null
   currency: string
   is_zero_cost: boolean
+  is_unpriced?: boolean
+  warning_triggered?: boolean
+  hard_stop_triggered?: boolean
+  evidence?: Record<string, unknown>
   status: string
   created_at: string
+}
+
+export interface ApprovalRequest {
+  id: Identifier
+  project_id: Identifier
+  goal_id: Identifier
+  task_id: Identifier
+  run_id: Identifier
+  agent_version_id: Identifier
+  configuration_id: Identifier | null
+  requested_by: Identifier | null
+  mode: string
+  status: "pending" | "approved" | "denied" | "expired" | "cancelled"
+  action_type: string
+  action_preview: Record<string, unknown>
+  policy_version_ids: Identifier[]
+  policy_evidence: Record<string, unknown>
+  expires_at: string | null
+  resolved_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ApprovalDecision {
+  id: Identifier
+  approval_request_id: Identifier
+  decision: string
+  actor_id: Identifier | null
+  reason: string | null
+  context: Record<string, unknown>
+  evaluated_policy_version_ids: Identifier[]
+  created_at: string
+}
+
+export interface AdminOverride {
+  id: Identifier
+  project_id: Identifier | null
+  goal_id: Identifier | null
+  task_id: Identifier | null
+  run_id: Identifier | null
+  created_by: Identifier
+  scope_type: "project" | "goal" | "task" | "run"
+  scope_id: Identifier
+  reason: string
+  starts_at: string
+  expires_at: string
+  evaluated_policy_version_ids: Identifier[]
+  context: Record<string, unknown>
+  created_at: string
+}
+
+export interface BudgetReservation {
+  id: Identifier
+  budget_id: Identifier
+  project_id: Identifier
+  goal_id: Identifier
+  task_id: Identifier
+  run_id: Identifier
+  action_type: string
+  amount_minor_units: number
+  currency: string
+  status: string
+  is_unpriced: boolean
+  warning_triggered: boolean
+  hard_stop_triggered: boolean
+  pricing_evidence: Record<string, unknown>
+  policy_version_ids: Identifier[]
+  reconciled_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface GovernanceEvidence {
+  approval_requests: ApprovalRequest[]
+  approval_decisions: ApprovalDecision[]
+  admin_overrides: AdminOverride[]
+  budget_reservations: BudgetReservation[]
+  cost_ledger_entries: CostLedgerEntry[]
+  audit_events: AuditEvent[]
 }
 
 export class ApiError extends Error {

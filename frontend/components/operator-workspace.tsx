@@ -39,6 +39,7 @@ import {
   jsonBody,
 } from "@/lib/api"
 import { ArtifactWorkspace } from "@/components/artifact-workspace"
+import { GovernanceOperations } from "@/components/governance-operations"
 import {
   GovernanceLookups,
   GovernanceWorkspace,
@@ -148,12 +149,14 @@ export function OperatorWorkspace() {
   const [mutation, setMutation] = useState("")
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
-  const [governanceLookups, setGovernanceLookups] = useState<GovernanceLookups>({
-    skillVersionName: {},
-    mcpVersionName: {},
-    modelProfileVersionName: {},
-    policySetVersionName: {},
-  })
+  const [governanceLookups, setGovernanceLookups] = useState<GovernanceLookups>(
+    {
+      skillVersionName: {},
+      mcpVersionName: {},
+      modelProfileVersionName: {},
+      policySetVersionName: {},
+    }
+  )
 
   const loadInventory = useCallback(async () => {
     const [models, projects, agents, skills, servers] = await Promise.all([
@@ -706,6 +709,16 @@ export function OperatorWorkspace() {
           skills={inventory.skills}
           servers={inventory.servers}
           onLookupsChange={setGovernanceLookups}
+        />
+
+        <GovernanceOperations
+          projectId={selectedProjectId}
+          tasks={tasks}
+          runs={runs}
+          onRefresh={async () => {
+            await loadProjectState(selectedProjectId)
+            if (selectedGoalId) await loadGoalState(selectedGoalId)
+          }}
         />
 
         <ArtifactWorkspace

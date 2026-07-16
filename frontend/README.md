@@ -8,11 +8,18 @@ The operator console proxies its requests to the versioned FastAPI backend. Set
 `AGENTIC_OS_API_URL` when the backend is not available at the default
 `http://127.0.0.1:8000/api/v1` URL.
 
+For local role/access smoke checks, set `AGENTIC_OS_USER_ID` before starting the
+frontend. The API proxy forwards that actor UUID as `X-Agentic-User-ID`.
+
 Manual smoke check:
 
 For the complete governed-configuration setup, restart, enforcement, and
 evidence checklist, see
 [`docs/governed-configuration-verification.md`](../docs/governed-configuration-verification.md).
+
+For durable approval decisions, admin overrides, authorization failures, budget
+evidence, recovery, and reload persistence, see
+[`docs/governance-operations-verification.md`](../docs/governance-operations-verification.md).
 
 1. Start PostgreSQL and the backend API, then start this app with `pnpm dev`.
 2. Create a model profile, project, and goal from the console.
