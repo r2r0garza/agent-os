@@ -23,6 +23,7 @@ from agentic_os.domain.models import (
     Run,
     Task,
 )
+from agentic_os.observability import CorrelationContext, record_observability
 from agentic_os.worker.approvals import ensure_action_approvals
 from agentic_os.worker.configuration import ConfigurationSnapshotError, resolve_run_configuration
 from agentic_os.worker.governance import (
@@ -104,17 +105,32 @@ def _fail_interrupted_previous_attempt(session: Session, task: Task, *, project_
         return
     stale_run.status = "failed"
     stale_run.completed_at = datetime.now(timezone.utc)
-    session.add(
-        AuditEvent(
-            project_id=project_id,
-            goal_id=task.goal_id,
-            task_id=task.id,
-            run_id=stale_run.id,
-            event_type="run.interrupted",
-            payload={"reason": "lease expired before completion", "previous_lease_token": stale_run.lease_token},
-        )
+    audit_event = AuditEvent(
+        project_id=project_id,
+        goal_id=task.goal_id,
+        task_id=task.id,
+        run_id=stale_run.id,
+        event_type="run.interrupted",
+        payload={
+            "reason": "lease expired before completion",
+            "previous_lease_token": stale_run.lease_token,
+        },
     )
+    session.add(audit_event)
     session.flush()
+    goal = session.get(Goal, task.goal_id)
+    project = session.get(Project, project_id) if project_id else None
+    if goal is not None and project is not None:
+        context = CorrelationContext.for_run(project=project, goal=goal, task=task, run=stale_run)
+        record_observability(
+            session,
+            context,
+            event_kind="run",
+            operation_name="run.interrupted",
+            status="failed",
+            audit_event_id=audit_event.id,
+            attributes={"reason": "lease expired before completion"},
+        )
 
 
 def _execute_claimed_task(
@@ -194,22 +210,23 @@ def _execute_claimed_task(
     run.snapshot = snapshot
     session.flush()
 
-    session.add(
-        AuditEvent(
-            project_id=project_id,
-            goal_id=task.goal_id,
-            task_id=task.id,
-            run_id=run.id,
-            event_type="run.started",
-            payload={
-                "attempt_number": attempt_number,
-                "worker_id": worker_id,
-                "configuration_snapshot_id": str(resolved.snapshot_id),
-                "agent_version_id": agent["version_id"],
-                "model_profile_version_id": snapshot["model_profile_version_id"],
-            },
-        )
+    context = CorrelationContext.for_run(project=project, goal=goal, task=task, run=run)
+
+    started_audit = AuditEvent(
+        project_id=project_id,
+        goal_id=task.goal_id,
+        task_id=task.id,
+        run_id=run.id,
+        event_type="run.started",
+        payload={
+            "attempt_number": attempt_number,
+            "worker_id": worker_id,
+            "configuration_snapshot_id": str(resolved.snapshot_id),
+            "agent_version_id": agent["version_id"],
+            "model_profile_version_id": snapshot["model_profile_version_id"],
+        },
     )
+    session.add(started_audit)
     session.add(
         AuditEvent(
             project_id=project_id,
@@ -225,6 +242,23 @@ def _execute_claimed_task(
         )
     )
     session.flush()
+    record_observability(
+        session,
+        context,
+        event_kind="run",
+        operation_name="run.started",
+        status="running",
+        audit_event_id=started_audit.id,
+        attributes={"attempt_number": attempt_number, "worker_id": worker_id},
+    )
+    record_observability(
+        session,
+        context,
+        event_kind="task",
+        operation_name="task.claimed",
+        status="running",
+        attributes={"lease_token": task.lease_token, "worker_id": worker_id},
+    )
 
     if on_run_started is not None:
         # Commit so the run's "running" state is durably visible to other
@@ -234,6 +268,15 @@ def _execute_claimed_task(
         # workspace resource-lease rows acquired with the task. The
         # transaction-scoped advisory locks used during claim are only race
         # guards and may be released here safely.
+        record_observability(
+            session,
+            context,
+            event_kind="checkpoint",
+            operation_name="run.checkpoint.committed",
+            status="committed",
+            checkpoint_id=uuid.uuid4(),
+            attributes={"boundary": "run_started", "attempt_number": attempt_number},
+        )
         session.commit()
         on_run_started()
 
@@ -252,6 +295,19 @@ def _execute_claimed_task(
         **run.snapshot,
         "approval_request_ids": [str(request.id) for request in approval_requests],
     }
+    for approval_request in approval_requests:
+        record_observability(
+            session,
+            context,
+            event_kind="approval",
+            operation_name="approval.evaluated",
+            status=approval_request.status,
+            approval_request_id=approval_request.id,
+            attributes={
+                "action_type": approval_request.action_type,
+                "policy_decision": policy_decision,
+            },
+        )
     if approval_state == "rejected":
         run.status = "failed"
         run.completed_at = datetime.now(timezone.utc)
@@ -333,6 +389,20 @@ def _execute_claimed_task(
                     "configuration_snapshot_id": str(resolved.snapshot_id),
                 },
             )
+            record_observability(
+                session,
+                context,
+                event_kind="budget",
+                operation_name="budget.cost_reserved",
+                status=cost.ledger_entry.status,
+                cost_ledger_entry_id=cost.ledger_entry.id,
+                attributes={
+                    "action_type": "mcp_tool_call",
+                    "tool": tool_name,
+                    "amount_minor_units": amount_minor_units,
+                    "currency": currency,
+                },
+            )
         except BudgetExhaustedError as error:
             session.add(
                 AuditEvent(
@@ -395,11 +465,33 @@ def _execute_claimed_task(
         # can reserve remaining capacity and execute concurrently. A crash
         # after this commit leaves an active pessimistic reservation for
         # reconciliation instead of losing evidence or permitting overspend.
+        record_observability(
+            session,
+            context,
+            event_kind="checkpoint",
+            operation_name="run.checkpoint.committed",
+            status="committed",
+            checkpoint_id=uuid.uuid4(),
+            attributes={"boundary": "budget_reservation", "tool": tool_name},
+        )
         session.commit()
 
+        tool_call_id = uuid.uuid4()
+        mcp_call_id = uuid.uuid4()
         try:
             result = invoke_tool(tool_name, {"task_id": str(task.id), "run_id": str(run.id)})
         except TimeoutError as error:
+            record_observability(
+                session,
+                context,
+                event_kind="mcp_call",
+                operation_name="mcp.tool.invoked",
+                status="failed",
+                cost_ledger_entry_id=cost.ledger_entry.id,
+                tool_call_id=tool_call_id,
+                mcp_call_id=mcp_call_id,
+                attributes={"tool": tool_name, "error_type": type(error).__name__},
+            )
             mark_action_cost_uncertain(session, cost, reason=str(error))
             session.add(
                 AuditEvent(
@@ -422,6 +514,17 @@ def _execute_claimed_task(
                 f"tool {tool_name!r} timed out with an uncertain external result"
             ) from error
         except Exception as error:
+            record_observability(
+                session,
+                context,
+                event_kind="mcp_call",
+                operation_name="mcp.tool.invoked",
+                status="failed",
+                cost_ledger_entry_id=cost.ledger_entry.id,
+                tool_call_id=tool_call_id,
+                mcp_call_id=mcp_call_id,
+                attributes={"tool": tool_name, "error_type": type(error).__name__},
+            )
             release_action_cost(session, cost, reason=str(error))
             raise
 
@@ -430,6 +533,28 @@ def _execute_claimed_task(
             cost,
             actual_amount_minor_units=amount_minor_units or 0,
             evidence={"tool": tool_name},
+        )
+        record_observability(
+            session,
+            context,
+            event_kind="mcp_call",
+            operation_name="mcp.tool.invoked",
+            status="completed",
+            cost_ledger_entry_id=cost.ledger_entry.id,
+            tool_call_id=tool_call_id,
+            mcp_call_id=mcp_call_id,
+            attributes={"tool": tool_name},
+        )
+        record_observability(
+            session,
+            context,
+            event_kind="tool_call",
+            operation_name="tool.invoked",
+            status="completed",
+            cost_ledger_entry_id=cost.ledger_entry.id,
+            tool_call_id=tool_call_id,
+            mcp_call_id=mcp_call_id,
+            attributes={"tool": tool_name},
         )
         tool_results[tool_name] = result
         session.add(
@@ -467,6 +592,7 @@ def _execute_claimed_task(
 
     sandbox_config = capability_manifest.get("sandbox")
     if sandbox_config:
+        sandbox_id = uuid.uuid4()
         sandbox_result = execute_task_sandbox(
             session, task, run.id, sandbox_config, project_id=project_id
         )
@@ -475,6 +601,19 @@ def _execute_claimed_task(
                 f"sandbox execution for task {task.id} did not succeed: {sandbox_result}"
             )
         tool_results["sandbox"] = sandbox_result
+        record_observability(
+            session,
+            context,
+            event_kind="sandbox",
+            operation_name="sandbox.execution",
+            status="completed",
+            sandbox_id=sandbox_id,
+            attributes={
+                "runtime": sandbox_config.get("runtime", "docker"),
+                "exit_code": sandbox_result["exit_code"],
+                "timed_out": sandbox_result["timed_out"],
+            },
+        )
 
     renew_lease(session, task, worker_id)
 
@@ -516,6 +655,16 @@ def _execute_claimed_task(
         version_number=1,
     )
     verify_artifact_version(storage, artifact_version)
+    record_observability(
+        session,
+        context,
+        event_kind="artifact",
+        operation_name="artifact.output_published",
+        status="completed",
+        artifact_id=artifact.id,
+        artifact_version_id=artifact_version.id,
+        attributes={"kind": artifact.kind, "content_type": artifact.content_type},
+    )
 
     citations = record_output_citations(session, task, run, artifact, consumed_knowledge)
     if citations:
@@ -533,16 +682,41 @@ def _execute_claimed_task(
 
     run.status = "completed"
     run.completed_at = datetime.now(timezone.utc)
-    session.add(
-        AuditEvent(
-            project_id=project_id,
-            goal_id=task.goal_id,
-            task_id=task.id,
-            run_id=run.id,
-            event_type="run.completed",
-            payload={"artifact_id": str(artifact.id)},
-        )
+    completed_audit = AuditEvent(
+        project_id=project_id,
+        goal_id=task.goal_id,
+        task_id=task.id,
+        run_id=run.id,
+        event_type="run.completed",
+        payload={"artifact_id": str(artifact.id)},
     )
+    session.add(completed_audit)
     session.flush()
+    record_observability(
+        session,
+        context,
+        event_kind="run",
+        operation_name="run.completed",
+        status="completed",
+        audit_event_id=completed_audit.id,
+        artifact_id=artifact.id,
+    )
+    record_observability(
+        session,
+        context,
+        event_kind="task",
+        operation_name="task.completed",
+        status="completed",
+        artifact_id=artifact.id,
+    )
+    record_observability(
+        session,
+        context,
+        event_kind="checkpoint",
+        operation_name="run.checkpoint.committed",
+        status="committed",
+        checkpoint_id=uuid.uuid4(),
+        attributes={"boundary": "run_completed"},
+    )
 
     release_lease(session, task, worker_id, status="completed")

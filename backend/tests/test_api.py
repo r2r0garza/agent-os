@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from sqlalchemy import create_engine, select
 
-from agentic_os.domain import create_database_engine, database_url
+from agentic_os.domain import create_database_engine, database_url, session_factory
+from agentic_os.domain.models import ObservabilityRecord, TelemetryExportAttempt
 
 BACKEND_ROOT = Path(__file__).parents[1]
 
@@ -94,6 +95,52 @@ class ApiWorkflowTests(unittest.TestCase):
         schema = client.get("/openapi.json").json()
         for path in ("/api/v1/projects", "/api/v1/model-profiles", "/api/v1/agents", "/api/v1/skills"):
             self.assertIn(path, schema["paths"])
+
+    def test_request_context_propagates_to_goal_observability(self) -> None:
+        request_id = uuid.uuid4()
+        headers = {"x-request-id": str(request_id)}
+        project_response = client.post(
+            "/api/v1/projects",
+            json={"name": f"Correlated Project {uuid.uuid4()}"},
+            headers=headers,
+        )
+        self.assertEqual(project_response.status_code, 201, project_response.text)
+        project = project_response.json()
+        goal_response = client.post(
+            f"/api/v1/projects/{project['id']}/goals",
+            json={"title": "Correlated goal"},
+            headers=headers,
+        )
+        self.assertEqual(goal_response.status_code, 201, goal_response.text)
+        self.assertEqual(goal_response.headers["x-request-id"], str(request_id))
+        self.assertEqual(goal_response.headers["x-correlation-id"], str(request_id))
+        self.assertTrue(goal_response.headers["traceparent"].startswith("00-"))
+
+        engine = create_database_engine(TEST_DATABASE_URL)
+        Session = session_factory(engine)
+        with Session() as session:
+            records = list(
+                session.execute(
+                    select(ObservabilityRecord).where(
+                        ObservabilityRecord.correlation_id == request_id
+                    )
+                ).scalars()
+            )
+            self.assertTrue({"request", "goal"} <= {record.event_kind for record in records})
+            goal_record = next(record for record in records if record.event_kind == "goal")
+            self.assertEqual(str(goal_record.goal_id), goal_response.json()["id"])
+            self.assertIn(goal_record.trace_id, goal_response.headers["traceparent"])
+            attempts = list(
+                session.execute(
+                    select(TelemetryExportAttempt).where(
+                        TelemetryExportAttempt.observability_record_id.in_(
+                            [record.id for record in records]
+                        )
+                    )
+                ).scalars()
+            )
+            self.assertEqual({attempt.status for attempt in attempts}, {"disabled"})
+        engine.dispose()
 
     def test_project_goal_agent_skill_mcp_budget_workflow(self) -> None:
         project = client.post("/api/v1/projects", json={"name": "Demo Project"}).json()

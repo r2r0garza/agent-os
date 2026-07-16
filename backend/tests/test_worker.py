@@ -43,6 +43,7 @@ from agentic_os.domain.models import (
     Goal,
     McpServer,
     McpServerVersion,
+    ObservabilityRecord,
     Policy,
     Project,
     Run,
@@ -50,6 +51,8 @@ from agentic_os.domain.models import (
     Skill,
     SkillVersion,
     Task,
+    TelemetryExportAttempt,
+    TelemetryExportSetting,
     Team,
     User,
 )
@@ -62,6 +65,7 @@ from agentic_os.worker.governance import (
     reserve_action_cost,
 )
 from agentic_os.worker.runner import TaskExecutionError
+from agentic_os.observability import deliver_pending_telemetry
 
 BACKEND_ROOT = Path(__file__).parents[1]
 
@@ -470,6 +474,15 @@ class WorkerTestCase(unittest.TestCase):
             self.assertEqual(runs[1].snapshot["configuration_snapshot_id"], snapshot_id)
             self.assertEqual(runs[1].snapshot["enabled_tools"], ["echo"])
             self.assertEqual(runs[1].snapshot["policy_decision"], "allow")
+            self.assertEqual(runs[0].snapshot["correlation_id"], runs[1].snapshot["correlation_id"])
+            self.assertEqual(runs[0].snapshot["trace_id"], runs[1].snapshot["trace_id"])
+            correlations = {
+                record.correlation_id
+                for record in session.execute(
+                    select(ObservabilityRecord).where(ObservabilityRecord.task_id == task_id)
+                ).scalars()
+            }
+            self.assertEqual(len(correlations), 1)
             snapshots = list(
                 session.execute(
                     select(RunConfigurationSnapshot)
@@ -1376,6 +1389,97 @@ class WorkerTestCase(unittest.TestCase):
             claimed = claim_ready_task(session, "worker-a")
             session.commit()
             self.assertIsNone(claimed)
+
+    def test_worker_persists_correlated_records_when_export_is_disabled(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id = task.id
+
+        with self.Session() as session:
+            claimed = run_task_worker_once(session, "worker-observability-disabled")
+            session.commit()
+            self.assertEqual(claimed.status, "completed")
+
+        with self.Session() as session:
+            records = list(
+                session.execute(
+                    select(ObservabilityRecord)
+                    .where(ObservabilityRecord.task_id == task_id)
+                    .order_by(ObservabilityRecord.occurred_at)
+                ).scalars()
+            )
+            self.assertTrue(records)
+            self.assertEqual(len({record.correlation_id for record in records}), 1)
+            self.assertTrue(
+                {"run", "tool_call", "mcp_call", "budget", "artifact", "checkpoint"}
+                <= {record.event_kind for record in records}
+            )
+            attempts = list(
+                session.execute(
+                    select(TelemetryExportAttempt)
+                    .join(
+                        ObservabilityRecord,
+                        ObservabilityRecord.id == TelemetryExportAttempt.observability_record_id,
+                    )
+                    .where(ObservabilityRecord.task_id == task_id)
+                ).scalars()
+            )
+            self.assertEqual(len(attempts), len(records))
+            self.assertEqual({attempt.status for attempt in attempts}, {"disabled"})
+
+    def test_export_failure_is_persisted_without_rolling_back_completed_run(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id = task.id
+            goal = session.get(Goal, task.goal_id)
+            project = session.get(Project, goal.project_id)
+            session.add(
+                TelemetryExportSetting(
+                    team_id=project.team_id,
+                    project_id=project.id,
+                    created_by=goal.created_by,
+                    exporter_type="opentelemetry",
+                    enabled=True,
+                    endpoint_reference="secret://telemetry/endpoint",
+                    redaction_policy_evidence={"secret_token": "must-not-export"},
+                )
+            )
+            session.commit()
+
+        with self.Session() as session:
+            claimed = run_task_worker_once(session, "worker-observability-failure")
+            session.commit()
+            self.assertEqual(claimed.status, "completed")
+
+        exported_payloads = []
+
+        def failing_exporter(destination, payload):
+            exported_payloads.append((destination, payload))
+            raise ConnectionError("telemetry sink unavailable")
+
+        with self.Session() as session:
+            delivered, failed = deliver_pending_telemetry(session, failing_exporter)
+            self.assertEqual(delivered, 0)
+            self.assertGreater(failed, 0)
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(run.status, "completed")
+            attempts = list(
+                session.execute(
+                    select(TelemetryExportAttempt)
+                    .join(
+                        ObservabilityRecord,
+                        ObservabilityRecord.id == TelemetryExportAttempt.observability_record_id,
+                    )
+                    .where(ObservabilityRecord.task_id == task_id)
+                ).scalars()
+            )
+            self.assertEqual({attempt.status for attempt in attempts}, {"failed"})
+            self.assertEqual({attempt.failure_code for attempt in attempts}, {"ConnectionError"})
+            self.assertNotIn("must-not-export", json.dumps(exported_payloads, default=str))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from typing import Callable
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from agentic_os.observability import TelemetryExporter, deliver_pending_telemetry
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS
 from agentic_os.worker.runner import run_task_worker_once
 
@@ -32,6 +33,7 @@ def run_scheduler_once(
     worker_count: int = 1,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
     on_run_started: Callable[[], None] | None = None,
+    telemetry_exporter: TelemetryExporter | None = None,
 ) -> SchedulerResult:
     """Run up to ``worker_count`` claim/execute loops concurrently until no
     ready task remains.
@@ -107,4 +109,7 @@ def run_scheduler_once(
         thread.start()
     for thread in threads:
         thread.join()
+    if telemetry_exporter is not None:
+        with session_maker() as session:
+            deliver_pending_telemetry(session, telemetry_exporter)
     return result

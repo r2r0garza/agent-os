@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from agentic_os.api.bootstrap import ensure_default_user
 from agentic_os.api.deps import get_session
 from agentic_os.domain.models import Goal, Project
+from agentic_os.observability import current_request_context, record_observability
 
 router = APIRouter(tags=["goals"])
 
@@ -48,6 +50,22 @@ def create_goal(project_id: uuid.UUID, payload: GoalCreate, session: Session = D
     )
     session.add(goal)
     session.flush()
+    context = current_request_context()
+    if context is not None:
+        record_observability(
+            session,
+            replace(
+                context,
+                team_id=project.team_id,
+                user_id=user.id,
+                project_id=project.id,
+                goal_id=goal.id,
+            ),
+            event_kind="goal",
+            operation_name="goal.created",
+            status=goal.status,
+            attributes={"title": goal.title},
+        )
     session.refresh(goal)
     return goal
 
