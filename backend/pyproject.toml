@@ -12,13 +12,13 @@ dependencies = [
     "psycopg[binary]>=3.1",
     "fastapi>=0.115",
     "cryptography>=42",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "httpx>=0.27",
-    "uvicorn[standard]>=0.30",
 ]
 
 [project.scripts]
@@ -26,4 +26,3 @@ agentic-os = "agentic_os.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentic_os"]
-

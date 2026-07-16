@@ -1,0 +1,148 @@
+name: agentic-os
+
+x-backend-environment: &backend-environment
+  AGENTIC_OS_DATABASE_URL: postgresql+psycopg://agentic_os:${POSTGRES_PASSWORD:-agentic_os}@postgres:5432/agentic_os
+  AGENTIC_OS_ARTIFACT_ROOT: /var/lib/agentic-os/artifacts
+  AGENTIC_OS_MASTER_KEY: ${AGENTIC_OS_MASTER_KEY:-}
+  OTEL_SDK_DISABLED: ${AGENTIC_OS_TELEMETRY_DISABLED:-true}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://telemetry:4317
+
+x-backend-volumes: &backend-volumes
+  - artifacts:/var/lib/agentic-os/artifacts
+  - configuration:/etc/agentic-os
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agentic_os
+      POSTGRES_USER: agentic_os
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentic_os}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentic_os -d agentic_os"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [agentic-os]
+
+  api:
+    build:
+      context: backend
+    environment: *backend-environment
+    command:
+      - /bin/sh
+      - -c
+      - alembic upgrade head && exec uvicorn agentic_os.api.app:create_app --factory --host 0.0.0.0 --port 8000
+    volumes: *backend-volumes
+    ports:
+      - "${AGENTIC_OS_API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/api/v1/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [agentic-os]
+
+  worker:
+    build:
+      context: backend
+    environment:
+      <<: *backend-environment
+      AGENTIC_OS_WORKER_ID: compose-worker
+      AGENTIC_OS_SANDBOX_WORKSPACE_ROOT: ${AGENTIC_OS_WORKSPACE_ROOT:-/tmp/agentic-os-workspaces}
+      DOCKER_HOST: unix:///var/run/agentic-os-runtime.sock
+    command: ["agentic-os-worker-loop"]
+    volumes:
+      - artifacts:/var/lib/agentic-os/artifacts
+      - configuration:/etc/agentic-os
+      - ${AGENTIC_OS_WORKSPACE_ROOT:-/tmp/agentic-os-workspaces}:${AGENTIC_OS_WORKSPACE_ROOT:-/tmp/agentic-os-workspaces}
+      - ${CONTAINER_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/agentic-os-runtime.sock
+    depends_on:
+      api:
+        condition: service_healthy
+      sandbox-runtime:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/agentic-os-worker-ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    networks: [agentic-os]
+
+  frontend:
+    build:
+      context: frontend
+    environment:
+      AGENTIC_OS_API_URL: http://api:8000/api/v1
+      AGENTIC_OS_USER_ID: ${AGENTIC_OS_USER_ID:-}
+    ports:
+      - "${AGENTIC_OS_FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://localhost:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [agentic-os]
+
+  sandbox-runtime:
+    image: docker:28-cli
+    environment:
+      DOCKER_HOST: unix:///var/run/agentic-os-runtime.sock
+    command: ["sh", "-c", "docker info >/dev/null && exec tail -f /dev/null"]
+    volumes:
+      - ${CONTAINER_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/agentic-os-runtime.sock
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [agentic-os]
+
+  telemetry:
+    profiles: [telemetry]
+    image: otel/opentelemetry-collector-contrib:0.130.1
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - telemetry-data:/var/lib/otel
+    ports:
+      - "${AGENTIC_OS_OTLP_GRPC_PORT:-4317}:4317"
+      - "${AGENTIC_OS_OTLP_HTTP_PORT:-4318}:4318"
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+    networks: [agentic-os]
+
+volumes:
+  postgres-data:
+    name: agentic-os-postgres-data
+  artifacts:
+    name: agentic-os-artifacts
+  configuration:
+    name: agentic-os-configuration
+  telemetry-data:
+    name: agentic-os-telemetry-data
+
+networks:
+  agentic-os:
+    name: agentic-os

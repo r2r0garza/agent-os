@@ -12,6 +12,10 @@ Agentic OS currently has two app surfaces:
 
 Run backend and frontend commands in separate terminal sessions.
 
+For the Compose-compatible Docker and Podman deployment, including its service
+topology, named volumes, health checks, sandbox socket, and optional telemetry
+profile, see [docs/local-deployment.md](docs/local-deployment.md).
+
 ### Backend setup
 
 Create and activate a repository-local virtual environment, then install the

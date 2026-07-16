@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import uuid
@@ -44,7 +45,15 @@ def execute_task_sandbox(
             "no sandbox runtime (docker or podman) is available to execute the requested sandbox"
         )
 
-    workspace_dir = tempfile.mkdtemp(prefix=f"agentic-os-run-{run_id}-")
+    configured_workspace_root = os.environ.get("AGENTIC_OS_SANDBOX_WORKSPACE_ROOT")
+    workspace_root = None
+    if configured_workspace_root:
+        workspace_root = os.path.abspath(configured_workspace_root)
+        os.makedirs(workspace_root, mode=0o700, exist_ok=True)
+    workspace_dir = tempfile.mkdtemp(
+        prefix=f"agentic-os-run-{run_id}-",
+        dir=workspace_root,
+    )
     spec = SandboxSpec(
         image=sandbox_config.get("image", DEFAULT_SANDBOX_IMAGE),
         command=list(sandbox_config.get("command", ["true"])),
