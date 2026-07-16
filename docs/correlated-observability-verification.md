@@ -4,6 +4,44 @@ This checklist verifies the Sprint 6 operator timeline and admin health views
 against persisted, versioned backend APIs. It intentionally uses no mock
 frontend state.
 
+## Automated coverage
+
+Run the backend suite from `backend/` with the local PostgreSQL instance
+available:
+
+```bash
+source .venv/bin/activate
+python -m pytest tests/test_observability_api.py tests/test_worker.py \
+  tests/test_restart_recovery.py
+```
+
+- `test_observability_api.py` covers redaction of secrets in timeline and
+  detail responses, project/task/run ownership authorization, admin-only
+  health and failed-delivery views, and degraded/stale health reporting for
+  workers, sandboxes, telemetry, and the event stream.
+- `test_worker.py` covers correlated evidence persisted by a real worker run
+  (`test_worker_persists_correlated_records_when_export_is_disabled`) and
+  telemetry export failure isolation from the completed product transaction
+  (`test_export_failure_is_persisted_without_rolling_back_completed_run`).
+- `test_restart_recovery.py`
+  (`test_worker_process_kill_and_restart_resumes_without_duplicating_work`)
+  covers restart continuity: a killed and resumed worker run keeps one stable
+  task-derived correlation id across both attempts, canonical observability
+  records and telemetry export attempts for the interrupted and completed
+  runs remain queryable through `/api/v1/tasks/{task_id}/observability-timeline`
+  with secrets redacted, and `/api/v1/admin/observability/health` stays
+  reachable after the restart.
+
+Run `./agentic-os index check` after backend source changes, and from
+`frontend/` run `pnpm lint`, `pnpm typecheck`, and `pnpm build` for frontend
+changes.
+
+## Manual verification
+
+The steps below exercise the same workflow interactively when a fixture or
+automated case is not enough evidence on its own (e.g. exporter outage
+timing, browser reload behavior).
+
 ## Setup
 
 1. Start PostgreSQL and the backend API using the repository-local development

@@ -13,7 +13,13 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 from sqlalchemy import create_engine, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
-from agentic_os.domain.models import Run, RunConfigurationSnapshot, Task
+from agentic_os.domain.models import (
+    ObservabilityRecord,
+    Run,
+    RunConfigurationSnapshot,
+    Task,
+    TelemetryExportAttempt,
+)
 from agentic_os.sandbox import runtime_available
 
 BACKEND_ROOT = Path(__file__).parents[1]
@@ -389,6 +395,52 @@ class RestartRecoveryTests(unittest.TestCase):
         self.assertEqual(ledger_entries[0]["actual_amount_minor_units"], 25)
         self.assertEqual(ledger_entries[0]["status"], "reconciled")
         self.assertFalse(ledger_entries[0]["is_zero_cost"])
+
+        # Correlated observability evidence survives the kill and restart: the
+        # interrupted first attempt and the resumed second attempt both
+        # record canonical evidence under the same task-derived correlation
+        # id, and that evidence remains reachable through the versioned API
+        # afterward -- not only through direct database access.
+        with self.Session() as session:
+            observability_records = list(
+                session.execute(
+                    select(ObservabilityRecord)
+                    .where(ObservabilityRecord.task_id == task_id)
+                    .order_by(ObservabilityRecord.occurred_at)
+                ).scalars()
+            )
+            self.assertTrue(observability_records)
+            self.assertEqual(
+                len({record.correlation_id for record in observability_records}), 1
+            )
+            self.assertEqual(
+                {record.run_id for record in observability_records},
+                {first_attempt.id, completed_run_id},
+            )
+            self.assertIn("run", {record.event_kind for record in observability_records})
+            telemetry_attempts = list(
+                session.execute(
+                    select(TelemetryExportAttempt)
+                    .join(
+                        ObservabilityRecord,
+                        ObservabilityRecord.id == TelemetryExportAttempt.observability_record_id,
+                    )
+                    .where(ObservabilityRecord.task_id == task_id)
+                ).scalars()
+            )
+            self.assertEqual(len(telemetry_attempts), len(observability_records))
+
+        api_timeline = client.get(f"/api/v1/tasks/{task_id}/observability-timeline").json()
+        self.assertEqual(len(api_timeline), len(observability_records))
+        self.assertEqual(
+            {str(record.correlation_id) for record in observability_records},
+            {item["correlation_id"] for item in api_timeline},
+        )
+        self.assertNotIn(expected["model_secret"], str(api_timeline))
+
+        health_after_restart = client.get("/api/v1/admin/observability/health")
+        self.assertEqual(health_after_restart.status_code, 200, health_after_restart.text)
+        self.assertEqual(health_after_restart.json()["database"]["status"], "healthy")
 
         # Duplicate execution is prevented: the completed task is no longer
         # claimable, so a further worker restart finds nothing to do.
