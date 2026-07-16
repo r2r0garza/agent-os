@@ -119,11 +119,43 @@ export interface Run {
 
 export interface Artifact {
   id: Identifier
+  project_id: Identifier
   goal_id: Identifier | null
   task_id: Identifier | null
   run_id: Identifier | null
+  created_by: Identifier | null
+  parent_artifact_id: Identifier | null
   name: string
+  kind: "source" | "normalized" | "output"
+  content_type: string | null
+  ingestion_status: string
+  ingestion_metadata: Record<string, unknown>
+  ingestion_error: string | null
   created_at: string
+  latest_version: ArtifactVersion | null
+}
+
+export interface ArtifactVersion {
+  id: Identifier
+  artifact_id: Identifier
+  version_number: number
+  content_hash: string
+  size_bytes: number
+  storage_state: string
+  previous_version_id: Identifier | null
+  created_at: string
+}
+
+export interface ArtifactLineage {
+  artifact: Artifact
+  parent: Artifact | null
+  children: Artifact[]
+}
+
+export interface ArtifactCitation {
+  source_artifact_id: Identifier
+  normalized_artifact_id: Identifier
+  citation_anchor: Record<string, unknown>
 }
 
 export interface AuditEvent {
@@ -184,6 +216,29 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return (await response.json()) as T
+}
+
+export async function apiText(path: string): Promise<string> {
+  const response = await fetch(`/api/agentic${path}`, {
+    cache: "no-store",
+    headers: { accept: "text/plain, application/json" },
+  })
+
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`
+    try {
+      const body = (await response.json()) as {
+        detail?: string
+        error?: string
+      }
+      message = body.detail ?? body.error ?? message
+    } catch {
+      // Preserve the status-based fallback for non-JSON upstream responses.
+    }
+    throw new ApiError(message, response.status)
+  }
+
+  return response.text()
 }
 
 export function jsonBody(value: unknown): RequestInit {

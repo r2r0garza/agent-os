@@ -20,6 +20,24 @@ Manual smoke check:
 6. Stop the worker during an active run, restart it, and confirm the console shows
    the durable recoverable state before displaying the resumed history.
 
+Artifact and project-knowledge smoke check:
+
+1. Select a persisted project, upload a `.txt` or `.md` source in **Project
+   knowledge**, and confirm both the source and normalized artifacts appear with
+   finalized version, hash, size, content type, and ingestion metadata.
+2. Select each artifact and confirm the inspector loads content and source →
+   normalized lineage from the versioned backend APIs. Reload the browser and
+   confirm the same artifacts and detail remain available.
+3. Run a task configured with the uploaded source artifact as project knowledge.
+   Select its output artifact and confirm the citation names both the source and
+   normalized artifact and displays its immutable citation anchor.
+4. Upload content using **Unsupported format smoke check** and confirm the source
+   remains downloadable while its `unsupported` ingestion state is prominent.
+5. To verify reconciliation messaging, mark or simulate an artifact version as
+   non-finalized with the backend verification fixture, select it, and confirm the
+   inspector explains that content is unavailable and instructs the operator to
+   reconcile storage and refresh.
+
 ## Adding components
 
 To add components to your app, run the following command:
@@ -35,5 +53,5 @@ This will place the ui components in the `components` directory.
 To use the components in your app, import them as follows:
 
 ```tsx
-import { Button } from "@/components/ui/button";
+import { Button } from "@/components/ui/button"
 ```

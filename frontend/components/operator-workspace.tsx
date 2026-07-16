@@ -9,7 +9,6 @@ import {
   CircleDollarSign,
   CloudCog,
   Database,
-  FileOutput,
   History,
   KeyRound,
   LoaderCircle,
@@ -39,6 +38,7 @@ import {
   api,
   jsonBody,
 } from "@/lib/api"
+import { ArtifactWorkspace } from "@/components/artifact-workspace"
 import { TaskGraphPanel } from "@/components/task-graph-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -263,7 +263,9 @@ export function OperatorWorkspace() {
     void loadGoalState(selectedGoalId)
       .catch((reason: unknown) =>
         setGoalStateError(
-          reason instanceof Error ? reason.message : "Unable to load the task graph"
+          reason instanceof Error
+            ? reason.message
+            : "Unable to load the task graph"
         )
       )
       .finally(() => setGoalLoading(false))
@@ -298,7 +300,9 @@ export function OperatorWorkspace() {
       void loadGoalState(selectedGoalId)
         .catch((reason: unknown) =>
           setGoalStateError(
-            reason instanceof Error ? reason.message : "Unable to load the task graph"
+            reason instanceof Error
+              ? reason.message
+              : "Unable to load the task graph"
           )
         )
         .finally(() => setGoalLoading(false))
@@ -490,9 +494,6 @@ export function OperatorWorkspace() {
     (event) => !selectedGoalId || event.goal_id === selectedGoalId
   )
   const visibleEvents = goalEvents.slice(-12).reverse()
-  const visibleArtifacts = artifacts.filter(
-    (artifact) => !selectedGoalId || artifact.goal_id === selectedGoalId
-  )
   const actualCost = ledger.reduce(
     (total, entry) => total + (entry.actual_amount_minor_units ?? 0),
     0
@@ -507,7 +508,9 @@ export function OperatorWorkspace() {
     [actualCost, currency]
   )
   const activeRun = runs.find((run) => run.status === "running")
-  const recoverable = runs.find((run) => ["failed", "cancelled"].includes(run.status))
+  const recoverable = runs.find((run) =>
+    ["failed", "cancelled"].includes(run.status)
+  )
 
   if (loading) {
     return (
@@ -685,6 +688,13 @@ export function OperatorWorkspace() {
             )}
           </CardContent>
         </Card>
+
+        <ArtifactWorkspace
+          projectId={selectedProjectId}
+          goalId={selectedGoalId}
+          artifacts={artifacts}
+          onRefresh={() => loadProjectState(selectedProjectId)}
+        />
 
         <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(360px,0.78fr)]">
           <div className="grid content-start gap-6">
@@ -1050,47 +1060,6 @@ export function OperatorWorkspace() {
                 ) : (
                   <EmptyState>
                     No audit events are available for this project yet.
-                  </EmptyState>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <FileOutput className="size-4" /> Artifacts & results
-                </CardTitle>
-                <CardDescription>
-                  Result metadata remains queryable after reload or worker
-                  restart.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {visibleArtifacts.length ? (
-                  <div className="grid gap-2">
-                    {visibleArtifacts
-                      .slice(-6)
-                      .reverse()
-                      .map((artifact) => (
-                        <div
-                          key={artifact.id}
-                          className="flex items-center gap-3 rounded-xl border p-3"
-                        >
-                          <FileOutput className="size-4 text-muted-foreground" />
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-medium">
-                              {artifact.name}
-                            </p>
-                            <p className="text-xs text-muted-foreground">
-                              {displayDate(artifact.created_at)}
-                            </p>
-                          </div>
-                        </div>
-                      ))}
-                  </div>
-                ) : (
-                  <EmptyState>
-                    No artifacts have been produced for this project.
                   </EmptyState>
                 )}
               </CardContent>
