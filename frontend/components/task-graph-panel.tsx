@@ -18,6 +18,8 @@ import {
   Task,
   TaskDependency,
 } from "@/lib/api"
+import { GovernanceLookups } from "@/components/governance-workspace"
+import { RunEvidencePanel } from "@/components/run-evidence-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 
@@ -148,6 +150,7 @@ interface TaskGraphPanelProps {
   ledger: CostLedgerEntry[]
   events: AuditEvent[]
   agents: Agent[]
+  governanceLookups: GovernanceLookups
 }
 
 export function TaskGraphPanel({
@@ -160,6 +163,7 @@ export function TaskGraphPanel({
   ledger,
   events,
   agents,
+  governanceLookups,
 }: TaskGraphPanelProps) {
   if (loading) {
     return (
@@ -338,6 +342,11 @@ export function TaskGraphPanel({
                                 <CircleDollarSign className="inline size-3" /> {cost} minor ·{" "}
                                 {displayDate(run.started_at)}
                               </p>
+                              <RunEvidencePanel
+                                run={run}
+                                agents={agents}
+                                lookups={governanceLookups}
+                              />
                             </div>
                           )
                         })}

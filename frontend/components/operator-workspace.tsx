@@ -39,6 +39,10 @@ import {
   jsonBody,
 } from "@/lib/api"
 import { ArtifactWorkspace } from "@/components/artifact-workspace"
+import {
+  GovernanceLookups,
+  GovernanceWorkspace,
+} from "@/components/governance-workspace"
 import { TaskGraphPanel } from "@/components/task-graph-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -144,6 +148,12 @@ export function OperatorWorkspace() {
   const [mutation, setMutation] = useState("")
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
+  const [governanceLookups, setGovernanceLookups] = useState<GovernanceLookups>({
+    skillVersionName: {},
+    mcpVersionName: {},
+    modelProfileVersionName: {},
+    policySetVersionName: {},
+  })
 
   const loadInventory = useCallback(async () => {
     const [models, projects, agents, skills, servers] = await Promise.all([
@@ -684,10 +694,19 @@ export function OperatorWorkspace() {
                 ledger={ledger}
                 events={goalEvents}
                 agents={inventory.agents}
+                governanceLookups={governanceLookups}
               />
             )}
           </CardContent>
         </Card>
+
+        <GovernanceWorkspace
+          agents={inventory.agents}
+          models={inventory.models}
+          skills={inventory.skills}
+          servers={inventory.servers}
+          onLookupsChange={setGovernanceLookups}
+        />
 
         <ArtifactWorkspace
           projectId={selectedProjectId}

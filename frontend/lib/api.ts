@@ -5,7 +5,63 @@ export interface ModelProfile {
   name: string
   base_url: string
   model_identifier: string
+  capability_metadata: Record<string, unknown>
+  pricing_metadata: Record<string, unknown>
   created_at: string
+  updated_at: string
+}
+
+export interface ModelProfileVersion {
+  id: Identifier
+  model_profile_id: Identifier
+  version_number: number
+  base_url: string
+  model_identifier: string
+  credential_id: Identifier | null
+  headers: Record<string, unknown>
+  capability_metadata: Record<string, unknown>
+  pricing_metadata: Record<string, unknown>
+  created_at: string
+}
+
+export interface Credential {
+  id: Identifier
+  team_id: Identifier | null
+  project_id: Identifier | null
+  name: string
+  credential_type: string
+  metadata: Record<string, unknown>
+  configured: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface PolicySet {
+  id: Identifier
+  team_id: Identifier | null
+  project_id: Identifier | null
+  name: string
+  created_at: string
+  updated_at: string
+}
+
+export interface PolicySetVersion {
+  id: Identifier
+  policy_set_id: Identifier
+  version_number: number
+  rules: Record<string, unknown>[]
+  created_at: string
+}
+
+export interface Budget {
+  id: Identifier
+  agent_id: Identifier
+  currency: string
+  amount_minor_units: number
+  enforcement_mode: string
+  warning_threshold_percent: number | null
+  created_at: string
+  updated_at: string
 }
 
 export interface Project {
@@ -31,6 +87,11 @@ export interface Agent {
   created_at: string
 }
 
+export interface VersionAttachment {
+  version_id: Identifier
+  config: Record<string, unknown>
+}
+
 export interface AgentVersion {
   id: Identifier
   agent_id: Identifier
@@ -38,7 +99,11 @@ export interface AgentVersion {
   instructions: string | null
   capability_manifest: Record<string, unknown>
   model_profile_id: Identifier | null
+  model_profile_version_id: Identifier | null
   default_budget_id: Identifier | null
+  skill_attachments: VersionAttachment[]
+  mcp_server_attachments: VersionAttachment[]
+  policy_set_version_ids: Identifier[]
   created_at: string
 }
 
@@ -49,10 +114,29 @@ export interface Skill {
   created_at: string
 }
 
+export interface SkillVersion {
+  id: Identifier
+  skill_id: Identifier
+  version_number: number
+  content_ref: string
+  resource_metadata: Record<string, unknown>
+  created_at: string
+}
+
 export interface McpServer {
   id: Identifier
   name: string
   project_id: Identifier | null
+  created_at: string
+}
+
+export interface McpServerVersion {
+  id: Identifier
+  mcp_server_id: Identifier
+  version_number: number
+  connection_config: Record<string, unknown>
+  credential_configured: boolean
+  credential_id: Identifier | null
   created_at: string
 }
 
@@ -102,6 +186,24 @@ export interface TaskGraph {
   dependencies: TaskDependency[]
 }
 
+export interface RunSnapshot {
+  configuration_snapshot_id?: Identifier
+  agent_id?: Identifier
+  agent_version_id?: Identifier
+  agent_version_number?: number
+  model_profile_version_id?: Identifier | null
+  default_budget_id?: Identifier | null
+  skill_version_ids?: Identifier[]
+  skill_version_id?: Identifier | null
+  mcp_server_version_ids?: Identifier[]
+  mcp_server_version_id?: Identifier | null
+  enabled_tools?: string[]
+  policy_decision?: string
+  policy_evaluations?: Record<string, unknown>[]
+  assignment_rationale?: Record<string, unknown>
+  capability_manifest?: Record<string, unknown>
+}
+
 export interface Run {
   id: Identifier
   task_id: Identifier
@@ -110,7 +212,7 @@ export interface Run {
   agent_version_id: Identifier
   langgraph_thread_id: string | null
   status: string
-  snapshot: Record<string, unknown>
+  snapshot: RunSnapshot
   started_at: string | null
   completed_at: string | null
   created_at: string
