@@ -367,6 +367,102 @@ export interface GovernanceEvidence {
   audit_events: AuditEvent[]
 }
 
+export interface TelemetryAttempt {
+  id: Identifier
+  observability_record_id: Identifier
+  destination: string
+  attempt_number: number
+  status: string
+  last_attempted_at: string | null
+  delivered_at: string | null
+  retry_after: string | null
+  failure_code: string | null
+  failure_message: string | null
+  delivery_evidence: Record<string, unknown>
+  created_at: string
+}
+
+export interface ObservabilityRecord {
+  id: Identifier
+  correlation_id: Identifier
+  request_id: Identifier | null
+  trace_id: string | null
+  span_id: string | null
+  parent_span_id: string | null
+  event_kind: string
+  operation_name: string
+  status: string | null
+  occurred_at: string
+  team_id: Identifier | null
+  user_id: Identifier | null
+  project_id: Identifier | null
+  goal_id: Identifier | null
+  task_id: Identifier | null
+  run_id: Identifier | null
+  audit_event_id: Identifier | null
+  cost_ledger_entry_id: Identifier | null
+  approval_request_id: Identifier | null
+  approval_decision_id: Identifier | null
+  artifact_id: Identifier | null
+  artifact_version_id: Identifier | null
+  model_call_id: Identifier | null
+  tool_call_id: Identifier | null
+  mcp_call_id: Identifier | null
+  sandbox_id: Identifier | null
+  checkpoint_id: Identifier | null
+  attributes: Record<string, unknown>
+  capture_policy_evidence: Record<string, unknown>
+  redaction_evidence: Record<string, unknown>
+  telemetry_attempts: TelemetryAttempt[]
+}
+
+export interface ObservabilityHealth {
+  status: string
+  checked_at: string
+  database: { status: string; latency_ms: number }
+  queues: {
+    status: string
+    depth: number
+    tasks_by_status: Record<string, number>
+  }
+  workers: {
+    status: string
+    active: number
+    stale: number
+    stale_worker_ids: string[]
+    stale_task_ids: Identifier[]
+    lease_count: number
+    retry_count: number
+    failure_count: number
+  }
+  sandbox: {
+    status: string
+    runtimes: Record<string, { status: string; reason: string | null }>
+  }
+  event_stream: {
+    status: string
+    latest_record_at: string | null
+    latest_record_age_seconds: number | null
+    latest_correlation_id: Identifier | null
+    deliveries_by_status: Record<string, number>
+    oldest_queued_delivery_at: string | null
+    delivery_delay_seconds: number | null
+  }
+  telemetry: {
+    status: string
+    deliveries_by_status: Record<string, number>
+    exporters: Array<{
+      id: Identifier
+      exporter_type: string
+      enabled: boolean
+      configured: boolean
+      capture_prompts: boolean
+      capture_outputs: boolean
+      redaction_policy_evidence: Record<string, unknown>
+    }>
+  }
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,

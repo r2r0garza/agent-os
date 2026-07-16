@@ -44,6 +44,7 @@ import {
   GovernanceLookups,
   GovernanceWorkspace,
 } from "@/components/governance-workspace"
+import { ObservabilityWorkspace } from "@/components/observability-workspace"
 import { TaskGraphPanel } from "@/components/task-graph-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -702,6 +703,8 @@ export function OperatorWorkspace() {
             )}
           </CardContent>
         </Card>
+
+        <ObservabilityWorkspace goalId={selectedGoalId} runs={runs} />
 
         <GovernanceWorkspace
           agents={inventory.agents}

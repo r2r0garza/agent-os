@@ -21,6 +21,10 @@ For durable approval decisions, admin overrides, authorization failures, budget
 evidence, recovery, and reload persistence, see
 [`docs/governance-operations-verification.md`](../docs/governance-operations-verification.md).
 
+For correlated goal/run timelines, trace and canonical evidence links, telemetry
+delivery/capture states, admin health, authorization, and recovery checks, see
+[`docs/correlated-observability-verification.md`](../docs/correlated-observability-verification.md).
+
 1. Start PostgreSQL and the backend API, then start this app with `pnpm dev`.
 2. Create a model profile, project, and goal from the console.
 3. Provision the skill, test MCP server, lifetime budget, and agent version.
