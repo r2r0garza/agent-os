@@ -198,6 +198,23 @@ for `docker` and `podman compose` for `docker compose`) available:
   boot was not re-demonstrated in this pass. Re-run step 1 of the manual
   sequence on a host with reliable registry connectivity to close this gap.
 
+## Repository code-index verification
+
+The final Sprint 7 documentation-only changes do not alter the indexed source
+set. A repository-root incremental rebuild reused all 168 indexed files and
+produced no generated-file diff:
+
+```text
+$ ./agentic-os index build --incremental
+{"dependencies": 7515, "parsed_files": 0, "resolved_dependencies": 2857, "reused_files": 168, "symbols": 1449}
+
+$ ./agentic-os index check
+code index is current
+```
+
+This confirms that `.code-index/dependencies.jsonl` and the related generated
+index artifacts match the tracked source after the final operations changes.
+
 ## Interpreting failures
 
 - **`test_local_deployment.py` skips:** the local `docker` CLI or Compose
