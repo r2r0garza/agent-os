@@ -14,6 +14,7 @@ from agentic_os.api.routers import (
     budgets,
     credentials,
     goals,
+    governance,
     mcp_servers,
     model_profiles,
     policy_sets,
@@ -42,6 +43,7 @@ def create_app() -> FastAPI:
     app.include_router(policy_sets.router, prefix=API_V1_PREFIX)
     app.include_router(projects.router, prefix=API_V1_PREFIX)
     app.include_router(goals.router, prefix=API_V1_PREFIX)
+    app.include_router(governance.router, prefix=API_V1_PREFIX)
     app.include_router(agents.router, prefix=API_V1_PREFIX)
     app.include_router(assignments.router, prefix=API_V1_PREFIX)
     app.include_router(skills.router, prefix=API_V1_PREFIX)

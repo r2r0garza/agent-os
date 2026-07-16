@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,10 +17,16 @@ router = APIRouter(tags=["budgets"])
 
 
 class BudgetCreate(BaseModel):
-    currency: str
-    amount_minor_units: int
-    enforcement_mode: str
-    warning_threshold_percent: int | None = None
+    currency: str = Field(min_length=3, max_length=8)
+    amount_minor_units: int = Field(ge=0)
+    enforcement_mode: Literal["warning", "hard_stop"]
+    warning_threshold_percent: int | None = Field(default=None, ge=1, le=100)
+
+
+class BudgetUpdate(BaseModel):
+    amount_minor_units: int | None = Field(default=None, ge=0)
+    enforcement_mode: Literal["warning", "hard_stop"] | None = None
+    warning_threshold_percent: int | None = Field(default=None, ge=1, le=100)
 
 
 class BudgetRead(BaseModel):
@@ -60,7 +67,11 @@ def list_budgets(agent_id: uuid.UUID, session: Session = Depends(get_session)) -
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
     require_default_team_access(session, agent, "agent")
-    return list(session.execute(select(Budget).where(Budget.agent_id == agent_id).order_by(Budget.created_at)).scalars())
+    return list(
+        session.execute(
+            select(Budget).where(Budget.agent_id == agent_id).order_by(Budget.created_at)
+        ).scalars()
+    )
 
 
 @router.get("/budgets/{budget_id}", response_model=BudgetRead)
@@ -70,4 +81,20 @@ def get_budget(budget_id: uuid.UUID, session: Session = Depends(get_session)) ->
         raise HTTPException(status_code=404, detail="budget not found")
     agent = session.get(Agent, budget.agent_id)
     require_default_team_access(session, agent, "budget")
+    return budget
+
+
+@router.patch("/budgets/{budget_id}", response_model=BudgetRead)
+def update_budget(
+    budget_id: uuid.UUID, payload: BudgetUpdate, session: Session = Depends(get_session)
+) -> Budget:
+    budget = session.get(Budget, budget_id)
+    if budget is None:
+        raise HTTPException(status_code=404, detail="budget not found")
+    agent = session.get(Agent, budget.agent_id)
+    require_default_team_access(session, agent, "budget")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(budget, field, value)
+    session.flush()
+    session.refresh(budget)
     return budget
