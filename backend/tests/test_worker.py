@@ -5,8 +5,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -34,7 +36,9 @@ from agentic_os.domain.models import (
     AuditEvent,
     ApprovalModeConfiguration,
     ApprovalRequest,
+    AdminOverride,
     Budget,
+    BudgetReservation,
     CostLedgerEntry,
     Goal,
     McpServer,
@@ -51,6 +55,12 @@ from agentic_os.domain.models import (
 )
 from agentic_os.sandbox import runtime_available
 from agentic_os.worker import claim_ready_task, run_task_worker_once
+from agentic_os.worker.governance import (
+    BudgetActionContext,
+    BudgetExhaustedError,
+    BudgetLimit,
+    reserve_action_cost,
+)
 from agentic_os.worker.runner import TaskExecutionError
 
 BACKEND_ROOT = Path(__file__).parents[1]
@@ -108,6 +118,7 @@ class WorkerTestCase(unittest.TestCase):
         tool_pricing: dict | None = None,
         budget_amount_minor_units: int = 10_00,
         budget_enforcement_mode: str = "hard_stop",
+        budget_warning_threshold_percent: int | None = None,
     ) -> Task:
         team = Team(name=f"Team {uuid.uuid4()}")
         session.add(team)
@@ -155,6 +166,7 @@ class WorkerTestCase(unittest.TestCase):
             currency="USD",
             amount_minor_units=budget_amount_minor_units,
             enforcement_mode=budget_enforcement_mode,
+            warning_threshold_percent=budget_warning_threshold_percent,
         )
         session.add(budget)
         session.flush()
@@ -296,6 +308,11 @@ class WorkerTestCase(unittest.TestCase):
             self.assertTrue(ledger_entries[0].is_zero_cost)
             self.assertEqual(ledger_entries[0].action_type, "mcp_tool_call")
             self.assertEqual(ledger_entries[0].status, "reconciled")
+            reservation = session.execute(
+                select(BudgetReservation).where(BudgetReservation.run_id == run.id)
+            ).scalar_one()
+            self.assertEqual(reservation.status, "reconciled")
+            self.assertEqual(ledger_entries[0].reservation_id, reservation.id)
 
             artifact_versions = list(
                 session.execute(
@@ -1042,6 +1059,7 @@ class WorkerTestCase(unittest.TestCase):
                 tool_pricing={"chargeable": True, "amount_minor_units": 5_00, "currency": "USD"},
                 budget_amount_minor_units=3_00,
                 budget_enforcement_mode="warning",
+                budget_warning_threshold_percent=80,
             )
             task_id = task.id
 
@@ -1063,12 +1081,200 @@ class WorkerTestCase(unittest.TestCase):
             self.assertEqual(ledger_entries[0].reserved_amount_minor_units, 500)
             self.assertEqual(ledger_entries[0].actual_amount_minor_units, 500)
             self.assertFalse(ledger_entries[0].is_zero_cost)
+            self.assertTrue(ledger_entries[0].warning_triggered)
+
+            reservation = session.execute(
+                select(BudgetReservation).where(BudgetReservation.run_id == run.id)
+            ).scalar_one()
+            self.assertEqual(reservation.status, "reconciled")
+            self.assertTrue(reservation.warning_triggered)
 
             event_types = {
                 row.event_type
                 for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
             }
             self.assertIn("tool.invoked", event_types)
+            self.assertIn("budget.warning_threshold", event_types)
+
+    def test_unpriced_metered_tool_is_rejected_before_hard_budget_side_effect(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(
+                session,
+                tool_pricing={"chargeable": True, "currency": "USD"},
+            )
+            task_id = task.id
+
+        with self.Session() as session:
+            with mock.patch("agentic_os.worker.runner.invoke_tool") as invoke:
+                with self.assertRaises(TaskExecutionError):
+                    run_task_worker_once(session, "worker-unpriced")
+                session.commit()
+                invoke.assert_not_called()
+
+        with self.Session() as session:
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            reservation = session.execute(
+                select(BudgetReservation).where(BudgetReservation.run_id == run.id)
+            ).scalar_one()
+            ledger = session.execute(
+                select(CostLedgerEntry).where(CostLedgerEntry.run_id == run.id)
+            ).scalar_one()
+            self.assertEqual(reservation.status, "rejected")
+            self.assertTrue(reservation.is_unpriced)
+            self.assertTrue(reservation.hard_stop_triggered)
+            self.assertEqual(ledger.status, "void")
+            self.assertTrue(ledger.is_unpriced)
+
+    def test_active_admin_override_allows_scoped_over_budget_action(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(
+                session,
+                tool_pricing={"chargeable": True, "amount_minor_units": 500, "currency": "USD"},
+                budget_amount_minor_units=300,
+            )
+            goal = session.get(Goal, task.goal_id)
+            project = session.get(Project, goal.project_id)
+            admin = User(
+                email=f"admin-{uuid.uuid4()}@example.test",
+                display_name="Budget Admin",
+                role="admin",
+            )
+            session.add(admin)
+            session.flush()
+            override = AdminOverride(
+                team_id=project.team_id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                created_by=admin.id,
+                scope_type="task",
+                scope_id=task.id,
+                reason="Allow one bounded over-limit tool call",
+                starts_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                context={"budget": {"allow_over_limit": True}},
+            )
+            session.add(override)
+            session.flush()
+            task_id = task.id
+            override_id = override.id
+            admin_id = admin.id
+            session.commit()
+
+        with self.Session() as session:
+            claimed = run_task_worker_once(session, "worker-override")
+            session.commit()
+            self.assertEqual(claimed.status, "completed")
+
+        with self.Session() as session:
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            reservation = session.execute(
+                select(BudgetReservation).where(BudgetReservation.run_id == run.id)
+            ).scalar_one()
+            ledger = session.execute(
+                select(CostLedgerEntry).where(CostLedgerEntry.run_id == run.id)
+            ).scalar_one()
+            self.assertEqual(reservation.status, "reconciled")
+            self.assertTrue(reservation.hard_stop_triggered)
+            self.assertEqual(reservation.pricing_evidence["override"]["id"], str(override_id))
+            self.assertEqual(ledger.evidence["override"]["actor_id"], str(admin_id))
+            events = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.run_id == run.id)).scalars()
+            }
+            self.assertIn("budget.override_applied", events)
+
+    def test_timed_out_tool_keeps_reservation_for_reconciliation(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(
+                session,
+                tool_pricing={"chargeable": True, "amount_minor_units": 200, "currency": "USD"},
+            )
+            task_id = task.id
+
+        with self.Session() as session:
+            with mock.patch(
+                "agentic_os.worker.runner.invoke_tool", side_effect=TimeoutError("provider timeout")
+            ):
+                with self.assertRaises(TaskExecutionError):
+                    run_task_worker_once(session, "worker-timeout")
+                session.commit()
+
+        with self.Session() as session:
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            reservation = session.execute(
+                select(BudgetReservation).where(BudgetReservation.run_id == run.id)
+            ).scalar_one()
+            ledger = session.execute(
+                select(CostLedgerEntry).where(CostLedgerEntry.run_id == run.id)
+            ).scalar_one()
+            self.assertEqual(reservation.status, "active")
+            self.assertEqual(ledger.status, "reserved")
+            self.assertEqual(ledger.evidence["outcome"], "uncertain_external_side_effect")
+            events = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.run_id == run.id)).scalars()
+            }
+            self.assertIn("budget.reconciliation_required", events)
+
+    def test_concurrent_hard_budget_reservations_cannot_overspend(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session, budget_amount_minor_units=1_000)
+            goal = session.get(Goal, task.goal_id)
+            project = session.get(Project, goal.project_id)
+            version = session.get(AgentVersion, task.assigned_agent_version_id)
+            budget = session.get(Budget, version.default_budget_id)
+            run = Run(
+                task_id=task.id,
+                attempt_number=99,
+                idempotency_key=f"{task.id}:concurrent-budget-test",
+                lease_token=task.lease_token,
+                agent_version_id=version.id,
+                status="running",
+            )
+            session.add(run)
+            task.status = "completed"
+            session.flush()
+            context = BudgetActionContext(
+                team_id=project.team_id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                agent_version_id=version.id,
+                requested_by=goal.created_by,
+            )
+            limit = BudgetLimit(
+                id=budget.id,
+                currency=budget.currency,
+                amount_minor_units=budget.amount_minor_units,
+                enforcement_mode=budget.enforcement_mode,
+            )
+            session.commit()
+
+        barrier = threading.Barrier(2)
+
+        def claim() -> str:
+            with self.Session() as session:
+                barrier.wait()
+                try:
+                    reserve_action_cost(
+                        session,
+                        budget=limit,
+                        context=context,
+                        action_type="model_call",
+                        amount_minor_units=600,
+                        currency="USD",
+                    )
+                    session.commit()
+                    return "reserved"
+                except BudgetExhaustedError:
+                    session.commit()
+                    return "rejected"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: claim(), range(2)))
+        self.assertCountEqual(results, ["reserved", "rejected"])
 
     def test_claim_ignores_tasks_without_assigned_agent(self) -> None:
         with self.Session() as session:

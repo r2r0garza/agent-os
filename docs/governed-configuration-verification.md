@@ -32,7 +32,9 @@ The suite proves:
 - API responses redact credentials and sensitive configuration while enforcing
   team/project ownership;
 - policy denial and approval interrupts happen before tool side effects;
-- hard budgets reject over-limit calls and warning budgets record allowed cost;
+- hard budgets reject over-limit and unpriced metered calls before dispatch,
+  warning budgets record threshold evidence while allowing dispatch, and
+  concurrent reservations cannot overspend a hard cap;
 - workers execute from pinned model, skill, MCP, policy, and budget versions;
 - retries and a real worker-process kill reuse one snapshot despite later
   configuration changes;
@@ -82,6 +84,30 @@ git diff --check
 9. Exercise enforcement with a copied task: attach a deny policy and confirm no
    `tool.invoked` event exists; then configure a priced tool above a hard budget
    and confirm `budget.exhausted` exists with no tool invocation.
+10. Inspect `budget_reservations` and `cost_ledger_entries`: successful calls
+    move from reserved to reconciled, while a timed-out call remains reserved
+    with `uncertain_external_side_effect` evidence for operator reconciliation.
+
+## Budget override contract
+
+An admin override affects budget enforcement only when its project, goal, task,
+or run scope contains the action; its actor is still an admin; its reason is
+non-empty; and its start/expiry window is active. The override `context` must
+grant the specific exception explicitly:
+
+```json
+{
+  "budget": {
+    "allow_over_limit": true,
+    "allow_unpriced": false
+  }
+}
+```
+
+`allow_over_limit` permits a scoped action beyond a hard cap.
+`allow_unpriced` permits a scoped metered action without comparable pricing.
+Applied overrides are copied into reservation and ledger evidence and emit a
+`budget.override_applied` audit event with actor, reason, scope, and expiry.
 
 ## Interpreting failures
 

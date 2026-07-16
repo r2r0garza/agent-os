@@ -26,7 +26,11 @@ from agentic_os.domain.models import (
 from agentic_os.worker.approvals import ensure_action_approvals
 from agentic_os.worker.configuration import ConfigurationSnapshotError, resolve_run_configuration
 from agentic_os.worker.governance import (
+    BudgetActionContext,
     BudgetExhaustedError,
+    mark_action_cost_uncertain,
+    reconcile_action_cost,
+    release_action_cost,
     reserve_action_cost,
 )
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, release_lease, renew_lease
@@ -289,20 +293,45 @@ def _execute_claimed_task(
     consumed_knowledge = consume_task_knowledge(session, storage, task, run, project_id=project_id)
 
     default_currency = budget.currency if budget else "USD"
+    budget_context = BudgetActionContext(
+        team_id=project.team_id,
+        project_id=project.id,
+        goal_id=goal.id,
+        task_id=task.id,
+        run_id=run.id,
+        agent_version_id=run.agent_version_id,
+        requested_by=goal.created_by,
+    )
     tool_results: dict[str, dict] = {}
     for tool_name in enabled_tools:
         descriptor = resolved.tool_descriptor(tool_name)
         pricing = descriptor.get("pricing") or {}
-        amount_minor_units = int(pricing.get("amount_minor_units", 0)) if pricing.get("chargeable") else 0
+        chargeable = pricing.get("chargeable") is True
+        amount_minor_units = (
+            int(pricing["amount_minor_units"])
+            if chargeable and pricing.get("amount_minor_units") is not None
+            else None if chargeable else 0
+        )
         currency = pricing.get("currency", default_currency)
+        # Enter budget locking from a clean transaction. The claimed task,
+        # run, snapshot, and any prior tool evidence are durable before the
+        # per-budget lock is acquired, which gives concurrent workers one
+        # consistent lock order and avoids task-row/budget-row deadlocks.
+        session.commit()
         try:
-            reserve_action_cost(
+            cost = reserve_action_cost(
                 session,
                 budget=budget,
-                run_id=run.id,
+                context=budget_context,
                 action_type="mcp_tool_call",
                 amount_minor_units=amount_minor_units,
                 currency=currency,
+                pricing_evidence={
+                    "tool": tool_name,
+                    "chargeable": chargeable,
+                    "declared_pricing": pricing,
+                    "configuration_snapshot_id": str(resolved.snapshot_id),
+                },
             )
         except BudgetExhaustedError as error:
             session.add(
@@ -323,7 +352,85 @@ def _execute_claimed_task(
             session.flush()
             raise TaskExecutionError(str(error)) from error
 
-        result = invoke_tool(tool_name, {"task_id": str(task.id), "run_id": str(run.id)})
+        if cost.warning_triggered:
+            session.add(
+                AuditEvent(
+                    project_id=project_id,
+                    goal_id=task.goal_id,
+                    task_id=task.id,
+                    run_id=run.id,
+                    event_type="budget.warning_threshold",
+                    payload={
+                        "tool": tool_name,
+                        "budget_id": str(budget.id) if budget else None,
+                        "reservation_id": (
+                            str(cost.reservation.id) if cost.reservation else None
+                        ),
+                        "configuration_snapshot_id": str(resolved.snapshot_id),
+                    },
+                )
+            )
+        if cost.override is not None:
+            session.add(
+                AuditEvent(
+                    project_id=project_id,
+                    goal_id=task.goal_id,
+                    task_id=task.id,
+                    run_id=run.id,
+                    event_type="budget.override_applied",
+                    payload={
+                        "tool": tool_name,
+                        "budget_id": str(budget.id) if budget else None,
+                        "override_id": str(cost.override.id),
+                        "actor_id": str(cost.override.created_by),
+                        "reason": cost.override.reason,
+                        "expires_at": cost.override.expires_at.isoformat(),
+                    },
+                )
+            )
+        session.flush()
+
+        # The reservation is the durable pre-side-effect boundary. Committing
+        # it releases the budget row lock so independent runs sharing a budget
+        # can reserve remaining capacity and execute concurrently. A crash
+        # after this commit leaves an active pessimistic reservation for
+        # reconciliation instead of losing evidence or permitting overspend.
+        session.commit()
+
+        try:
+            result = invoke_tool(tool_name, {"task_id": str(task.id), "run_id": str(run.id)})
+        except TimeoutError as error:
+            mark_action_cost_uncertain(session, cost, reason=str(error))
+            session.add(
+                AuditEvent(
+                    project_id=project_id,
+                    goal_id=task.goal_id,
+                    task_id=task.id,
+                    run_id=run.id,
+                    event_type="budget.reconciliation_required",
+                    payload={
+                        "tool": tool_name,
+                        "reservation_id": (
+                            str(cost.reservation.id) if cost.reservation else None
+                        ),
+                        "reason": str(error),
+                    },
+                )
+            )
+            session.flush()
+            raise TaskExecutionError(
+                f"tool {tool_name!r} timed out with an uncertain external result"
+            ) from error
+        except Exception as error:
+            release_action_cost(session, cost, reason=str(error))
+            raise
+
+        reconcile_action_cost(
+            session,
+            cost,
+            actual_amount_minor_units=amount_minor_units or 0,
+            evidence={"tool": tool_name},
+        )
         tool_results[tool_name] = result
         session.add(
             AuditEvent(

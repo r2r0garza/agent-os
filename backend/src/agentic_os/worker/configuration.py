@@ -74,6 +74,11 @@ class ResolvedRunConfiguration:
             currency=value["currency"],
             amount_minor_units=int(value["amount_minor_units"]),
             enforcement_mode=value["enforcement_mode"],
+            warning_threshold_percent=(
+                int(value["warning_threshold_percent"])
+                if value.get("warning_threshold_percent") is not None
+                else None
+            ),
         )
 
     def tool_descriptor(self, tool_name: str) -> dict[str, Any]:
