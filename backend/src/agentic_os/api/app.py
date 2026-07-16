@@ -20,6 +20,7 @@ from agentic_os.api.routers import (
     governance,
     mcp_servers,
     model_profiles,
+    observability,
     policy_sets,
     projects,
     skills,
@@ -57,6 +58,7 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(model_profiles.router, prefix=API_V1_PREFIX)
+    app.include_router(observability.router, prefix=API_V1_PREFIX)
     app.include_router(credentials.router, prefix=API_V1_PREFIX)
     app.include_router(policy_sets.router, prefix=API_V1_PREFIX)
     app.include_router(projects.router, prefix=API_V1_PREFIX)
