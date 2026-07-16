@@ -108,6 +108,16 @@ resource-key pair is safely serialized, and a mid-run restart while
 several multi-agent tasks are in flight recovers without losing or
 duplicating acknowledged work.
 
+## Local operations verification
+
+See [docs/local-operations-verification.md](docs/local-operations-verification.md)
+for the Sprint 7 consolidated verification: the automated suite covering
+Compose topology, configuration/master-key preflight, health evidence,
+setup/migration/backup/restore/upgrade operations, and restart continuity,
+plus the manual end-to-end smoke sequence (setup → submit governed goal →
+restart → recover → backup → restore → preflight/upgrade) and the frontend
+operational views that surface it.
+
 ## Deterministic code index
 
 The committed `.code-index/` covers tracked Python backend and TypeScript/TSX or
