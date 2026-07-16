@@ -14,6 +14,7 @@ from agentic_os.artifacts import (
     ArtifactContentUnavailableError,
     artifact_storage,
     create_artifact_version,
+    ingest_source_artifact,
 )
 from agentic_os.domain.models import Artifact, ArtifactVersion, AuditEvent, Goal, Project, Run, Task
 
@@ -49,6 +50,8 @@ class ArtifactRead(BaseModel):
     kind: str
     content_type: str | None
     ingestion_status: str
+    ingestion_metadata: dict
+    ingestion_error: str | None
     created_at: datetime
     latest_version: ArtifactVersionRead | None = None
 
@@ -155,6 +158,7 @@ def upload_artifact(
 
     storage = artifact_storage()
     create_artifact_version(session, storage, artifact, payload.content.encode(), version_number=1)
+    ingest_source_artifact(session, storage, artifact)
 
     session.add(
         AuditEvent(
@@ -202,6 +206,27 @@ def get_artifact(artifact_id: uuid.UUID, session: Session = Depends(get_session)
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact not found")
     return _to_read(session, artifact)
+
+
+@router.get("/artifacts/{artifact_id}/normalized", response_model=ArtifactRead)
+def get_normalized_artifact(
+    artifact_id: uuid.UUID, session: Session = Depends(get_session)
+) -> ArtifactRead:
+    artifact = session.get(Artifact, artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    normalized = session.execute(
+        select(Artifact)
+        .where(Artifact.parent_artifact_id == artifact_id, Artifact.kind == "normalized")
+        .order_by(Artifact.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if normalized is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"normalized artifact is unavailable; ingestion status is {artifact.ingestion_status}",
+        )
+    return _to_read(session, normalized)
 
 
 @router.get("/artifacts/{artifact_id}/versions", response_model=list[ArtifactVersionRead])

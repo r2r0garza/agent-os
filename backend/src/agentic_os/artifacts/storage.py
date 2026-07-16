@@ -51,6 +51,8 @@ class ArtifactStorage(Protocol):
 
     def delete_finalized(self, content_hash: str) -> None: ...
 
+    def read(self, storage_ref: str) -> bytes: ...
+
 
 class LocalArtifactStorage:
     """Content-addressed blob storage backed by a local durable directory."""
@@ -145,6 +147,12 @@ class LocalArtifactStorage:
         if not storage_ref.startswith(prefix):
             raise ArtifactStorageError(f"unsupported local storage reference: {storage_ref}")
         return self._final_path(f"sha256:{storage_ref.removeprefix(prefix)}")
+
+    def read(self, storage_ref: str) -> bytes:
+        path = self.path_for_ref(storage_ref)
+        if not path.is_file():
+            raise ArtifactStorageError(f"artifact content is unavailable: {storage_ref}")
+        return path.read_bytes()
 
     def _staged_path(self, content_hash: str) -> Path:
         return self.staging_root / _digest(content_hash)

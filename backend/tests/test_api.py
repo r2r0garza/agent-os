@@ -524,7 +524,9 @@ class ArtifactApiTests(unittest.TestCase):
         self.assertEqual(artifact["goal_id"], goal["id"])
         self.assertEqual(artifact["kind"], "source")
         self.assertEqual(artifact["content_type"], "text/markdown")
-        self.assertEqual(artifact["ingestion_status"], "pending")
+        self.assertEqual(artifact["ingestion_status"], "complete")
+        self.assertEqual(artifact["ingestion_metadata"]["normalization_version"], "text-v1")
+        self.assertIsNone(artifact["ingestion_error"])
         self.assertIsNone(artifact["parent_artifact_id"])
         version = artifact["latest_version"]
         self.assertEqual(version["version_number"], 1)
@@ -536,7 +538,16 @@ class ArtifactApiTests(unittest.TestCase):
         self.assertEqual(fetched, artifact)
 
         listed = client.get(f"/api/v1/projects/{project['id']}/artifacts").json()
-        self.assertEqual([entry["id"] for entry in listed], [artifact["id"]])
+        self.assertCountEqual([entry["kind"] for entry in listed], ["source", "normalized"])
+
+        normalized = client.get(f"/api/v1/artifacts/{artifact['id']}/normalized")
+        self.assertEqual(normalized.status_code, 200, normalized.text)
+        normalized_artifact = normalized.json()
+        self.assertEqual(normalized_artifact["parent_artifact_id"], artifact["id"])
+        self.assertEqual(normalized_artifact["kind"], "normalized")
+        self.assertEqual(normalized_artifact["ingestion_metadata"]["headings"][0]["title"], "Notes")
+        normalized_content = client.get(f"/api/v1/artifacts/{normalized_artifact['id']}/content")
+        self.assertEqual(normalized_content.text, "# Notes\n\nSome durable content.")
 
     def test_upload_rejects_goal_from_a_different_project(self) -> None:
         project_a = self._make_project()
@@ -576,6 +587,21 @@ class ArtifactApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.text, "retrievable content")
         self.assertTrue(response.headers["content-type"].startswith("text/plain"))
+
+    def test_unsupported_upload_preserves_source_and_exposes_status(self) -> None:
+        project = self._make_project()
+        source = client.post(
+            f"/api/v1/projects/{project['id']}/artifacts",
+            json={"name": "manual.pdf", "content": "%PDF", "content_type": "application/pdf"},
+        ).json()
+
+        self.assertEqual(source["kind"], "source")
+        self.assertEqual(source["ingestion_status"], "unsupported")
+        self.assertEqual(source["ingestion_metadata"]["reason"], "unsupported content type")
+        self.assertEqual(client.get(f"/api/v1/artifacts/{source['id']}/content").text, "%PDF")
+        normalized = client.get(f"/api/v1/artifacts/{source['id']}/normalized")
+        self.assertEqual(normalized.status_code, 409)
+        self.assertIn("unsupported", normalized.json()["detail"])
 
     def test_artifact_content_retrieval_blocked_when_not_finalized(self) -> None:
         from agentic_os.domain import create_database_engine, session_factory

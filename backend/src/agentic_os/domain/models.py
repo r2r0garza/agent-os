@@ -421,6 +421,8 @@ class Artifact(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     ingestion_status: Mapped[str] = mapped_column(
         ArtifactIngestionStatus, nullable=False, server_default="not_applicable"
     )
+    ingestion_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    ingestion_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ArtifactBlob(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
