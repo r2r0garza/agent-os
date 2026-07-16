@@ -108,6 +108,7 @@ class DomainMigrationTests(unittest.TestCase):
             "budgets",
             "cost_ledger_entries",
             "artifacts",
+            "artifact_blobs",
             "artifact_versions",
             "audit_events",
             "workspace_resources",

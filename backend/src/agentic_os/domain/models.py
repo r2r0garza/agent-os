@@ -42,6 +42,9 @@ PolicyScopeType = Enum(
 PolicyDecision = Enum("deny", "approval_required", "allow", name="policy_decision", validate_strings=True)
 BudgetEnforcementMode = Enum("warning", "hard_stop", name="budget_enforcement_mode", validate_strings=True)
 LedgerEntryStatus = Enum("reserved", "reconciled", "void", name="ledger_entry_status", validate_strings=True)
+ArtifactStorageState = Enum(
+    "staged", "finalized", "missing", "orphaned", name="artifact_storage_state", validate_strings=True
+)
 
 
 class Team(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -407,6 +410,23 @@ class Artifact(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     name: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class ArtifactBlob(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "artifact_blobs"
+    __table_args__ = (
+        UniqueConstraint("content_hash", name="uq_artifact_blobs_content_hash"),
+        CheckConstraint("size_bytes >= 0", name="artifact_blob_size_non_negative"),
+    )
+
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    storage_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str] = mapped_column(ArtifactStorageState, nullable=False, server_default="staged")
+    staged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciliation_details: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
 class ArtifactVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     __tablename__ = "artifact_versions"
     __table_args__ = (
@@ -417,8 +437,15 @@ class ArtifactVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
         UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="CASCADE"), nullable=False
     )
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    blob_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifact_blobs.id", ondelete="RESTRICT"), nullable=True
+    )
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     storage_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    storage_state: Mapped[str] = mapped_column(
+        ArtifactStorageState, nullable=False, server_default="missing"
+    )
     previous_version_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("artifact_versions.id", ondelete="SET NULL"), nullable=True
     )

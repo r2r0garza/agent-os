@@ -3,15 +3,18 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from sqlalchemy import create_engine, select
 
+from agentic_os.artifacts import ArtifactContentUnavailableError, LocalArtifactStorage
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
     Agent,
@@ -233,6 +236,41 @@ class WorkerTestCase(unittest.TestCase):
         with self.Session() as session:
             runs = list(session.execute(select(Run).where(Run.task_id == task_id)).scalars())
             self.assertEqual(len(runs), 1)
+
+    def test_worker_cannot_complete_when_finalized_artifact_content_disappears(self) -> None:
+        class DisappearingStorage(LocalArtifactStorage):
+            def finalize(self, staged):
+                storage_ref = super().finalize(staged)
+                self.path_for_ref(storage_ref).unlink()
+                return storage_ref
+
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id = task.id
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = DisappearingStorage(directory)
+            with self.Session() as session:
+                with mock.patch(
+                    "agentic_os.worker.runner.artifact_storage", return_value=storage
+                ):
+                    with self.assertRaises(ArtifactContentUnavailableError):
+                        run_task_worker_once(session, "worker-missing-artifact")
+                session.commit()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            versions = list(
+                session.execute(
+                    select(ArtifactVersion)
+                    .join(Artifact, ArtifactVersion.artifact_id == Artifact.id)
+                    .where(Artifact.run_id == run.id)
+                ).scalars()
+            )
+            self.assertEqual(task.status, "failed")
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(versions, [])
 
     def test_worker_executes_task_with_sandbox_and_persists_lifecycle_events(self) -> None:
         available, reason = runtime_available("docker")

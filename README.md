@@ -34,6 +34,10 @@ Override that for local development by setting `DATABASE_URL` when needed.
 Some API flows that store encrypted credentials also require
 `AGENTIC_OS_MASTER_KEY`.
 
+Finalized artifact bytes use a content-addressed local durable directory. Set
+`AGENTIC_OS_ARTIFACT_ROOT` to the mounted durable-volume path for the deployment;
+otherwise the backend uses `~/.local/share/agentic-os/artifacts`.
+
 Start the FastAPI development server from `backend/` with the virtual
 environment active:
 

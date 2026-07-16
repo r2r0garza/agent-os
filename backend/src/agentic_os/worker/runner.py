@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -9,11 +8,11 @@ from typing import Callable
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from agentic_os.artifacts import artifact_storage, create_artifact_version, verify_artifact_version
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
     Artifact,
-    ArtifactVersion,
     AuditEvent,
     Budget,
     CostLedgerEntry,
@@ -266,7 +265,6 @@ def _execute_claimed_task(
     artifact_payload = json.dumps(
         {"task_id": str(task.id), "run_id": str(run.id), "tool_results": tool_results}, sort_keys=True
     )
-    content_hash = "sha256:" + hashlib.sha256(artifact_payload.encode()).hexdigest()
     artifact = Artifact(
         project_id=project_id,
         goal_id=task.goal_id,
@@ -276,15 +274,15 @@ def _execute_claimed_task(
     )
     session.add(artifact)
     session.flush()
-    session.add(
-        ArtifactVersion(
-            artifact_id=artifact.id,
-            version_number=1,
-            content_hash=content_hash,
-            storage_ref=f"local://artifacts/{artifact.id}/v1.json",
-        )
+    storage = artifact_storage()
+    artifact_version = create_artifact_version(
+        session,
+        storage,
+        artifact,
+        artifact_payload.encode(),
+        version_number=1,
     )
-    session.flush()
+    verify_artifact_version(storage, artifact_version)
 
     run.status = "completed"
     run.completed_at = datetime.now(timezone.utc)
