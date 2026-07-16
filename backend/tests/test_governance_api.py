@@ -14,9 +14,11 @@ from sqlalchemy import create_engine, func, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
+    AuditEvent,
     ApprovalRequest,
     ProjectMember,
     Run,
+    Task,
     Team,
     TeamMembership,
     User,
@@ -107,6 +109,8 @@ class GovernanceApiTests(unittest.TestCase):
                 expires_at=expires_at,
             )
             session.add(request)
+            task = session.get(Task, uuid.UUID(self.task["id"]))
+            task.status = "blocked"
             session.flush()
             return {"id": str(request.id), "run_id": str(run.id)}
 
@@ -171,6 +175,18 @@ class GovernanceApiTests(unittest.TestCase):
         self.assertEqual(resolved.status_code, 201, resolved.text)
         self.assertEqual(resolved.json()["decision"], "approved")
         self.assertEqual(resolved.json()["context"]["access_token"], "[REDACTED]")
+        with SessionLocal() as session:
+            task = session.get(Task, uuid.UUID(self.task["id"]))
+            self.assertEqual(task.status, "ready")
+            self.assertIn(
+                "approval.resume_ready",
+                {
+                    event.event_type
+                    for event in session.execute(
+                        select(AuditEvent).where(AuditEvent.task_id == task.id)
+                    ).scalars()
+                },
+            )
         duplicate = client.post(
             f"/api/v1/approval-requests/{approval['id']}/deny", json={}, headers=headers
         )
@@ -188,6 +204,13 @@ class GovernanceApiTests(unittest.TestCase):
             client.post(f"/api/v1/approval-requests/{expired['id']}/expire", json={}).json()["decision"],
             "expired",
         )
+        with SessionLocal() as session:
+            runs = list(
+                session.execute(
+                    select(Run).where(Run.id.in_([uuid.UUID(denied["run_id"]), uuid.UUID(expired["run_id"])]))
+                ).scalars()
+            )
+            self.assertTrue(all(run.status == "failed" for run in runs))
 
     def test_role_and_ownership_boundaries_protect_requests_and_overrides(self) -> None:
         configuration = self._configure()

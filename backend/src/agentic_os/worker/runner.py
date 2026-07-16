@@ -23,6 +23,7 @@ from agentic_os.domain.models import (
     Run,
     Task,
 )
+from agentic_os.worker.approvals import ensure_action_approvals
 from agentic_os.worker.configuration import ConfigurationSnapshotError, resolve_run_configuration
 from agentic_os.worker.governance import (
     BudgetExhaustedError,
@@ -126,6 +127,9 @@ def _execute_claimed_task(
     project = session.get(Project, project_id)
     if project is None:
         raise TaskExecutionError(f"project {project_id} not found")
+    goal = session.get(Goal, task.goal_id)
+    if goal is None:
+        raise TaskExecutionError(f"goal {task.goal_id} not found")
 
     attempt_number = (
         session.execute(
@@ -179,6 +183,7 @@ def _execute_claimed_task(
         "enabled_tools": enabled_tools,
         "policy_decision": policy_decision,
         "policy_evaluations": policy_evaluations,
+        "approval_configuration": resolved.approval_configuration,
         "assignment_rationale": configuration["assignment_rationale"],
         "capability_manifest": capability_manifest,
     }
@@ -231,11 +236,35 @@ def _execute_claimed_task(
     if policy_decision == "deny":
         raise TaskExecutionError(f"policy denied execution for agent {agent['id']}")
 
-    if policy_decision == "approval_required":
-        # A durable interrupt: leave the run and task in an explicit,
-        # inspectable safe state rather than proceeding to any tool, skill,
-        # or sandbox side effect. Resuming after approval is a separate,
-        # future concern; this run attempt stops here.
+    approval_state, approval_requests = ensure_action_approvals(
+        session,
+        project=project,
+        goal=goal,
+        task=task,
+        run=run,
+        resolved=resolved,
+    )
+    run.snapshot = {
+        **run.snapshot,
+        "approval_request_ids": [str(request.id) for request in approval_requests],
+    }
+    if approval_state == "rejected":
+        run.status = "failed"
+        run.completed_at = datetime.now(timezone.utc)
+        session.add(
+            AuditEvent(
+                project_id=project_id,
+                goal_id=task.goal_id,
+                task_id=task.id,
+                run_id=run.id,
+                event_type="run.approval_rejected",
+                payload={"approval_request_ids": run.snapshot["approval_request_ids"]},
+            )
+        )
+        release_lease(session, task, worker_id, status="failed")
+        return
+
+    if approval_state == "pending":
         run.status = "waiting_approval"
         session.add(
             AuditEvent(
@@ -248,6 +277,7 @@ def _execute_claimed_task(
                     "decision": policy_decision,
                     "evaluations": policy_evaluations,
                     "configuration_snapshot_id": str(resolved.snapshot_id),
+                    "approval_request_ids": run.snapshot["approval_request_ids"],
                 },
             )
         )

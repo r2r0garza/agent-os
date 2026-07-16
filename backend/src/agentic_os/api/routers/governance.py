@@ -358,6 +358,50 @@ def _resolve_request(
         run_id=request.run_id, event_type=f"approval.{decision}",
         payload={"approval_request_id": str(request.id), "actor_id": str(actor.id), "reason": payload.reason},
     ))
+    task = session.get(Task, request.task_id)
+    run = session.get(Run, request.run_id)
+    if decision == "approved":
+        unresolved = session.execute(
+            select(ApprovalRequest).where(
+                ApprovalRequest.task_id == request.task_id,
+                ApprovalRequest.status == "pending",
+                ApprovalRequest.id != request.id,
+            )
+        ).first()
+        rejected = session.execute(
+            select(ApprovalRequest).where(
+                ApprovalRequest.task_id == request.task_id,
+                ApprovalRequest.status.in_(["denied", "expired", "cancelled"]),
+            )
+        ).first()
+        if task is not None and unresolved is None and rejected is None and task.status == "blocked":
+            task.status = "ready"
+            session.add(
+                AuditEvent(
+                    project_id=request.project_id,
+                    goal_id=request.goal_id,
+                    task_id=request.task_id,
+                    run_id=request.run_id,
+                    event_type="approval.resume_ready",
+                    payload={"approval_request_id": str(request.id)},
+                )
+            )
+    else:
+        if task is not None and task.status == "blocked":
+            task.status = "failed"
+        if run is not None and run.status == "waiting_approval":
+            run.status = "failed"
+            run.completed_at = now
+        session.add(
+            AuditEvent(
+                project_id=request.project_id,
+                goal_id=request.goal_id,
+                task_id=request.task_id,
+                run_id=request.run_id,
+                event_type=f"run.approval_{decision}",
+                payload={"approval_request_id": str(request.id)},
+            )
+        )
     session.flush()
     session.refresh(record)
     result = ApprovalDecisionRead.model_validate(record)

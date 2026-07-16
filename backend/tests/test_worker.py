@@ -32,6 +32,8 @@ from agentic_os.domain.models import (
     ArtifactCitation,
     ArtifactVersion,
     AuditEvent,
+    ApprovalModeConfiguration,
+    ApprovalRequest,
     Budget,
     CostLedgerEntry,
     Goal,
@@ -843,6 +845,12 @@ class WorkerTestCase(unittest.TestCase):
             self.assertEqual(run.status, "waiting_approval")
             self.assertIsNone(run.completed_at)
             self.assertEqual(run.snapshot["policy_decision"], "approval_required")
+            approval = session.execute(
+                select(ApprovalRequest).where(ApprovalRequest.task_id == task_id)
+            ).scalar_one()
+            approval_id = approval.id
+            self.assertEqual(approval.action_type, "run.execution")
+            self.assertEqual(run.snapshot["approval_request_ids"], [str(approval.id)])
 
             event_types = {
                 row.event_type
@@ -851,6 +859,142 @@ class WorkerTestCase(unittest.TestCase):
             self.assertIn("policy.approval_required", event_types)
             self.assertNotIn("tool.invoked", event_types)
             self.assertNotIn("task.failed", event_types)
+
+        # An approval made in another process/session returns the task to the
+        # claim queue. The retry reuses the original request and immutable
+        # configuration snapshot, then dispatches the tool exactly once.
+        with self.Session() as session:
+            approval = session.get(ApprovalRequest, approval_id)
+            approval.status = "approved"
+            approval.resolved_at = datetime.now(timezone.utc)
+            task = session.get(Task, task_id)
+            task.status = "ready"
+            session.commit()
+
+        with self.Session() as session:
+            with mock.patch(
+                "agentic_os.worker.runner.invoke_tool",
+                side_effect=lambda _name, arguments: {"echo": arguments},
+            ) as invoke:
+                resumed = run_task_worker_once(session, "worker-b")
+                session.commit()
+                self.assertEqual(resumed.status, "completed")
+                invoke.assert_called_once()
+
+        with self.Session() as session:
+            requests = list(
+                session.execute(select(ApprovalRequest).where(ApprovalRequest.task_id == task_id)).scalars()
+            )
+            runs = list(
+                session.execute(
+                    select(Run).where(Run.task_id == task_id).order_by(Run.attempt_number)
+                ).scalars()
+            )
+            self.assertEqual([request.id for request in requests], [approval_id])
+            self.assertEqual([run.status for run in runs], ["waiting_approval", "completed"])
+            self.assertEqual(
+                runs[0].snapshot["configuration_snapshot_id"],
+                runs[1].snapshot["configuration_snapshot_id"],
+            )
+
+    def test_consequential_mode_materializes_all_required_requests_before_side_effects(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(
+                session,
+                sandbox={
+                    "image": "alpine:latest",
+                    "command": ["true"],
+                    "network_policy": "restricted",
+                },
+            )
+            task.resource_intent = [{"resource_key": "docs/report.md", "intent": "write"}]
+            goal = session.get(Goal, task.goal_id)
+            project = session.get(Project, goal.project_id)
+            session.add(
+                ApprovalModeConfiguration(
+                    team_id=project.team_id,
+                    project_id=project.id,
+                    goal_id=goal.id,
+                    configured_by=goal.created_by,
+                    version_number=1,
+                    mode="consequential",
+                    consequential_action_types=[
+                        "skill.access",
+                        "mcp.call",
+                        "sandbox.lifecycle",
+                        "network.permission",
+                        "resource.permission",
+                        "workspace.promotion",
+                        "artifact.promotion",
+                    ],
+                )
+            )
+            task_id = task.id
+            session.commit()
+
+        with self.Session() as session:
+            with mock.patch("agentic_os.worker.runner.invoke_tool") as invoke, mock.patch(
+                "agentic_os.worker.runner.execute_task_sandbox"
+            ) as sandbox:
+                task = run_task_worker_once(session, "worker-approval")
+                session.commit()
+                self.assertEqual(task.status, "blocked")
+                invoke.assert_not_called()
+                sandbox.assert_not_called()
+
+        with self.Session() as session:
+            requests = list(
+                session.execute(
+                    select(ApprovalRequest)
+                    .where(ApprovalRequest.task_id == task_id)
+                    .order_by(ApprovalRequest.action_type)
+                ).scalars()
+            )
+            self.assertEqual(
+                {request.action_type for request in requests},
+                {
+                    "artifact.promotion",
+                    "mcp.call",
+                    "network.permission",
+                    "resource.permission",
+                    "sandbox.lifecycle",
+                    "skill.access",
+                    "workspace.promotion",
+                },
+            )
+            self.assertTrue(all(request.status == "pending" for request in requests))
+
+    def test_every_tool_call_mode_gates_each_tool_before_dispatch(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            goal = session.get(Goal, task.goal_id)
+            project = session.get(Project, goal.project_id)
+            session.add(
+                ApprovalModeConfiguration(
+                    team_id=project.team_id,
+                    project_id=project.id,
+                    configured_by=goal.created_by,
+                    version_number=1,
+                    mode="every_tool_call",
+                )
+            )
+            task_id = task.id
+            session.commit()
+
+        with self.Session() as session:
+            with mock.patch("agentic_os.worker.runner.invoke_tool") as invoke:
+                task = run_task_worker_once(session, "worker-every-tool")
+                session.commit()
+                self.assertEqual(task.status, "blocked")
+                invoke.assert_not_called()
+
+        with self.Session() as session:
+            requests = list(
+                session.execute(select(ApprovalRequest).where(ApprovalRequest.task_id == task_id)).scalars()
+            )
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0].action_type, "mcp.call")
+            self.assertEqual(requests[0].action_preview["tool"], "echo")
 
     def test_budget_hard_stop_blocks_chargeable_tool_before_invocation(self) -> None:
         with self.Session() as session:

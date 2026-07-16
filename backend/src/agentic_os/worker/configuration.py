@@ -14,6 +14,7 @@ from agentic_os.domain.models import (
     AgentVersionMcpServer,
     AgentVersionPolicySet,
     AgentVersionSkill,
+    ApprovalModeConfiguration,
     Budget,
     McpServerVersion,
     ModelProfileVersion,
@@ -48,6 +49,20 @@ class ResolvedRunConfiguration:
     @property
     def policy_evaluations(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self.configuration["policy_evaluations"])
+
+    @property
+    def approval_configuration(self) -> dict[str, Any]:
+        return copy.deepcopy(
+            self.configuration.get(
+                "approval_configuration",
+                {
+                    "id": None,
+                    "mode": "auto",
+                    "consequential_action_types": [],
+                    "context": {},
+                },
+            )
+        )
 
     @property
     def budget(self) -> BudgetLimit | None:
@@ -247,6 +262,26 @@ def resolve_run_configuration(
     if budget is not None and budget.agent_id != agent.id:
         raise ConfigurationSnapshotError(f"budget {budget.id} belongs to another agent")
 
+    approval_configuration = session.execute(
+        select(ApprovalModeConfiguration)
+        .where(
+            ApprovalModeConfiguration.project_id == project.id,
+            ApprovalModeConfiguration.goal_id == task.goal_id,
+        )
+        .order_by(ApprovalModeConfiguration.version_number.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if approval_configuration is None:
+        approval_configuration = session.execute(
+            select(ApprovalModeConfiguration)
+            .where(
+                ApprovalModeConfiguration.project_id == project.id,
+                ApprovalModeConfiguration.goal_id.is_(None),
+            )
+            .order_by(ApprovalModeConfiguration.version_number.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
     snapshot_id = uuid.uuid4()
     configuration: dict[str, Any] = {
         "schema_version": 1,
@@ -265,6 +300,7 @@ def resolve_run_configuration(
         "task_policies": task_policies,
         "policy_decision": policy_decision,
         "policy_evaluations": evaluations,
+        "approval_configuration": _approval_configuration_payload(approval_configuration),
         "budget": _budget_payload(budget),
         "enabled_tools": list(enabled_tools),
         "assignment_rationale": copy.deepcopy(task.assignment_rationale or {}),
@@ -323,4 +359,22 @@ def _budget_payload(budget: Budget | None) -> dict[str, Any] | None:
         "amount_minor_units": budget.amount_minor_units,
         "enforcement_mode": budget.enforcement_mode,
         "warning_threshold_percent": budget.warning_threshold_percent,
+    }
+
+
+def _approval_configuration_payload(
+    configuration: ApprovalModeConfiguration | None,
+) -> dict[str, Any]:
+    if configuration is None:
+        return {
+            "id": None,
+            "mode": "auto",
+            "consequential_action_types": [],
+            "context": {},
+        }
+    return {
+        "id": str(configuration.id),
+        "mode": configuration.mode,
+        "consequential_action_types": list(configuration.consequential_action_types or []),
+        "context": copy.deepcopy(configuration.context or {}),
     }
