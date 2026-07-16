@@ -21,7 +21,7 @@ from agentic_os.artifacts import (
     verify_artifact_version,
 )
 from agentic_os.domain import create_database_engine, database_url, session_factory
-from agentic_os.domain.models import Artifact, ArtifactBlob, ArtifactVersion, Project, Team, User
+from agentic_os.domain.models import Artifact, ArtifactBlob, ArtifactVersion, AuditEvent, Project, Team, User
 
 BACKEND_ROOT = Path(__file__).parents[1]
 
@@ -142,6 +142,38 @@ class ArtifactPersistenceTests(unittest.TestCase):
             blob = session.get(ArtifactBlob, version.blob_id)
             self.assertEqual(version.storage_state, "missing")
             self.assertEqual(blob.state, "missing")
+
+    def test_reconciliation_records_audit_event_on_storage_state_change(self) -> None:
+        with self.Session() as session:
+            artifact = self._artifact(session)
+            version = create_artifact_version(
+                session, self.storage, artifact, b"reconciled content", version_number=1
+            )
+            session.commit()
+            version_id = version.id
+            artifact_id = artifact.id
+            project_id = artifact.project_id
+
+        with self.Session() as session:
+            version = session.get(ArtifactVersion, version_id)
+            self.storage.path_for_ref(version.storage_ref).unlink()
+            reconcile_artifact_storage(session, self.storage)
+            session.commit()
+
+        with self.Session() as session:
+            events = list(
+                session.execute(
+                    select(AuditEvent).where(
+                        AuditEvent.event_type == "artifact.reconciliation_status_changed",
+                        AuditEvent.project_id == project_id,
+                    )
+                ).scalars()
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].project_id, project_id)
+            self.assertEqual(events[0].payload["artifact_id"], str(artifact_id))
+            self.assertEqual(events[0].payload["previous_state"], "finalized")
+            self.assertEqual(events[0].payload["new_state"], "missing")
 
     def test_reconciliation_marks_and_cleans_orphaned_staging(self) -> None:
         staged = self.storage.stage(b"abandoned content")

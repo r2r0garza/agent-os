@@ -45,6 +45,11 @@ LedgerEntryStatus = Enum("reserved", "reconciled", "void", name="ledger_entry_st
 ArtifactStorageState = Enum(
     "staged", "finalized", "missing", "orphaned", name="artifact_storage_state", validate_strings=True
 )
+ArtifactKind = Enum("source", "normalized", "output", name="artifact_kind", validate_strings=True)
+ArtifactIngestionStatus = Enum(
+    "not_applicable", "pending", "complete", "failed", "unsupported", "needs_reconciliation",
+    name="artifact_ingestion_status", validate_strings=True,
+)
 
 
 class Team(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -407,7 +412,15 @@ class Artifact(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    parent_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True
+    )
     name: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(ArtifactKind, nullable=False, server_default="source")
+    content_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ingestion_status: Mapped[str] = mapped_column(
+        ArtifactIngestionStatus, nullable=False, server_default="not_applicable"
+    )
 
 
 class ArtifactBlob(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):

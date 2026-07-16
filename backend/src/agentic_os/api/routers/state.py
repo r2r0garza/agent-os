@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
-from agentic_os.domain.models import Artifact, AuditEvent, CostLedgerEntry, Goal, Run, Task
+from agentic_os.domain.models import AuditEvent, CostLedgerEntry, Goal, Run, Task
 
 router = APIRouter(tags=["state"])
 
@@ -55,18 +55,6 @@ class RunRead(BaseModel):
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
-
-
-class ArtifactRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    project_id: uuid.UUID
-    goal_id: uuid.UUID | None
-    task_id: uuid.UUID | None
-    run_id: uuid.UUID | None
-    name: str
-    created_at: datetime
 
 
 class AuditEventRead(BaseModel):
@@ -130,32 +118,6 @@ def get_run(run_id: uuid.UUID, session: Session = Depends(get_session)) -> Run:
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
     return run
-
-
-@router.get("/projects/{project_id}/artifacts", response_model=list[ArtifactRead])
-def list_artifacts(
-    project_id: uuid.UUID,
-    goal_id: uuid.UUID | None = None,
-    task_id: uuid.UUID | None = None,
-    run_id: uuid.UUID | None = None,
-    session: Session = Depends(get_session),
-) -> list[Artifact]:
-    stmt = select(Artifact).where(Artifact.project_id == project_id)
-    if goal_id is not None:
-        stmt = stmt.where(Artifact.goal_id == goal_id)
-    if task_id is not None:
-        stmt = stmt.where(Artifact.task_id == task_id)
-    if run_id is not None:
-        stmt = stmt.where(Artifact.run_id == run_id)
-    return list(session.execute(stmt.order_by(Artifact.created_at)).scalars())
-
-
-@router.get("/artifacts/{artifact_id}", response_model=ArtifactRead)
-def get_artifact(artifact_id: uuid.UUID, session: Session = Depends(get_session)) -> Artifact:
-    artifact = session.get(Artifact, artifact_id)
-    if artifact is None:
-        raise HTTPException(status_code=404, detail="artifact not found")
-    return artifact
 
 
 @router.get("/audit-events", response_model=list[AuditEventRead])

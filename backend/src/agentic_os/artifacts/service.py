@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.artifacts.storage import ArtifactStorage, StagedContent
-from agentic_os.domain.models import Artifact, ArtifactBlob, ArtifactVersion
+from agentic_os.domain.models import Artifact, ArtifactBlob, ArtifactVersion, AuditEvent
 
 
 class ArtifactContentUnavailableError(RuntimeError):
@@ -103,7 +103,7 @@ def reconcile_artifact_storage(
             for version in session.execute(
                 select(ArtifactVersion).where(ArtifactVersion.blob_id == blob.id)
             ).scalars():
-                version.storage_state = "finalized"
+                _set_version_storage_state(session, version, "finalized")
             continue
 
         if blob.state == "staged" and storage.staged_available(blob.content_hash, blob.size_bytes):
@@ -122,7 +122,7 @@ def reconcile_artifact_storage(
         for version in session.execute(
             select(ArtifactVersion).where(ArtifactVersion.blob_id == blob.id)
         ).scalars():
-            version.storage_state = "missing"
+            _set_version_storage_state(session, version, "missing")
 
     for content_hash, modified_at in staged_entries.items():
         if content_hash not in known_hashes and modified_at <= cutoff_timestamp:
@@ -136,6 +136,29 @@ def reconcile_artifact_storage(
 
     session.flush()
     return ReconciliationResult(restored, missing, orphaned, cleaned_staged, cleaned_finalized)
+
+
+def _set_version_storage_state(session: Session, version: ArtifactVersion, new_state: str) -> None:
+    previous_state = version.storage_state
+    version.storage_state = new_state
+    if previous_state == new_state:
+        return
+    artifact = session.get(Artifact, version.artifact_id)
+    session.add(
+        AuditEvent(
+            project_id=artifact.project_id if artifact else None,
+            goal_id=artifact.goal_id if artifact else None,
+            task_id=artifact.task_id if artifact else None,
+            run_id=artifact.run_id if artifact else None,
+            event_type="artifact.reconciliation_status_changed",
+            payload={
+                "artifact_id": str(version.artifact_id),
+                "version_id": str(version.id),
+                "previous_state": previous_state,
+                "new_state": new_state,
+            },
+        )
+    )
 
 
 def _upsert_blob(session: Session, staged: StagedContent) -> ArtifactBlob:

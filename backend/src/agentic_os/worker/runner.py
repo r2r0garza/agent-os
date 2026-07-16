@@ -271,6 +271,8 @@ def _execute_claimed_task(
         task_id=task.id,
         run_id=run.id,
         name=f"{task.title} result",
+        kind="output",
+        content_type="application/json",
     )
     session.add(artifact)
     session.flush()

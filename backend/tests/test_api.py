@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 
 from agentic_os.domain import create_database_engine, database_url
 
@@ -493,6 +493,180 @@ class ApiWorkflowTests(unittest.TestCase):
         task_state = client.get(f"/api/v1/tasks/{task_id}").json()
         self.assertEqual(task_state["assigned_agent_version_id"], assignment["selected_agent_version_id"])
         self.assertEqual(task_state["assignment_status"], "assigned")
+
+
+class ArtifactApiTests(unittest.TestCase):
+    """Proves project-scoped artifact upload, retrieval, lineage, and access
+    checks are backed by persisted PostgreSQL state (issue #17)."""
+
+    def _make_project(self) -> dict:
+        return client.post("/api/v1/projects", json={"name": f"Artifact Project {uuid.uuid4()}"}).json()
+
+    def _make_goal(self, project_id: str) -> dict:
+        return client.post(f"/api/v1/projects/{project_id}/goals", json={"title": "Ship it"}).json()
+
+    def test_upload_artifact_persists_metadata_and_finalized_version(self) -> None:
+        project = self._make_project()
+        goal = self._make_goal(project["id"])
+
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/artifacts",
+            json={
+                "name": "notes.md",
+                "content": "# Notes\n\nSome durable content.",
+                "content_type": "text/markdown",
+                "goal_id": goal["id"],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        artifact = response.json()
+        self.assertEqual(artifact["project_id"], project["id"])
+        self.assertEqual(artifact["goal_id"], goal["id"])
+        self.assertEqual(artifact["kind"], "source")
+        self.assertEqual(artifact["content_type"], "text/markdown")
+        self.assertEqual(artifact["ingestion_status"], "pending")
+        self.assertIsNone(artifact["parent_artifact_id"])
+        version = artifact["latest_version"]
+        self.assertEqual(version["version_number"], 1)
+        self.assertEqual(version["storage_state"], "finalized")
+        self.assertTrue(version["content_hash"].startswith("sha256:"))
+        self.assertGreater(version["size_bytes"], 0)
+
+        fetched = client.get(f"/api/v1/artifacts/{artifact['id']}").json()
+        self.assertEqual(fetched, artifact)
+
+        listed = client.get(f"/api/v1/projects/{project['id']}/artifacts").json()
+        self.assertEqual([entry["id"] for entry in listed], [artifact["id"]])
+
+    def test_upload_rejects_goal_from_a_different_project(self) -> None:
+        project_a = self._make_project()
+        project_b = self._make_project()
+        goal_b = self._make_goal(project_b["id"])
+
+        response = client.post(
+            f"/api/v1/projects/{project_a['id']}/artifacts",
+            json={"name": "cross-project.txt", "content": "hello", "goal_id": goal_b["id"]},
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+
+    def test_get_artifact_not_found_returns_404(self) -> None:
+        response = client.get(f"/api/v1/artifacts/{uuid.uuid4()}")
+        self.assertEqual(response.status_code, 404)
+
+    def test_artifact_versions_endpoint_lists_immutable_versions(self) -> None:
+        project = self._make_project()
+        artifact = client.post(
+            f"/api/v1/projects/{project['id']}/artifacts",
+            json={"name": "log.txt", "content": "line one"},
+        ).json()
+
+        versions = client.get(f"/api/v1/artifacts/{artifact['id']}/versions").json()
+        self.assertEqual(len(versions), 1)
+        self.assertEqual(versions[0]["version_number"], 1)
+        self.assertEqual(versions[0]["content_hash"], artifact["latest_version"]["content_hash"])
+
+    def test_artifact_content_retrieval_returns_bytes_when_finalized(self) -> None:
+        project = self._make_project()
+        artifact = client.post(
+            f"/api/v1/projects/{project['id']}/artifacts",
+            json={"name": "body.txt", "content": "retrievable content", "content_type": "text/plain"},
+        ).json()
+
+        response = client.get(f"/api/v1/artifacts/{artifact['id']}/content")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.text, "retrievable content")
+        self.assertTrue(response.headers["content-type"].startswith("text/plain"))
+
+    def test_artifact_content_retrieval_blocked_when_not_finalized(self) -> None:
+        from agentic_os.domain import create_database_engine, session_factory
+        from agentic_os.domain.models import ArtifactVersion
+
+        project = self._make_project()
+        artifact = client.post(
+            f"/api/v1/projects/{project['id']}/artifacts",
+            json={"name": "unstable.txt", "content": "will be marked missing"},
+        ).json()
+
+        engine = create_database_engine(TEST_DATABASE_URL)
+        session_maker = session_factory(engine)
+        with session_maker() as session:
+            version = session.execute(
+                select(ArtifactVersion).where(ArtifactVersion.artifact_id == uuid.UUID(artifact["id"]))
+            ).scalar_one()
+            version.storage_state = "missing"
+            session.commit()
+        engine.dispose()
+
+        response = client.get(f"/api/v1/artifacts/{artifact['id']}/content")
+        self.assertEqual(response.status_code, 409)
+
+        events = client.get(
+            "/api/v1/audit-events", params={"project_id": project["id"]}
+        ).json()
+        event_types = [event["event_type"] for event in events]
+        self.assertIn("artifact.created", event_types)
+        self.assertIn("artifact.retrieval_blocked", event_types)
+
+    def test_artifact_lineage_reports_parent_and_children(self) -> None:
+        from agentic_os.domain import create_database_engine, session_factory
+        from agentic_os.domain.models import Artifact
+
+        project = self._make_project()
+        source = client.post(
+            f"/api/v1/projects/{project['id']}/artifacts",
+            json={"name": "source.md", "content": "# Source"},
+        ).json()
+
+        engine = create_database_engine(TEST_DATABASE_URL)
+        session_maker = session_factory(engine)
+        with session_maker() as session:
+            normalized = Artifact(
+                project_id=uuid.UUID(project["id"]),
+                parent_artifact_id=uuid.UUID(source["id"]),
+                name="source.md (normalized)",
+                kind="normalized",
+                ingestion_status="complete",
+            )
+            session.add(normalized)
+            session.commit()
+            normalized_id = normalized.id
+        engine.dispose()
+
+        source_lineage = client.get(f"/api/v1/artifacts/{source['id']}/lineage").json()
+        self.assertIsNone(source_lineage["parent"])
+        self.assertEqual([child["id"] for child in source_lineage["children"]], [str(normalized_id)])
+
+        normalized_lineage = client.get(f"/api/v1/artifacts/{normalized_id}/lineage").json()
+        self.assertEqual(normalized_lineage["parent"]["id"], source["id"])
+        self.assertEqual(normalized_lineage["children"], [])
+
+    def test_list_artifacts_filters_by_kind(self) -> None:
+        from agentic_os.domain import create_database_engine, session_factory
+        from agentic_os.domain.models import Artifact
+
+        project = self._make_project()
+        client.post(
+            f"/api/v1/projects/{project['id']}/artifacts",
+            json={"name": "source-only.txt", "content": "hi"},
+        )
+
+        engine = create_database_engine(TEST_DATABASE_URL)
+        session_maker = session_factory(engine)
+        with session_maker() as session:
+            session.add(
+                Artifact(project_id=uuid.UUID(project["id"]), name="result.json", kind="output")
+            )
+            session.commit()
+        engine.dispose()
+
+        output_only = client.get(
+            f"/api/v1/projects/{project['id']}/artifacts", params={"kind": "output"}
+        ).json()
+        self.assertEqual(len(output_only), 1)
+        self.assertEqual(output_only[0]["kind"], "output")
+
+        invalid = client.get(f"/api/v1/projects/{project['id']}/artifacts", params={"kind": "bogus"})
+        self.assertEqual(invalid.status_code, 422)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from agentic_os.api.routers import (
     agents,
+    artifacts,
     assignments,
     budgets,
     goals,
@@ -35,5 +36,6 @@ def create_app() -> FastAPI:
     app.include_router(budgets.router, prefix=API_V1_PREFIX)
     app.include_router(state.router, prefix=API_V1_PREFIX)
     app.include_router(task_graph.router, prefix=API_V1_PREFIX)
+    app.include_router(artifacts.router, prefix=API_V1_PREFIX)
 
     return app
