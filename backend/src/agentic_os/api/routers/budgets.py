@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
+from agentic_os.api.ownership import require_default_team_access
 from agentic_os.domain.models import Agent, Budget
 
 router = APIRouter(tags=["budgets"])
@@ -39,6 +40,7 @@ def create_budget(agent_id: uuid.UUID, payload: BudgetCreate, session: Session =
     agent = session.get(Agent, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
+    require_default_team_access(session, agent, "agent")
     budget = Budget(
         agent_id=agent_id,
         currency=payload.currency,
@@ -57,6 +59,7 @@ def list_budgets(agent_id: uuid.UUID, session: Session = Depends(get_session)) -
     agent = session.get(Agent, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
+    require_default_team_access(session, agent, "agent")
     return list(session.execute(select(Budget).where(Budget.agent_id == agent_id).order_by(Budget.created_at)).scalars())
 
 
@@ -65,4 +68,6 @@ def get_budget(budget_id: uuid.UUID, session: Session = Depends(get_session)) ->
     budget = session.get(Budget, budget_id)
     if budget is None:
         raise HTTPException(status_code=404, detail="budget not found")
+    agent = session.get(Agent, budget.agent_id)
+    require_default_team_access(session, agent, "budget")
     return budget

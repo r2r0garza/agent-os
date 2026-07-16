@@ -152,6 +152,169 @@ class ApiWorkflowTests(unittest.TestCase):
         audit_events = client.get("/api/v1/audit-events", params={"project_id": project["id"]}).json()
         self.assertEqual(audit_events, [])
 
+    def test_governed_configuration_versions_and_redacts_sensitive_values(self) -> None:
+        secret = "credential-value-that-must-never-return"
+        credential_response = client.post(
+            "/api/v1/credentials",
+            json={
+                "name": "Provider credential",
+                "credential_type": "api_key",
+                "material": secret,
+                "metadata": {"provider": "compatible"},
+            },
+        )
+        self.assertEqual(credential_response.status_code, 201, credential_response.text)
+        credential = credential_response.json()
+        self.assertTrue(credential["configured"])
+        self.assertNotIn(secret, credential_response.text)
+        self.assertNotIn("encrypted_material", credential_response.text)
+        self.assertEqual(client.get(f"/api/v1/credentials/{credential['id']}").json(), credential)
+        self.assertIn(credential, client.get("/api/v1/credentials").json())
+        immutable = client.patch(f"/api/v1/credentials/{credential['id']}", json={"material": "replacement"})
+        self.assertEqual(immutable.status_code, 409)
+        self.assertNotIn("replacement", immutable.text)
+
+        profile = client.post(
+            "/api/v1/model-profiles",
+            json={
+                "name": "Governed profile",
+                "base_url": "https://models.example.test/v1",
+                "model_identifier": "model-v1",
+                "credential_id": credential["id"],
+            },
+        ).json()
+        profile_versions = client.get(f"/api/v1/model-profiles/{profile['id']}/versions").json()
+        self.assertEqual([item["version_number"] for item in profile_versions], [1])
+        header_secret = "Bearer header-secret"
+        profile_v2_response = client.post(
+            f"/api/v1/model-profiles/{profile['id']}/versions",
+            json={
+                "base_url": "https://models.example.test/v2",
+                "model_identifier": "model-v2",
+                "credential_id": credential["id"],
+                "headers": {"Authorization": header_secret, "X-Region": "local"},
+            },
+        )
+        self.assertEqual(profile_v2_response.status_code, 201, profile_v2_response.text)
+        profile_v2 = profile_v2_response.json()
+        self.assertEqual(profile_v2["version_number"], 2)
+        self.assertEqual(profile_v2["headers"]["Authorization"], "[REDACTED]")
+        self.assertNotIn(header_secret, profile_v2_response.text)
+        self.assertEqual(
+            client.get(f"/api/v1/model-profiles/{profile['id']}/versions/1").json()["model_identifier"],
+            "model-v1",
+        )
+
+        skill = client.post("/api/v1/skills", json={"name": "Governed skill"}).json()
+        skill_version = client.post(
+            f"/api/v1/skills/{skill['id']}/versions",
+            json={"content_ref": "skills/governed/v1", "resource_metadata": {"format": "markdown"}},
+        ).json()
+        mcp = client.post("/api/v1/mcp-servers", json={"name": "Governed MCP"}).json()
+        mcp_version_response = client.post(
+            f"/api/v1/mcp-servers/{mcp['id']}/versions",
+            json={
+                "credential_id": credential["id"],
+                "connection_config": {
+                    "url": "https://mcp.example.test",
+                    "headers": {"X-API-Key": "mcp-secret"},
+                    "tools": [{"name": "echo"}],
+                },
+            },
+        )
+        self.assertEqual(mcp_version_response.status_code, 201, mcp_version_response.text)
+        mcp_version = mcp_version_response.json()
+        self.assertEqual(mcp_version["connection_config"]["headers"]["X-API-Key"], "[REDACTED]")
+        self.assertNotIn("mcp-secret", mcp_version_response.text)
+        policy_set = client.post("/api/v1/policy-sets", json={"name": "Agent policy"}).json()
+        policy_version = client.post(
+            f"/api/v1/policy-sets/{policy_set['id']}/versions",
+            json={"rules": [{"scope": "tool", "decision": "allow", "match": {"name": "echo"}}]},
+        ).json()
+        agent = client.post("/api/v1/agents", json={"name": "Governed agent"}).json()
+        budget = client.post(
+            f"/api/v1/agents/{agent['id']}/budgets",
+            json={"currency": "USD", "amount_minor_units": 1000, "enforcement_mode": "hard_stop"},
+        ).json()
+        version_response = client.post(
+            f"/api/v1/agents/{agent['id']}/versions",
+            json={
+                "instructions": "Use only pinned configuration.",
+                "model_profile_version_id": profile_v2["id"],
+                "default_budget_id": budget["id"],
+                "skill_attachments": [{"version_id": skill_version["id"], "config": {"enabled": True}}],
+                "mcp_server_attachments": [{"version_id": mcp_version["id"], "config": {"tools": ["echo"]}}],
+                "policy_set_version_ids": [policy_version["id"]],
+            },
+        )
+        self.assertEqual(version_response.status_code, 201, version_response.text)
+        version = version_response.json()
+        self.assertEqual(version["model_profile_id"], profile["id"])
+        self.assertEqual(version["model_profile_version_id"], profile_v2["id"])
+        self.assertEqual(version["skill_attachments"][0]["version_id"], skill_version["id"])
+        self.assertEqual(version["mcp_server_attachments"][0]["version_id"], mcp_version["id"])
+        self.assertEqual(version["policy_set_version_ids"], [policy_version["id"]])
+        self.assertEqual(client.get(f"/api/v1/agents/{agent['id']}/versions/1").json(), version)
+
+    def test_governed_configuration_rejects_cross_team_and_invalid_references(self) -> None:
+        from agentic_os.domain import create_database_engine, session_factory
+        from agentic_os.domain.models import Credential, Skill, SkillVersion, Team, User
+
+        engine = create_database_engine(TEST_DATABASE_URL)
+        with session_factory(engine)() as session:
+            team = Team(name=f"Foreign Team {uuid.uuid4()}")
+            user = User(email=f"foreign-{uuid.uuid4()}@example.test", display_name="Foreign owner")
+            session.add_all([team, user])
+            session.flush()
+            credential = Credential(
+                team_id=team.id,
+                created_by=user.id,
+                name="Foreign credential",
+                credential_type="api_key",
+                encrypted_material="encrypted-foreign-value",
+            )
+            skill = Skill(team_id=team.id, created_by=user.id, name="Foreign skill")
+            session.add_all([credential, skill])
+            session.flush()
+            skill_version = SkillVersion(skill_id=skill.id, version_number=1, content_ref="skills/foreign/v1")
+            session.add(skill_version)
+            session.commit()
+            credential_id = credential.id
+            skill_version_id = skill_version.id
+        engine.dispose()
+
+        denied = client.post(
+            "/api/v1/model-profiles",
+            json={
+                "name": "Invalid profile",
+                "base_url": "https://example.test/v1",
+                "model_identifier": "model",
+                "credential_id": str(credential_id),
+            },
+        )
+        self.assertEqual(denied.status_code, 403, denied.text)
+        self.assertNotIn("encrypted-foreign-value", denied.text)
+
+        agent = client.post("/api/v1/agents", json={"name": "Scope test agent"}).json()
+        cross_team = client.post(
+            f"/api/v1/agents/{agent['id']}/versions",
+            json={"skill_attachments": [{"version_id": str(skill_version_id)}]},
+        )
+        self.assertEqual(cross_team.status_code, 403, cross_team.text)
+        missing = client.post(
+            f"/api/v1/agents/{agent['id']}/versions",
+            json={"model_profile_version_id": str(uuid.uuid4())},
+        )
+        self.assertEqual(missing.status_code, 422, missing.text)
+
+    def test_validation_errors_redact_secret_inputs(self) -> None:
+        response = client.post(
+            "/api/v1/credentials",
+            json={"name": "bad", "credential_type": "api_key", "material": {"token": "should-not-echo"}},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("should-not-echo", response.text)
+
     def test_state_inspection_reads_persisted_records(self) -> None:
         from agentic_os.domain import create_database_engine, session_factory
         from agentic_os.domain.models import AuditEvent, CostLedgerEntry, Task
