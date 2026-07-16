@@ -10,6 +10,12 @@ from agentic_os.artifacts.ingestion import (
     ingest_source_artifact,
     normalize_text_content,
 )
+from agentic_os.artifacts.knowledge import (
+    ConsumedKnowledge,
+    KnowledgeUnavailableError,
+    consume_task_knowledge,
+    record_output_citations,
+)
 from agentic_os.artifacts.storage import (
     ArtifactStorage,
     ArtifactStorageError,
@@ -24,14 +30,18 @@ __all__ = [
     "ArtifactNormalizationError",
     "ArtifactStorage",
     "ArtifactStorageError",
+    "ConsumedKnowledge",
     "ContentVerificationError",
+    "KnowledgeUnavailableError",
     "LocalArtifactStorage",
     "NormalizedContent",
     "StagedContent",
     "artifact_storage",
+    "consume_task_knowledge",
     "create_artifact_version",
     "ingest_source_artifact",
     "normalize_text_content",
     "reconcile_artifact_storage",
+    "record_output_citations",
     "verify_artifact_version",
 ]

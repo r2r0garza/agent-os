@@ -130,6 +130,7 @@ class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     expected_outputs: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     resource_intent: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     policy_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    knowledge_artifact_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     budget_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("budgets.id", ondelete="SET NULL"), nullable=True
     )
@@ -464,6 +465,36 @@ class ArtifactVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     previous_version_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("artifact_versions.id", ondelete="SET NULL"), nullable=True
     )
+
+
+class ArtifactCitation(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "artifact_citations"
+    __table_args__ = (
+        UniqueConstraint(
+            "output_artifact_id", "source_artifact_id", "run_id",
+            name="uq_artifact_citations_output_source_run",
+        ),
+    )
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    output_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="CASCADE"), nullable=False
+    )
+    source_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    normalized_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    normalized_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifact_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    citation_anchor: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
 
 
 class AuditEvent(Base, UUIDPrimaryKeyMixin):

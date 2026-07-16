@@ -8,7 +8,13 @@ from typing import Callable
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.artifacts import artifact_storage, create_artifact_version, verify_artifact_version
+from agentic_os.artifacts import (
+    artifact_storage,
+    consume_task_knowledge,
+    create_artifact_version,
+    record_output_citations,
+    verify_artifact_version,
+)
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
@@ -206,6 +212,9 @@ def _execute_claimed_task(
     if policy_decision == "deny":
         raise TaskExecutionError(f"policy denied execution for agent {agent.id}")
 
+    storage = artifact_storage()
+    consumed_knowledge = consume_task_knowledge(session, storage, task, run, project_id=project_id)
+
     tool_results: dict[str, dict] = {}
     for tool_name in enabled_tools:
         result = invoke_tool(tool_name, {"task_id": str(task.id), "run_id": str(run.id)})
@@ -262,8 +271,22 @@ def _execute_claimed_task(
 
     promote_workspace_changes(session, task, run, worker_id)
 
+    citation_summary = [
+        {
+            "source_artifact_id": str(item.source_artifact.id),
+            "normalized_artifact_id": str(item.normalized_artifact.id),
+            "citation_anchor": item.citation_anchor,
+        }
+        for item in consumed_knowledge
+    ]
     artifact_payload = json.dumps(
-        {"task_id": str(task.id), "run_id": str(run.id), "tool_results": tool_results}, sort_keys=True
+        {
+            "task_id": str(task.id),
+            "run_id": str(run.id),
+            "tool_results": tool_results,
+            "citations": citation_summary,
+        },
+        sort_keys=True,
     )
     artifact = Artifact(
         project_id=project_id,
@@ -276,7 +299,6 @@ def _execute_claimed_task(
     )
     session.add(artifact)
     session.flush()
-    storage = artifact_storage()
     artifact_version = create_artifact_version(
         session,
         storage,
@@ -285,6 +307,20 @@ def _execute_claimed_task(
         version_number=1,
     )
     verify_artifact_version(storage, artifact_version)
+
+    citations = record_output_citations(session, task, run, artifact, consumed_knowledge)
+    if citations:
+        session.add(
+            AuditEvent(
+                project_id=project_id,
+                goal_id=task.goal_id,
+                task_id=task.id,
+                run_id=run.id,
+                event_type="artifact.output_published",
+                payload={"artifact_id": str(artifact.id), "citation_count": len(citations)},
+            )
+        )
+        session.flush()
 
     run.status = "completed"
     run.completed_at = datetime.now(timezone.utc)

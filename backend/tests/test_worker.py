@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -14,12 +15,19 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from sqlalchemy import create_engine, select
 
-from agentic_os.artifacts import ArtifactContentUnavailableError, LocalArtifactStorage
+from agentic_os.artifacts import (
+    ArtifactContentUnavailableError,
+    KnowledgeUnavailableError,
+    LocalArtifactStorage,
+    create_artifact_version,
+    ingest_source_artifact,
+)
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
     Artifact,
+    ArtifactCitation,
     ArtifactVersion,
     AuditEvent,
     Budget,
@@ -162,6 +170,33 @@ class WorkerTestCase(unittest.TestCase):
         session.commit()
         return task
 
+    def _build_ready_task_with_knowledge(
+        self, session, storage: LocalArtifactStorage
+    ) -> tuple[Task, Artifact, Artifact]:
+        task = self._build_ready_task(session)
+        goal = session.get(Goal, task.goal_id)
+        project = session.get(Project, goal.project_id)
+
+        source = Artifact(
+            project_id=project.id,
+            goal_id=goal.id,
+            name="knowledge.md",
+            kind="source",
+            content_type="text/markdown",
+            ingestion_status="pending",
+        )
+        session.add(source)
+        session.flush()
+        create_artifact_version(session, storage, source, b"# Title\nBody\n", version_number=1)
+        normalized = ingest_source_artifact(session, storage, source)
+        self.assertIsNotNone(normalized)
+
+        task.knowledge_artifact_ids = [str(source.id)]
+        session.add(task)
+        session.flush()
+        session.commit()
+        return task, source, normalized
+
     def test_worker_executes_single_task_end_to_end(self) -> None:
         with self.Session() as session:
             task = self._build_ready_task(session)
@@ -271,6 +306,162 @@ class WorkerTestCase(unittest.TestCase):
             self.assertEqual(task.status, "failed")
             self.assertEqual(run.status, "failed")
             self.assertEqual(versions, [])
+
+    def test_worker_consumes_project_knowledge_and_publishes_cited_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = LocalArtifactStorage(directory)
+            with self.Session() as session:
+                task, source, normalized = self._build_ready_task_with_knowledge(session, storage)
+                task_id = task.id
+                source_id = source.id
+                normalized_id = normalized.id
+
+            with self.Session() as session:
+                with mock.patch("agentic_os.worker.runner.artifact_storage", return_value=storage):
+                    claimed = run_task_worker_once(session, "worker-a")
+                session.commit()
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.status, "completed")
+
+            with self.Session() as session:
+                run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+                output_artifact = session.execute(
+                    select(Artifact).where(Artifact.task_id == task_id, Artifact.kind == "output")
+                ).scalar_one()
+
+                citations = list(
+                    session.execute(
+                        select(ArtifactCitation).where(ArtifactCitation.output_artifact_id == output_artifact.id)
+                    ).scalars()
+                )
+                self.assertEqual(len(citations), 1)
+                self.assertEqual(citations[0].run_id, run.id)
+                self.assertEqual(citations[0].task_id, task_id)
+                self.assertEqual(citations[0].source_artifact_id, source_id)
+                self.assertEqual(citations[0].normalized_artifact_id, normalized_id)
+                self.assertIn("source_byte_span", citations[0].citation_anchor)
+
+                event_types = [
+                    row.event_type
+                    for row in session.execute(
+                        select(AuditEvent).where(AuditEvent.run_id == run.id).order_by(AuditEvent.sequence_number)
+                    ).scalars()
+                ]
+                self.assertEqual(
+                    event_types,
+                    [
+                        "run.started",
+                        "policy.decision",
+                        "artifact.knowledge_consumed",
+                        "tool.invoked",
+                        "skill.invoked",
+                        "artifact.citations_recorded",
+                        "artifact.output_published",
+                        "run.completed",
+                    ],
+                )
+
+                output_version = session.execute(
+                    select(ArtifactVersion).where(ArtifactVersion.artifact_id == output_artifact.id)
+                ).scalar_one()
+                payload = json.loads(storage.read(output_version.storage_ref))
+                self.assertEqual(len(payload["citations"]), 1)
+                self.assertEqual(payload["citations"][0]["source_artifact_id"], str(source_id))
+                self.assertEqual(payload["citations"][0]["normalized_artifact_id"], str(normalized_id))
+
+    def test_worker_fails_safely_when_knowledge_artifact_is_missing(self) -> None:
+        missing_artifact_id = uuid.uuid4()
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task.knowledge_artifact_ids = [str(missing_artifact_id)]
+            session.add(task)
+            session.commit()
+            task_id = task.id
+
+        with self.Session() as session:
+            with self.assertRaises(KnowledgeUnavailableError):
+                run_task_worker_once(session, "worker-a")
+            session.commit()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+            self.assertIsNone(task.lease_owner)
+
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "failed")
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertIn("artifact.knowledge_unavailable", event_types)
+            self.assertIn("task.failed", event_types)
+            self.assertNotIn("tool.invoked", event_types)
+
+            output_artifacts = list(
+                session.execute(
+                    select(Artifact).where(Artifact.task_id == task_id, Artifact.kind == "output")
+                ).scalars()
+            )
+            self.assertEqual(output_artifacts, [])
+
+            citations = list(
+                session.execute(select(ArtifactCitation).where(ArtifactCitation.task_id == task_id)).scalars()
+            )
+            self.assertEqual(citations, [])
+
+    def test_knowledge_citations_persist_across_interrupted_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = LocalArtifactStorage(directory)
+            with self.Session() as session:
+                task, source, _normalized = self._build_ready_task_with_knowledge(session, storage)
+                task_id = task.id
+                source_id = source.id
+
+            # worker-crashed claims the task but dies before a run is ever
+            # created; its lease is never renewed or released.
+            with self.Session() as session:
+                claim_ready_task(session, "worker-crashed", lease_seconds=60)
+                session.commit()
+
+            with self.Session() as session:
+                task = session.get(Task, task_id)
+                task.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                session.commit()
+
+            with self.Session() as session:
+                with mock.patch("agentic_os.worker.runner.artifact_storage", return_value=storage):
+                    claimed = run_task_worker_once(session, "worker-recovering")
+                session.commit()
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.status, "completed")
+
+            with self.Session() as session:
+                runs = list(
+                    session.execute(
+                        select(Run).where(Run.task_id == task_id).order_by(Run.attempt_number)
+                    ).scalars()
+                )
+                self.assertEqual(len(runs), 1)
+                self.assertEqual(runs[0].status, "completed")
+                self.assertEqual(runs[0].attempt_number, 1)
+
+                citations = list(
+                    session.execute(select(ArtifactCitation).where(ArtifactCitation.task_id == task_id)).scalars()
+                )
+                self.assertEqual(len(citations), 1)
+                self.assertEqual(citations[0].run_id, runs[0].id)
+                self.assertEqual(citations[0].source_artifact_id, source_id)
+
+                knowledge_events = [
+                    row.event_type
+                    for row in session.execute(
+                        select(AuditEvent).where(AuditEvent.task_id == task_id).order_by(AuditEvent.sequence_number)
+                    ).scalars()
+                ]
+                self.assertEqual(knowledge_events.count("artifact.knowledge_consumed"), 1)
+                self.assertEqual(knowledge_events.count("artifact.citations_recorded"), 1)
 
     def test_worker_executes_task_with_sandbox_and_persists_lifecycle_events(self) -> None:
         available, reason = runtime_available("docker")
