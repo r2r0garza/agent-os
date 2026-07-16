@@ -36,6 +36,7 @@ from agentic_os.domain.models import (
     McpServerVersion,
     ModelProfile,
     ModelProfileVersion,
+    ObservabilityRecord,
     PolicySet,
     PolicySetVersion,
     Project,
@@ -47,6 +48,8 @@ from agentic_os.domain.models import (
     TaskDependency,
     Team,
     TeamMembership,
+    TelemetryExportAttempt,
+    TelemetryExportSetting,
     User,
 )
 
@@ -141,6 +144,9 @@ class DomainMigrationTests(unittest.TestCase):
             "approval_decisions",
             "admin_overrides",
             "budget_reservations",
+            "observability_records",
+            "telemetry_export_attempts",
+            "telemetry_export_settings",
         }
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -162,6 +168,214 @@ class DomainMigrationTests(unittest.TestCase):
 
             count = session.execute(text("SELECT count(*) FROM teams")).scalar_one()
             self.assertGreaterEqual(count, 2)
+
+    def test_observability_records_link_canonical_evidence_and_export_states(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Observability Team")
+            user = User(
+                email=f"observability-{uuid.uuid4()}@example.test",
+                display_name="Observability Operator",
+            )
+            session.add_all([team, user])
+            session.flush()
+            session.add(TeamMembership(team_id=team.id, user_id=user.id))
+
+            project = Project(team_id=team.id, created_by=user.id, name="Observed Project")
+            session.add(project)
+            session.flush()
+            goal = Goal(project_id=project.id, created_by=user.id, title="Observe a run")
+            session.add(goal)
+            session.flush()
+
+            model_profile = ModelProfile(
+                team_id=team.id,
+                created_by=user.id,
+                name="observability-model",
+                base_url="https://example.test/v1",
+                model_identifier="test-model",
+                api_key_ciphertext="encrypted",
+            )
+            agent = Agent(team_id=team.id, created_by=user.id, name="Observed Agent")
+            session.add_all([model_profile, agent])
+            session.flush()
+            agent_version = AgentVersion(
+                agent_id=agent.id,
+                version_number=1,
+                capability_manifest={"capabilities": ["observe"]},
+                model_profile_id=model_profile.id,
+            )
+            session.add(agent_version)
+            session.flush()
+
+            task = Task(goal_id=goal.id, title="Emit correlated evidence")
+            session.add(task)
+            session.flush()
+            run = Run(
+                task_id=task.id,
+                attempt_number=1,
+                idempotency_key=f"{task.id}:1",
+                lease_token=1,
+                agent_version_id=agent_version.id,
+            )
+            session.add(run)
+            session.flush()
+
+            audit_event = AuditEvent(
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                event_type="model.call.completed",
+                payload={"redacted": True},
+            )
+            ledger_entry = CostLedgerEntry(
+                run_id=run.id,
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                agent_version_id=agent_version.id,
+                actor_id=user.id,
+                action_type="model_call",
+                currency="USD",
+                is_zero_cost=True,
+                status="reconciled",
+            )
+            approval = ApprovalRequest(
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                agent_version_id=agent_version.id,
+                requested_by=user.id,
+                mode="auto",
+                action_type="model_call",
+            )
+            artifact = Artifact(
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                created_by=user.id,
+                name="observed-result.md",
+            )
+            session.add_all([audit_event, ledger_entry, approval, artifact])
+            session.flush()
+            artifact_version = ArtifactVersion(
+                artifact_id=artifact.id,
+                version_number=1,
+                content_hash="sha256:" + "1" * 64,
+                storage_ref="local://observed-result.md",
+            )
+            session.add(artifact_version)
+            session.flush()
+
+            export_setting = TelemetryExportSetting(
+                team_id=team.id,
+                project_id=project.id,
+                created_by=user.id,
+                exporter_type="opentelemetry",
+                enabled=True,
+                endpoint_reference="environment:OTEL_EXPORTER_OTLP_ENDPOINT",
+                capture_prompts=False,
+                capture_outputs=False,
+                redaction_policy_evidence={"policy_version": "redaction-v1", "secrets": "removed"},
+                configuration_evidence={"credential_source": "environment", "credential_value": "omitted"},
+            )
+            session.add(export_setting)
+            session.flush()
+
+            correlation_id = uuid.uuid4()
+            trace_id = "a" * 32
+            record = ObservabilityRecord(
+                correlation_id=correlation_id,
+                request_id=uuid.uuid4(),
+                trace_id=trace_id,
+                span_id="b" * 16,
+                event_kind="model_call",
+                operation_name="worker.model_call",
+                status="completed",
+                team_id=team.id,
+                user_id=user.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                audit_event_id=audit_event.id,
+                cost_ledger_entry_id=ledger_entry.id,
+                approval_request_id=approval.id,
+                artifact_id=artifact.id,
+                artifact_version_id=artifact_version.id,
+                model_call_id=uuid.uuid4(),
+                attributes={"model": "test-model", "payload_capture": "omitted"},
+                capture_policy_evidence={"prompts": False, "outputs": False},
+                redaction_evidence={"fields_redacted": ["authorization", "api_key"]},
+            )
+            checkpoint_record = ObservabilityRecord(
+                correlation_id=correlation_id,
+                trace_id=trace_id,
+                span_id="c" * 16,
+                parent_span_id="b" * 16,
+                event_kind="checkpoint",
+                operation_name="langgraph.checkpoint",
+                team_id=team.id,
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=task.id,
+                run_id=run.id,
+                checkpoint_id=uuid.uuid4(),
+            )
+            session.add_all([record, checkpoint_record])
+            session.flush()
+
+            delivery_states = ("pending", "delivered", "dropped", "delayed", "disabled", "failed")
+            session.add_all(
+                [
+                    TelemetryExportAttempt(
+                        observability_record_id=record.id,
+                        export_setting_id=export_setting.id,
+                        destination="opentelemetry",
+                        attempt_number=index,
+                        status=status,
+                        failure_code="export_unavailable" if status == "failed" else None,
+                        delivery_evidence={"payload": "redacted", "state": status},
+                    )
+                    for index, status in enumerate(delivery_states, start=1)
+                ]
+            )
+            session.commit()
+
+            filters = {
+                "run_id": run.id,
+                "goal_id": goal.id,
+                "project_id": project.id,
+                "team_id": team.id,
+                "correlation_id": correlation_id,
+            }
+            for column, value in filters.items():
+                count = session.execute(
+                    text(f"SELECT count(*) FROM observability_records WHERE {column} = :value"),
+                    {"value": value},
+                ).scalar_one()
+                self.assertEqual(count, 2)
+
+            trace_count = session.execute(
+                text("SELECT count(*) FROM observability_records WHERE trace_id = :trace_id"),
+                {"trace_id": trace_id},
+            ).scalar_one()
+            self.assertEqual(trace_count, 2)
+
+            persisted_states = session.execute(
+                text(
+                    "SELECT status FROM telemetry_export_attempts "
+                    "WHERE observability_record_id = :record_id ORDER BY attempt_number"
+                ),
+                {"record_id": record.id},
+            ).scalars().all()
+            self.assertEqual(persisted_states, list(delivery_states))
+            self.assertNotIn("encrypted", str(record.attributes))
+            self.assertNotIn("encrypted", str(export_setting.configuration_evidence))
 
     def test_full_project_goal_task_run_lifecycle_with_audit_trail(self) -> None:
         with self.Session() as session:

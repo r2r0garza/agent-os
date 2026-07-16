@@ -66,6 +66,15 @@ ArtifactIngestionStatus = Enum(
     "not_applicable", "pending", "complete", "failed", "unsupported", "needs_reconciliation",
     name="artifact_ingestion_status", validate_strings=True,
 )
+ObservabilityEventKind = Enum(
+    "request", "goal", "task", "run", "model_call", "tool_call", "mcp_call",
+    "sandbox", "approval", "budget", "artifact", "checkpoint",
+    name="observability_event_kind", validate_strings=True,
+)
+TelemetryDeliveryStatus = Enum(
+    "pending", "delivered", "dropped", "delayed", "disabled", "failed",
+    name="telemetry_delivery_status", validate_strings=True,
+)
 
 
 class Team(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -931,3 +940,128 @@ class AuditEvent(Base, UUIDPrimaryKeyMixin):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class TelemetryExportSetting(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "telemetry_export_settings"
+    __table_args__ = (
+        Index("ix_telemetry_export_settings_scope", "team_id", "project_id", "enabled"),
+    )
+
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    exporter_type: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    endpoint_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    capture_prompts: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    capture_outputs: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    redaction_policy_evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    configuration_evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class ObservabilityRecord(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "observability_records"
+    __table_args__ = (
+        Index("ix_observability_records_correlation", "correlation_id", "occurred_at"),
+        Index("ix_observability_records_trace", "trace_id", "span_id"),
+        Index("ix_observability_records_run", "run_id", "occurred_at"),
+        Index("ix_observability_records_goal", "goal_id", "occurred_at"),
+        Index("ix_observability_records_project", "project_id", "occurred_at"),
+        Index("ix_observability_records_team", "team_id", "occurred_at"),
+    )
+
+    correlation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    span_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    parent_span_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    event_kind: Mapped[str] = mapped_column(ObservabilityEventKind, nullable=False)
+    operation_name: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="SET NULL"), nullable=True
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True
+    )
+    goal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="SET NULL"), nullable=True
+    )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
+    audit_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("audit_events.id", ondelete="SET NULL"), nullable=True
+    )
+    cost_ledger_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cost_ledger_entries.id", ondelete="SET NULL"), nullable=True
+    )
+    approval_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("approval_requests.id", ondelete="SET NULL"), nullable=True
+    )
+    approval_decision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("approval_decisions.id", ondelete="SET NULL"), nullable=True
+    )
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True
+    )
+    artifact_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifact_versions.id", ondelete="SET NULL"), nullable=True
+    )
+    model_call_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    tool_call_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    mcp_call_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    sandbox_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    attributes: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    capture_policy_evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    redaction_evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class TelemetryExportAttempt(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "telemetry_export_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "observability_record_id", "destination", "attempt_number",
+            name="uq_telemetry_export_attempts_record_destination_attempt",
+        ),
+        CheckConstraint("attempt_number > 0", name="attempt_number_positive"),
+        Index("ix_telemetry_export_attempts_status", "status", "created_at"),
+    )
+
+    observability_record_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("observability_records.id", ondelete="CASCADE"), nullable=False
+    )
+    export_setting_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("telemetry_export_settings.id", ondelete="SET NULL"), nullable=True
+    )
+    destination: Mapped[str] = mapped_column(Text, nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        TelemetryDeliveryStatus, nullable=False, server_default="pending"
+    )
+    last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivery_evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
