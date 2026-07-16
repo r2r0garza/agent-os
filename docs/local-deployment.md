@@ -10,8 +10,8 @@ socket and Compose provider.
 | Service | Purpose | Published port | Health evidence |
 | --- | --- | --- | --- |
 | `frontend` | Next.js operator console | `3000` | HTTP response from `/` |
-| `api` | FastAPI versioned API | `8000` | `GET /api/v1/health` |
-| `worker` | Durable task polling and execution | none | successful scheduler poll marker |
+| `api` | FastAPI versioned API | `8000` | `GET /api/v1/health` (database, migrations, artifact root, master key) |
+| `worker` | Durable task polling and execution | none | `agentic-os health check --role worker` plus a successful scheduler poll marker |
 | `postgres` | durable system of record | none | `pg_isready` |
 | `sandbox-runtime` | worker access to the selected container engine | none | `docker info` through the mounted socket |
 | `telemetry` | optional local OTLP collector | `4317`, `4318` | collector configuration validation |
@@ -154,6 +154,16 @@ after PostgreSQL is healthy, the worker starts only after both API and sandbox
 runtime health checks pass, and the frontend starts only after the API is
 healthy.
 
+`GET /api/v1/health` fails closed: it returns `503` with a per-dependency
+breakdown (`database`, `migrations`, `artifact_root`, `master_key`) whenever
+any of those checks cannot be satisfied, instead of the earlier static `ok`
+response, so Compose (and any dependent service's `depends_on: condition:
+service_healthy`) detects a broken dependency after startup, not only during
+the initial boot sequence. `agentic-os health check --role worker` runs the
+same checks plus sandbox runtime availability and is what gates the worker's
+own readiness marker; run `agentic-os health check --role api|worker` manually
+to inspect the same evidence outside of a container healthcheck.
+
 ## Setup, migrations, backup, restore, and upgrade
 
 Run operational commands in the API image so the PostgreSQL client version and
@@ -219,6 +229,14 @@ back, stop application services and restore the database dump, artifact bytes,
 configuration, and matching master key as one recovery set before starting the
 previous application image. Database rollback through Alembic downgrade is not
 the supported recovery path.
+
+Every `setup-check`, `migrations status`, `migrations apply`, `backup`,
+`restore`, and `upgrade-preflight` invocation persists a non-secret evidence
+record (`operations.*` audit events) to the deployment's own database when it
+is reachable, so `GET /api/v1/audit-events` shows a durable history of
+maintenance actions alongside goal and task activity. Persistence is
+best-effort: a preflight check run before the database exists still completes
+normally, it just has no audit trail to write to yet.
 
 ### Manual backup/restore smoke test
 

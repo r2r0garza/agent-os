@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 from agentic_os.config import (
     ARTIFACT_ROOT_ENV,
@@ -28,7 +29,7 @@ from agentic_os.config import (
     format_report,
     run_preflight,
 )
-from agentic_os.domain.database import database_url
+from agentic_os.domain.database import create_database_engine, database_url, session_factory
 
 BACKUP_FORMAT_VERSION = 1
 REQUIRED_POSTGRES_TOOLS = ("pg_dump", "pg_restore", "pg_isready")
@@ -115,6 +116,28 @@ def _sanitized_configuration(url_value: str, artifact_root: Path) -> dict[str, A
     }
 
 
+def _record_maintenance_event(event_type: str, payload: dict[str, Any]) -> None:
+    """Best-effort durable evidence for an operator maintenance action.
+
+    Maintenance commands must still succeed when the audit trail's own
+    database is unreachable (for example, a preflight check run before the
+    database exists), so persistence failures are swallowed rather than
+    surfaced as command failures.
+    """
+    from agentic_os.domain.models import AuditEvent
+
+    try:
+        engine = create_database_engine()
+        try:
+            with session_factory(engine)() as session:
+                session.add(AuditEvent(event_type=event_type, payload=payload))
+                session.commit()
+        finally:
+            engine.dispose()
+    except SQLAlchemyError:
+        pass
+
+
 def setup_check() -> str:
     results = run_preflight()
     missing = [tool for tool in REQUIRED_POSTGRES_TOOLS if shutil.which(tool) is None]
@@ -124,25 +147,33 @@ def setup_check() -> str:
     else:
         report += "\n[OK] postgres_tools: pg_dump, pg_restore, and pg_isready are available"
     if not all(result.ok for result in results) or missing:
+        _record_maintenance_event("operations.setup_check", {"ok": False, "report": report.splitlines()})
         raise OperationError(report)
     try:
         _run(["pg_isready", "--quiet"], env=_postgres_environment(database_url()))
     except OperationError as error:
-        raise OperationError(report + f"\n[FAIL] database_connection: {error}") from error
+        report += f"\n[FAIL] database_connection: {error}"
+        _record_maintenance_event("operations.setup_check", {"ok": False, "report": report.splitlines()})
+        raise OperationError(report) from error
     report += "\n[OK] database_connection: PostgreSQL accepts connections"
+    _record_maintenance_event("operations.setup_check", {"ok": True, "report": report.splitlines()})
     return report
 
 
 def migration_status() -> str:
     config = _alembic_config()
     result = _run(["alembic", "-c", str(config), "current", "--check-heads"])
-    return result.stdout.strip() or "database is at the migration head"
+    detail = result.stdout.strip() or "database is at the migration head"
+    _record_maintenance_event("operations.migration_status", {"detail": detail})
+    return detail
 
 
 def apply_migrations() -> str:
     config = _alembic_config()
     result = _run(["alembic", "-c", str(config), "upgrade", "head"])
-    return result.stdout.strip() or "migrations applied through head"
+    detail = result.stdout.strip() or "migrations applied through head"
+    _record_maintenance_event("operations.migration_apply", {"detail": detail})
+    return detail
 
 
 def _collect_artifacts(source: Path, destination: Path) -> list[dict[str, Any]]:
@@ -219,6 +250,7 @@ def create_backup(output: str | Path) -> dict[str, Any]:
         )
         with tarfile.open(target, "x:gz") as archive:
             archive.add(staging, arcname="agentic-os-backup", recursive=True)
+    _record_maintenance_event("operations.backup_created", {"backup": str(target), "manifest": manifest})
     return {"backup": str(target), "artifact_files": len(artifact_entries), "manifest": manifest}
 
 
@@ -316,19 +348,21 @@ def restore_backup(
         if artifact_target.exists() and confirm_overwrite:
             shutil.rmtree(artifact_target)
         staged_artifacts.replace(artifact_target)
-    return {
+    result = {
         "backup": str(Path(backup).resolve()),
         "artifact_root": str(artifact_target),
         "artifact_files": len(manifest["artifacts"]),
         "master_key_restored": False,
         "next_step": "Restore matching master-key material separately, then run setup-check and migration status.",
     }
+    _record_maintenance_event("operations.restore_completed", result)
+    return result
 
 
 def upgrade_preflight() -> dict[str, Any]:
     report = setup_check()
     migrations = migration_status()
-    return {
+    result = {
         "ready": True,
         "configuration": report.splitlines(),
         "migrations": migrations,
@@ -337,3 +371,5 @@ def upgrade_preflight() -> dict[str, Any]:
             "configuration, and matching master key together if rollback is required."
         ),
     }
+    _record_maintenance_event("operations.upgrade_preflight", result)
+    return result

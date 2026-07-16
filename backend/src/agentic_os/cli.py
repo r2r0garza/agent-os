@@ -45,6 +45,18 @@ def parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="overwrite an existing key file"
     )
 
+    health = commands.add_parser("health", help="check startup and runtime dependency health")
+    health_actions = health.add_subparsers(dest="health_command", required=True)
+    health_check_parser = health_actions.add_parser(
+        "check", help="report database, migration, artifact-root, master-key, and sandbox health"
+    )
+    health_check_parser.add_argument(
+        "--role",
+        choices=("api", "worker"),
+        default="api",
+        help="worker role also checks sandbox runtime availability (default: api)",
+    )
+
     operations = commands.add_parser("operations", help="run bounded local deployment operations")
     operation_actions = operations.add_subparsers(dest="operations_command", required=True)
     operation_actions.add_parser("setup-check", help="validate setup and backup prerequisites")
@@ -150,6 +162,19 @@ def _run_config_command(args: argparse.Namespace) -> int:
     raise AssertionError(f"unknown config command {args.config_command!r}")
 
 
+def _run_health_command(args: argparse.Namespace) -> int:
+    from agentic_os.domain import create_database_engine
+    from agentic_os.health import deployment_health
+
+    engine = create_database_engine()
+    try:
+        report = deployment_health(engine, include_sandbox=args.role == "worker")
+    finally:
+        engine.dispose()
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report["status"] == "healthy" else 1
+
+
 def _run_operations_command(args: argparse.Namespace) -> int:
     import tempfile
 
@@ -203,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_worker_run_once(args.worker_id, args.lease_seconds, args.workers)
     if args.command == "config":
         return _run_config_command(args)
+    if args.command == "health":
+        return _run_health_command(args)
     if args.command == "operations":
         return _run_operations_command(args)
     try:

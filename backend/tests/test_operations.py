@@ -12,7 +12,19 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from agentic_os.operations import OperationError, create_backup, restore_backup, verify_backup
+from sqlalchemy import select
+
+from agentic_os.domain import create_database_engine, database_url, session_factory
+from agentic_os.domain.models import AuditEvent
+from agentic_os.operations import (
+    OperationError,
+    _record_maintenance_event,
+    apply_migrations,
+    create_backup,
+    migration_status,
+    restore_backup,
+    verify_backup,
+)
 
 
 class LocalOperationsTests(unittest.TestCase):
@@ -92,6 +104,93 @@ class LocalOperationsTests(unittest.TestCase):
                 archive.add(unpacked / "agentic-os-backup", arcname="agentic-os-backup")
             with self.assertRaisesRegex(OperationError, "integrity"):
                 verify_backup(tampered, root / "verify")
+
+
+class MaintenanceEvidenceTests(unittest.TestCase):
+    """Maintenance operations persist durable, queryable evidence.
+
+    Requires a reachable PostgreSQL because evidence is written as an
+    AuditEvent row through the real domain session, the same durable record
+    every other observability view reads from.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.database_url = os.environ.get("AGENTIC_OS_DATABASE_URL", database_url())
+        try:
+            probe = create_database_engine(cls.database_url)
+            with probe.connect():
+                pass
+            probe.dispose()
+        except Exception as error:  # pragma: no cover - environment guard
+            raise unittest.SkipTest(
+                f"PostgreSQL is not reachable at {cls.database_url!r}: {error}"
+            )
+
+    def _latest_event(self, event_type: str):
+        engine = create_database_engine(self.database_url)
+        try:
+            with session_factory(engine)() as session:
+                return session.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.event_type == event_type)
+                    .order_by(AuditEvent.sequence_number.desc())
+                ).scalars().first()
+        finally:
+            engine.dispose()
+
+    def test_maintenance_event_is_swallowed_when_database_is_unreachable(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"AGENTIC_OS_DATABASE_URL": "postgresql+psycopg://user:pass@127.0.0.1:1/agentic_os"},
+            clear=False,
+        ):
+            _record_maintenance_event("operations.test_probe", {"ok": True})  # does not raise
+
+    def test_migration_status_persists_queryable_evidence(self) -> None:
+        with mock.patch.dict(os.environ, {"AGENTIC_OS_DATABASE_URL": self.database_url}, clear=False):
+            detail = migration_status()
+        event = self._latest_event("operations.migration_status")
+        self.assertIsNotNone(event)
+        self.assertEqual(event.payload["detail"], detail)
+
+    def test_apply_migrations_persists_queryable_evidence(self) -> None:
+        with mock.patch.dict(os.environ, {"AGENTIC_OS_DATABASE_URL": self.database_url}, clear=False):
+            detail = apply_migrations()
+        event = self._latest_event("operations.migration_apply")
+        self.assertIsNotNone(event)
+        self.assertEqual(event.payload["detail"], detail)
+
+    def test_backup_and_restore_persist_queryable_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifacts = root / "artifacts"
+            artifacts.mkdir()
+            (artifacts / "blob").write_bytes(b"durable bytes")
+            backup = root / "backup.tar.gz"
+            restored = root / "restored-artifacts"
+            environment = {
+                "AGENTIC_OS_DATABASE_URL": self.database_url,
+                "AGENTIC_OS_ARTIFACT_ROOT": str(artifacts),
+                "AGENTIC_OS_MASTER_KEY_FILE": str(root / "master.key"),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch(
+                "agentic_os.operations.subprocess.run", side_effect=LocalOperationsTests._fake_postgres
+            ):
+                result = create_backup(backup)
+                restore_backup(
+                    backup,
+                    target_database_url="postgresql+psycopg://restore:other@clean.test/restored",
+                    target_artifact_root=restored,
+                )
+
+        backup_event = self._latest_event("operations.backup_created")
+        self.assertIsNotNone(backup_event)
+        self.assertEqual(backup_event.payload["backup"], result["backup"])
+
+        restore_event = self._latest_event("operations.restore_completed")
+        self.assertIsNotNone(restore_event)
+        self.assertEqual(restore_event.payload["artifact_root"], str(restored.resolve()))
 
 
 if __name__ == "__main__":

@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -903,6 +905,46 @@ class ArtifactApiTests(unittest.TestCase):
 
         invalid = client.get(f"/api/v1/projects/{project['id']}/artifacts", params={"kind": "bogus"})
         self.assertEqual(invalid.status_code, 422)
+
+
+class HealthEndpointTests(unittest.TestCase):
+    """The unauthenticated /health endpoint backs container healthchecks and
+    must fail closed on real dependency problems (exit criterion 4), not just
+    report a static "ok"."""
+
+    def test_health_is_200_when_every_dependency_is_satisfied(self) -> None:
+        from cryptography.fernet import Fernet
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "AGENTIC_OS_ARTIFACT_ROOT": str(Path(tmp) / "artifacts"),
+                "AGENTIC_OS_MASTER_KEY": Fernet.generate_key().decode(),
+            },
+            clear=False,
+        ):
+            response = client.get("/api/v1/health")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "healthy")
+        self.assertEqual(body["checks"]["database"]["status"], "healthy")
+        self.assertEqual(body["checks"]["migrations"]["status"], "healthy")
+
+    def test_health_is_503_when_master_key_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "AGENTIC_OS_ARTIFACT_ROOT": str(Path(tmp) / "artifacts"),
+                "AGENTIC_OS_MASTER_KEY_FILE": str(Path(tmp) / "missing-master.key"),
+            },
+            clear=False,
+        ):
+            os.environ.pop("AGENTIC_OS_MASTER_KEY", None)
+            response = client.get("/api/v1/health")
+        self.assertEqual(response.status_code, 503)
+        body = response.json()
+        self.assertEqual(body["status"], "unavailable")
+        self.assertEqual(body["checks"]["master_key"]["status"], "unavailable")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from agentic_os.api.deps import _engine as api_engine
 from agentic_os.api.redaction import redact_mapping
+from agentic_os.health import deployment_health
 from agentic_os.observability import request_correlation_scope
 
 from agentic_os.api.routers import (
@@ -54,8 +56,10 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=422, content={"detail": jsonable_encoder(redact_mapping(error.errors()))})
 
     @app.get(f"{API_V1_PREFIX}/health", tags=["health"])
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> JSONResponse:
+        report = deployment_health(api_engine())
+        status_code = 200 if report["status"] == "healthy" else 503
+        return JSONResponse(status_code=status_code, content=jsonable_encoder(report))
 
     app.include_router(model_profiles.router, prefix=API_V1_PREFIX)
     app.include_router(observability.router, prefix=API_V1_PREFIX)
