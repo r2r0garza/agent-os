@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -229,8 +230,13 @@ class ObservabilityApiTests(unittest.TestCase):
             response = client.get("/api/v1/admin/observability/health")
         self.assertEqual(response.status_code, 200, response.text)
         health = response.json()
-        self.assertEqual(health["database"]["status"], "ok")
-        self.assertEqual(health["sandbox"]["docker"]["status"], "available")
+        self.assertEqual(health["database"]["status"], "healthy")
+        self.assertGreaterEqual(health["database"]["latency_ms"], 0)
+        self.assertEqual(health["sandbox"]["status"], "degraded")
+        self.assertEqual(health["sandbox"]["runtimes"]["docker"]["status"], "available")
+        self.assertEqual(
+            health["sandbox"]["runtimes"]["podman"]["status"], "unavailable"
+        )
         self.assertEqual(health["telemetry"]["status"], "degraded")
         exporter = health["telemetry"]["exporters"][-1]
         self.assertTrue(exporter["configured"])
@@ -243,3 +249,50 @@ class ObservabilityApiTests(unittest.TestCase):
         self.assertEqual(failure["failure_code"], "sink_unavailable")
         self.assertEqual(failure["failure_message"], "[REDACTED]")
         self.assertEqual(failure["delivery_evidence"]["api_token"], "[REDACTED]")
+
+    def test_admin_health_reports_stale_workers_retries_failures_and_delayed_delivery(self) -> None:
+        now = datetime.now(timezone.utc)
+        with SessionLocal.begin() as session:
+            task = session.get(Task, uuid.UUID(self.task["id"]))
+            task.status = "running"
+            task.lease_owner = "worker-stale-secretless-id"
+            task.lease_expires_at = now - timedelta(minutes=5)
+            first_run = session.get(Run, self.run_id)
+            first_run.status = "failed"
+            session.add(
+                Run(
+                    task_id=task.id,
+                    attempt_number=2,
+                    idempotency_key=f"health-retry-{uuid.uuid4()}",
+                    lease_token=task.lease_token,
+                    agent_version_id=uuid.UUID(self.agent_version["id"]),
+                    status="failed",
+                )
+            )
+            attempt = session.execute(
+                select(TelemetryExportAttempt).where(
+                    TelemetryExportAttempt.observability_record_id == self.record_id
+                )
+            ).scalar_one()
+            attempt.status = "delayed"
+            attempt.retry_after = now + timedelta(minutes=1)
+            for record in session.execute(select(ObservabilityRecord)).scalars():
+                record.occurred_at = now - timedelta(minutes=5)
+
+        with mock.patch(
+            "agentic_os.api.routers.observability.runtime_available",
+            return_value=(False, "runtime unavailable"),
+        ):
+            response = client.get("/api/v1/admin/observability/health")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        health = response.json()
+        self.assertEqual(health["workers"]["status"], "stale")
+        self.assertIn("worker-stale-secretless-id", health["workers"]["stale_worker_ids"])
+        self.assertIn(self.task["id"], health["workers"]["stale_task_ids"])
+        self.assertGreaterEqual(health["workers"]["retry_count"], 1)
+        self.assertGreaterEqual(health["workers"]["failure_count"], 2)
+        self.assertEqual(health["sandbox"]["status"], "unavailable")
+        self.assertEqual(health["event_stream"]["status"], "delayed")
+        self.assertIsNotNone(health["event_stream"]["latest_correlation_id"])
+        self.assertEqual(health["telemetry"]["status"], "degraded")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -27,6 +28,8 @@ from agentic_os.domain.models import (
 from agentic_os.sandbox.availability import runtime_available
 
 router = APIRouter(tags=["observability"])
+
+EVENT_STREAM_DELAY_SECONDS = 120
 
 
 class TelemetryAttemptRead(BaseModel):
@@ -326,25 +329,64 @@ def observability_health(
     actor: User = Depends(current_actor),
 ) -> dict:
     _require_admin(actor)
+    database_check_started = perf_counter()
     session.execute(text("SELECT 1"))
+    database_latency_ms = round((perf_counter() - database_check_started) * 1000, 3)
     now = datetime.now(timezone.utc)
     queue_counts = dict(
         session.execute(select(Task.status, func.count(Task.id)).group_by(Task.status)).all()
     )
+    queue_depth = sum(queue_counts.get(status, 0) for status in ("pending", "ready"))
     active_workers = session.execute(
         select(func.count(func.distinct(Task.lease_owner))).where(
             Task.lease_owner.is_not(None), Task.lease_expires_at > now
         )
     ).scalar_one()
-    latest_record_at = session.execute(
-        select(func.max(ObservabilityRecord.occurred_at))
+    active_lease_count = session.execute(
+        select(func.count(Task.id)).where(
+            Task.lease_owner.is_not(None), Task.lease_expires_at > now
+        )
     ).scalar_one()
+    stale_worker_rows = list(
+        session.execute(
+            select(Task.id, Task.lease_owner, Task.lease_expires_at).where(
+                Task.lease_owner.is_not(None),
+                (Task.lease_expires_at.is_(None)) | (Task.lease_expires_at <= now),
+            )
+        ).all()
+    )
+    stale_worker_ids = sorted({row.lease_owner for row in stale_worker_rows if row.lease_owner})
+    retry_count = session.execute(
+        select(func.count(Run.id)).where(Run.attempt_number > 1)
+    ).scalar_one()
+    failure_count = session.execute(
+        select(func.count(Run.id)).where(Run.status == "failed")
+    ).scalar_one()
+    latest_record = session.execute(
+        select(ObservabilityRecord)
+        .order_by(ObservabilityRecord.occurred_at.desc(), ObservabilityRecord.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    latest_record_at = latest_record.occurred_at if latest_record else None
+    latest_record_age_seconds = (
+        max(0.0, (now - latest_record_at).total_seconds()) if latest_record_at else None
+    )
     delivery_counts = dict(
         session.execute(
             select(TelemetryExportAttempt.status, func.count(TelemetryExportAttempt.id)).group_by(
                 TelemetryExportAttempt.status
             )
         ).all()
+    )
+    oldest_queued_delivery_at = session.execute(
+        select(func.min(TelemetryExportAttempt.created_at)).where(
+            TelemetryExportAttempt.status.in_(("pending", "delayed"))
+        )
+    ).scalar_one()
+    delivery_delay_seconds = (
+        max(0.0, (now - oldest_queued_delivery_at).total_seconds())
+        if oldest_queued_delivery_at
+        else None
     )
     exporters = session.execute(
         select(TelemetryExportSetting).where(
@@ -356,14 +398,90 @@ def observability_health(
     for runtime in ("docker", "podman"):
         available, reason = runtime_available(runtime)
         sandbox[runtime] = {"status": "available" if available else "unavailable", "reason": reason}
+    available_sandbox_count = sum(
+        runtime["status"] == "available" for runtime in sandbox.values()
+    )
+    sandbox_status = (
+        "healthy"
+        if available_sandbox_count == len(sandbox)
+        else "degraded"
+        if available_sandbox_count
+        else "unavailable"
+    )
+    workers_status = (
+        "stale"
+        if stale_worker_ids
+        else "unavailable"
+        if queue_depth and not active_workers
+        else "healthy"
+    )
+    event_stream_status = (
+        "unavailable"
+        if latest_record_at is None
+        else "delayed"
+        if latest_record_age_seconds is not None
+        and latest_record_age_seconds > EVENT_STREAM_DELAY_SECONDS
+        and (queue_depth or active_workers or stale_worker_rows)
+        else "healthy"
+    )
+    telemetry_status = (
+        "degraded"
+        if delivery_counts.get("failed", 0) or delivery_counts.get("dropped", 0)
+        else "delayed"
+        if delivery_counts.get("delayed", 0)
+        or (
+            delivery_delay_seconds is not None
+            and delivery_delay_seconds > EVENT_STREAM_DELAY_SECONDS
+        )
+        else "healthy"
+    )
+    component_statuses = (
+        "healthy",
+        "degraded" if queue_counts.get("failed", 0) else "healthy",
+        workers_status,
+        sandbox_status,
+        event_stream_status,
+        telemetry_status,
+    )
+    overall_status = next(
+        (
+            status
+            for status in ("unavailable", "stale", "degraded", "delayed")
+            if status in component_statuses
+        ),
+        "healthy",
+    )
     return {
-        "database": {"status": "ok"},
-        "queues": {"status": "ok", "tasks_by_status": queue_counts},
-        "workers": {"status": "ok" if active_workers else "idle", "active": active_workers},
-        "sandbox": sandbox,
-        "event_stream": {"status": "ok", "latest_record_at": latest_record_at},
+        "status": overall_status,
+        "checked_at": now,
+        "database": {"status": "healthy", "latency_ms": database_latency_ms},
+        "queues": {
+            "status": "degraded" if queue_counts.get("failed", 0) else "healthy",
+            "depth": queue_depth,
+            "tasks_by_status": queue_counts,
+        },
+        "workers": {
+            "status": workers_status,
+            "active": active_workers,
+            "stale": len(stale_worker_ids),
+            "stale_worker_ids": stale_worker_ids,
+            "stale_task_ids": [row.id for row in stale_worker_rows],
+            "lease_count": active_lease_count + len(stale_worker_rows),
+            "retry_count": retry_count,
+            "failure_count": failure_count,
+        },
+        "sandbox": {"status": sandbox_status, "runtimes": sandbox},
+        "event_stream": {
+            "status": event_stream_status,
+            "latest_record_at": latest_record_at,
+            "latest_record_age_seconds": latest_record_age_seconds,
+            "latest_correlation_id": latest_record.correlation_id if latest_record else None,
+            "deliveries_by_status": delivery_counts,
+            "oldest_queued_delivery_at": oldest_queued_delivery_at,
+            "delivery_delay_seconds": delivery_delay_seconds,
+        },
         "telemetry": {
-            "status": "degraded" if delivery_counts.get("failed", 0) else "ok",
+            "status": telemetry_status,
             "deliveries_by_status": delivery_counts,
             "exporters": [
                 {
