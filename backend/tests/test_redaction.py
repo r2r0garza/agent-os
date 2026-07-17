@@ -49,6 +49,23 @@ class RedactMappingTests(unittest.TestCase):
             },
         )
 
+    def test_redacts_credential_values_but_preserves_safe_credential_metadata(self) -> None:
+        redacted = redact_mapping(
+            {
+                "credential": "plain-secret",
+                "credential_value": "plain-secret",
+                "credential_id": "credential-123",
+                "credential_configured": True,
+                "credential_type": "api_key",
+            }
+        )
+
+        self.assertEqual(redacted["credential"], "[REDACTED]")
+        self.assertEqual(redacted["credential_value"], "[REDACTED]")
+        self.assertEqual(redacted["credential_id"], "credential-123")
+        self.assertTrue(redacted["credential_configured"])
+        self.assertEqual(redacted["credential_type"], "api_key")
+
 
 if __name__ == "__main__":
     unittest.main()

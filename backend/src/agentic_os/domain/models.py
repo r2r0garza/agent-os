@@ -193,6 +193,198 @@ class Goal(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
 
 
+class GoalPlanningSession(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "goal_planning_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "goal_id",
+            "revision_number",
+            name="uq_goal_planning_sessions_goal_revision",
+        ),
+        CheckConstraint("revision_number > 0", name="goal_planning_revision_positive"),
+        CheckConstraint(
+            "status IN ('draft', 'previewed', 'accepted', 'rejected')",
+            name="goal_planning_status_valid",
+        ),
+        CheckConstraint(
+            "validation_status IN ('pending', 'valid', 'invalid')",
+            name="goal_planning_validation_status_valid",
+        ),
+        CheckConstraint(
+            "status <> 'accepted' OR accepted_at IS NOT NULL",
+            name="goal_planning_accepted_has_timestamp",
+        ),
+        Index(
+            "ix_goal_planning_sessions_goal_status",
+            "goal_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="CASCADE"), nullable=False
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    revision_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="draft")
+    validation_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="pending"
+    )
+    constraints_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PlanningCapabilityRequirement(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "planning_capability_requirements"
+    __table_args__ = (
+        UniqueConstraint(
+            "planning_session_id",
+            "capability_key",
+            name="uq_planning_requirements_session_capability",
+        ),
+    )
+
+    planning_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    capability_key: Mapped[str] = mapped_column(Text, nullable=False)
+    required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class PlanningCandidate(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "planning_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "planning_session_id",
+            "agent_version_id",
+            name="uq_planning_candidates_session_agent_version",
+        ),
+        Index(
+            "ix_planning_candidates_session_eligible",
+            "planning_session_id",
+            "eligible",
+        ),
+    )
+
+    planning_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="RESTRICT"), nullable=False
+    )
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    matched_capabilities: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    missing_capabilities: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    rejection_reasons: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    constraints_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+
+
+class PlanningAssignment(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "planning_assignments"
+    __table_args__ = (
+        UniqueConstraint(
+            "planning_session_id",
+            "assignment_key",
+            name="uq_planning_assignments_session_key",
+        ),
+        CheckConstraint(
+            "validation_status IN ('pending', 'valid', 'invalid')",
+            name="planning_assignment_validation_status_valid",
+        ),
+    )
+
+    planning_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assignment_key: Mapped[str] = mapped_column(Text, nullable=False)
+    requirement_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("planning_capability_requirements.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    candidate_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("planning_candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    selected_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    validation_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="pending"
+    )
+    validation_evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+
+
+class PlanningOverride(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "planning_overrides"
+    __table_args__ = (
+        CheckConstraint(
+            "validation_status IN ('pending', 'valid', 'invalid')",
+            name="planning_override_validation_status_valid",
+        ),
+    )
+
+    planning_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assignment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("planning_assignments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    requested_candidate_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("planning_candidates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    prior_candidate_evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    validation_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="pending"
+    )
+    validation_evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+
+
 class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "tasks"
 
