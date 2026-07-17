@@ -771,6 +771,9 @@ class AgentVersionSkill(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
         UUID(as_uuid=True), ForeignKey("skill_versions.id", ondelete="RESTRICT"), nullable=False
     )
     attachment_config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
 
 
 class McpServer(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -808,6 +811,28 @@ class McpServerVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     credential_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="RESTRICT"), nullable=True
+    )
+
+
+class McpServerInstallation(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    """Lineage for a credential-free MCP definition installed into another team."""
+
+    __tablename__ = "mcp_server_installations"
+    __table_args__ = (
+        UniqueConstraint(
+            "installed_mcp_server_id",
+            name="uq_mcp_server_installations_installed_server",
+        ),
+    )
+
+    installed_mcp_server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("mcp_servers.id", ondelete="CASCADE"), nullable=False
+    )
+    source_mcp_server_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("mcp_server_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    installed_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
 
 
@@ -931,6 +956,9 @@ class AgentVersionMcpServer(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
         UUID(as_uuid=True), ForeignKey("mcp_server_versions.id", ondelete="RESTRICT"), nullable=False
     )
     attachment_config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
 
 
 class Policy(Base, UUIDPrimaryKeyMixin, TimestampMixin):

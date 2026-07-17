@@ -29,6 +29,7 @@ from agentic_os.domain.models import (
     McpServer,
     McpServerAttachment,
     McpServerHealthCheck,
+    McpServerInstallation,
     McpServerTool,
     McpServerVersion,
     Project,
@@ -53,6 +54,20 @@ class McpServerCreate(BaseModel):
 class McpServerUpdate(BaseModel):
     name: str | None = None
     visibility: str | None = None
+
+
+class McpServerInstallCreate(BaseModel):
+    name: str | None = None
+
+
+class McpServerInstallationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    installed_mcp_server_id: uuid.UUID
+    source_mcp_server_version_id: uuid.UUID
+    installed_by: uuid.UUID
+    created_at: datetime
 
 
 class McpServerRead(BaseModel):
@@ -364,6 +379,114 @@ def update_mcp_server(
     session.flush()
     session.refresh(server)
     return server
+
+
+@router.post(
+    "/{mcp_server_id}/versions/{version_number}/install",
+    response_model=McpServerRead,
+    status_code=201,
+)
+def install_mcp_server_version(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    payload: McpServerInstallCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServer:
+    """Install a visible definition without copying credential authority."""
+
+    source = session.get(McpServer, mcp_server_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, source, action="mcp_server.install")
+    source_version = _get_version(session, mcp_server_id, version_number)
+    target_team_id = primary_team_id(session, actor)
+
+    installed = McpServer(
+        team_id=target_team_id,
+        project_id=None,
+        created_by=actor.id,
+        name=payload.name or source.name,
+        visibility="private",
+    )
+    session.add(installed)
+    session.flush()
+    installed_version = McpServerVersion(
+        mcp_server_id=installed.id,
+        version_number=1,
+        connection_config=redact_mapping(source_version.connection_config),
+        credential_ciphertext=None,
+        credential_id=None,
+    )
+    session.add(installed_version)
+    session.flush()
+
+    source_tools = session.execute(
+        select(McpServerTool)
+        .where(McpServerTool.mcp_server_version_id == source_version.id)
+        .order_by(McpServerTool.tool_name)
+    ).scalars()
+    for tool in source_tools:
+        session.add(
+            McpServerTool(
+                mcp_server_version_id=installed_version.id,
+                tool_name=tool.tool_name,
+                description=tool.description,
+                input_schema=redact_mapping(tool.input_schema),
+                schema_valid=tool.schema_valid,
+                schema_validation_errors=redact_mapping(tool.schema_validation_errors),
+                descriptor_hash=tool.descriptor_hash,
+                credential_scope_required=tool.credential_scope_required,
+                enabled=tool.enabled,
+                timeout_ms=tool.timeout_ms,
+                output_limit_bytes=tool.output_limit_bytes,
+                last_discovered_at=tool.last_discovered_at,
+            )
+        )
+    installation = McpServerInstallation(
+        installed_mcp_server_id=installed.id,
+        source_mcp_server_version_id=source_version.id,
+        installed_by=actor.id,
+    )
+    session.add(installation)
+    session.add(
+        AuditEvent(
+            event_type="mcp.definition.installed",
+            payload={
+                "actor_id": str(actor.id),
+                "installed_mcp_server_id": str(installed.id),
+                "source_mcp_server_version_id": str(source_version.id),
+                "target_team_id": str(target_team_id),
+                "credentials_copied": False,
+            },
+        )
+    )
+    session.flush()
+    session.refresh(installed)
+    return installed
+
+
+@router.get(
+    "/{mcp_server_id}/installation",
+    response_model=McpServerInstallationRead,
+)
+def get_mcp_server_installation(
+    mcp_server_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServerInstallation:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, server, action="mcp_server.installation.read")
+    installation = session.execute(
+        select(McpServerInstallation).where(
+            McpServerInstallation.installed_mcp_server_id == mcp_server_id
+        )
+    ).scalar_one_or_none()
+    if installation is None:
+        raise HTTPException(status_code=404, detail="mcp server installation not found")
+    return installation
 
 
 @router.post("/{mcp_server_id}/versions", response_model=McpServerVersionRead, status_code=201)
