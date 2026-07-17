@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from agentic_os.api.authorization import (
     can_access_project,
+    can_access_owned_scope,
     current_actor,
     has_team_access,
     primary_team_id,
@@ -20,7 +21,16 @@ from agentic_os.api.authorization import (
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.api.secrets import encrypt_secret
-from agentic_os.domain.models import Credential, McpServer, McpServerVersion, Project, User
+from agentic_os.domain.models import (
+    Agent,
+    AuditEvent,
+    Credential,
+    McpServer,
+    McpServerAttachment,
+    McpServerVersion,
+    Project,
+    User,
+)
 
 router = APIRouter(prefix="/mcp-servers", tags=["mcp-servers"])
 
@@ -29,6 +39,12 @@ class McpServerCreate(BaseModel):
     name: str
     team_id: uuid.UUID | None = None
     project_id: uuid.UUID | None = None
+    visibility: str = "private"
+
+
+class McpServerUpdate(BaseModel):
+    name: str | None = None
+    visibility: str | None = None
 
 
 class McpServerRead(BaseModel):
@@ -38,6 +54,7 @@ class McpServerRead(BaseModel):
     team_id: uuid.UUID | None
     project_id: uuid.UUID | None
     name: str
+    visibility: str
     created_at: datetime
     updated_at: datetime
 
@@ -58,19 +75,65 @@ class McpServerVersionRead(BaseModel):
     created_at: datetime
 
 
-def _version_to_read(version: McpServerVersion) -> McpServerVersionRead:
+class McpServerAttachmentCreate(BaseModel):
+    credential_id: uuid.UUID | None = None
+    team_id: uuid.UUID | None = None
+    project_id: uuid.UUID | None = None
+    agent_id: uuid.UUID | None = None
+
+
+class McpServerAttachmentRead(BaseModel):
+    id: uuid.UUID
+    mcp_server_version_id: uuid.UUID
+    team_id: uuid.UUID | None
+    project_id: uuid.UUID | None
+    agent_id: uuid.UUID | None
+    credential_configured: bool
+    revoked: bool
+    created_at: datetime
+
+
+def _version_to_read(
+    session: Session, actor: User, version: McpServerVersion
+) -> McpServerVersionRead:
+    grants = session.execute(
+        select(McpServerAttachment).where(
+            McpServerAttachment.mcp_server_version_id == version.id,
+            McpServerAttachment.revoked_at.is_(None),
+        )
+    ).scalars()
+    credential_configured = any(
+        grant.credential_id is not None and _can_access_attachment_target(session, actor, grant)
+        for grant in grants
+    )
     return McpServerVersionRead(
         id=version.id,
         mcp_server_id=version.mcp_server_id,
         version_number=version.version_number,
         connection_config=redact_mapping(version.connection_config),
-        credential_configured=version.credential_ciphertext is not None or version.credential_id is not None,
-        credential_id=version.credential_id,
+        credential_configured=credential_configured,
+        # Definition responses never expose the credential-to-definition link.
+        credential_id=None,
         created_at=version.created_at,
     )
 
 
-def _require_server_access(session: Session, actor: User, server: McpServer, *, action: str) -> None:
+def _can_read_server(session: Session, actor: User, server: McpServer) -> bool:
+    if actor.role == "admin":
+        return True
+    if server.project_id is not None:
+        project = session.get(Project, server.project_id)
+        return project is not None and can_access_project(session, actor, project)
+    if server.team_id is not None and has_team_access(session, actor, server.team_id):
+        return True
+    return server.visibility in ("team", "public")
+
+
+def _require_server_access(
+    session: Session, actor: User, server: McpServer, *, action: str, mutate: bool = False
+) -> None:
+    if not mutate and _can_read_server(session, actor, server):
+        return
     if server.project_id is not None:
         require_project_access(session, actor, server.project_id, action=action)
     elif server.team_id is not None:
@@ -79,6 +142,35 @@ def _require_server_access(session: Session, actor: User, server: McpServer, *, 
         )
     else:
         raise HTTPException(status_code=404, detail="mcp server not found")
+
+
+def _can_access_attachment_target(
+    session: Session, actor: User, attachment: McpServerAttachment
+) -> bool:
+    if actor.role == "admin":
+        return True
+    if attachment.team_id is not None:
+        return has_team_access(session, actor, attachment.team_id)
+    if attachment.project_id is not None:
+        project = session.get(Project, attachment.project_id)
+        return project is not None and can_access_project(session, actor, project)
+    if attachment.agent_id is not None:
+        agent = session.get(Agent, attachment.agent_id)
+        return agent is not None and has_team_access(session, actor, agent.team_id)
+    return False
+
+
+def _attachment_to_read(attachment: McpServerAttachment) -> McpServerAttachmentRead:
+    return McpServerAttachmentRead(
+        id=attachment.id,
+        mcp_server_version_id=attachment.mcp_server_version_id,
+        team_id=attachment.team_id,
+        project_id=attachment.project_id,
+        agent_id=attachment.agent_id,
+        credential_configured=attachment.credential_id is not None,
+        revoked=attachment.revoked_at is not None,
+        created_at=attachment.created_at,
+    )
 
 
 @router.post("", response_model=McpServerRead, status_code=201)
@@ -93,6 +185,8 @@ def create_mcp_server(
         raise HTTPException(status_code=422, detail="project not found")
     if team_id is not None and project_id is not None:
         raise HTTPException(status_code=422, detail="MCP server must have exactly one owner scope")
+    if project_id is not None and payload.visibility != "private":
+        raise HTTPException(status_code=422, detail="project MCP definitions must remain private")
     if team_id is not None:
         require_team_access(
             session, actor, team_id, action="mcp_server.create", resource_type="team"
@@ -101,7 +195,13 @@ def create_mcp_server(
         require_project_access(session, actor, project_id, action="mcp_server.create")
     if team_id is None and project_id is None:
         team_id = primary_team_id(session, actor)
-    server = McpServer(team_id=team_id, project_id=project_id, created_by=actor.id, name=payload.name)
+    server = McpServer(
+        team_id=team_id,
+        project_id=project_id,
+        created_by=actor.id,
+        name=payload.name,
+        visibility=payload.visibility,
+    )
     session.add(server)
     session.flush()
     session.refresh(server)
@@ -113,17 +213,7 @@ def list_mcp_servers(
     session: Session = Depends(get_session), actor: User = Depends(current_actor)
 ) -> list[McpServer]:
     servers = session.execute(select(McpServer).order_by(McpServer.created_at)).scalars()
-    if actor.role == "admin":
-        return list(servers)
-    result = []
-    for server in servers:
-        if server.team_id is not None and has_team_access(session, actor, server.team_id):
-            result.append(server)
-        elif server.project_id is not None:
-            project = session.get(Project, server.project_id)
-            if project is not None and can_access_project(session, actor, project):
-                result.append(server)
-    return result
+    return [server for server in servers if _can_read_server(session, actor, server)]
 
 
 @router.get("/{mcp_server_id}", response_model=McpServerRead)
@@ -139,6 +229,32 @@ def get_mcp_server(
     return server
 
 
+@router.patch("/{mcp_server_id}", response_model=McpServerRead)
+def update_mcp_server(
+    mcp_server_id: uuid.UUID,
+    payload: McpServerUpdate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServer:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(
+        session, actor, server, action="mcp_server.update", mutate=True
+    )
+    updates = payload.model_dump(exclude_unset=True)
+    if server.project_id is not None and updates.get("visibility", "private") != "private":
+        raise HTTPException(status_code=422, detail="project MCP definitions must remain private")
+    if "visibility" in updates and updates["visibility"] != server.visibility:
+        if actor.role != "admin" and server.created_by != actor.id:
+            raise HTTPException(status_code=403, detail="only the owner or an admin can change visibility")
+    for key, value in updates.items():
+        setattr(server, key, value)
+    session.flush()
+    session.refresh(server)
+    return server
+
+
 @router.post("/{mcp_server_id}/versions", response_model=McpServerVersionRead, status_code=201)
 def create_mcp_server_version(
     mcp_server_id: uuid.UUID,
@@ -149,9 +265,12 @@ def create_mcp_server_version(
     server = session.get(McpServer, mcp_server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="mcp server not found")
-    _require_server_access(session, actor, server, action="mcp_server.version.create")
+    _require_server_access(
+        session, actor, server, action="mcp_server.version.create", mutate=True
+    )
     if payload.credential is not None and payload.credential_id is not None:
         raise HTTPException(status_code=422, detail="provide credential or credential_id, not both")
+    credential = None
     if payload.credential_id is not None:
         credential = session.get(Credential, payload.credential_id)
         if credential is None:
@@ -174,17 +293,42 @@ def create_mcp_server_version(
         ).scalar_one()
         + 1
     )
+    connection_config = redact_mapping(payload.connection_config)
+    if payload.credential is not None or payload.credential_id is not None:
+        connection_config["credential_required"] = True
     version = McpServerVersion(
         mcp_server_id=mcp_server_id,
         version_number=next_version,
-        connection_config=payload.connection_config,
-        credential_ciphertext=encrypt_secret(payload.credential.get_secret_value()) if payload.credential else None,
-        credential_id=payload.credential_id,
+        connection_config=connection_config,
+        credential_ciphertext=None,
+        credential_id=None,
     )
     session.add(version)
     session.flush()
+    if payload.credential is not None:
+        credential = Credential(
+            team_id=server.team_id,
+            project_id=server.project_id,
+            created_by=actor.id,
+            name=f"{server.name} credential v{next_version}",
+            credential_type="mcp_inline",
+            encrypted_material=encrypt_secret(payload.credential.get_secret_value()),
+            metadata_={"mcp_server_version_id": str(version.id)},
+        )
+        session.add(credential)
+        session.flush()
+    if credential is not None:
+        grant = McpServerAttachment(
+            mcp_server_version_id=version.id,
+            credential_id=credential.id,
+            team_id=server.team_id,
+            project_id=server.project_id,
+            created_by=actor.id,
+        )
+        session.add(grant)
+        session.flush()
     session.refresh(version)
-    return _version_to_read(version)
+    return _version_to_read(session, actor, version)
 
 
 @router.get("/{mcp_server_id}/versions", response_model=list[McpServerVersionRead])
@@ -202,7 +346,7 @@ def list_mcp_server_versions(
         .where(McpServerVersion.mcp_server_id == mcp_server_id)
         .order_by(McpServerVersion.version_number)
     ).scalars()
-    return [_version_to_read(version) for version in versions]
+    return [_version_to_read(session, actor, version) for version in versions]
 
 
 @router.get("/{mcp_server_id}/versions/{version_number}", response_model=McpServerVersionRead)
@@ -224,7 +368,175 @@ def get_mcp_server_version(
     ).scalar_one_or_none()
     if version is None:
         raise HTTPException(status_code=404, detail="mcp server version not found")
-    return _version_to_read(version)
+    return _version_to_read(session, actor, version)
+
+
+def _get_version(
+    session: Session, mcp_server_id: uuid.UUID, version_number: int
+) -> McpServerVersion:
+    version = session.execute(
+        select(McpServerVersion).where(
+            McpServerVersion.mcp_server_id == mcp_server_id,
+            McpServerVersion.version_number == version_number,
+        )
+    ).scalar_one_or_none()
+    if version is None:
+        raise HTTPException(status_code=404, detail="mcp server version not found")
+    return version
+
+
+@router.post(
+    "/{mcp_server_id}/versions/{version_number}/attachments",
+    response_model=McpServerAttachmentRead,
+    status_code=201,
+)
+def create_mcp_server_attachment(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    payload: McpServerAttachmentCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServerAttachmentRead:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, server, action="mcp_server.attach")
+    version = _get_version(session, mcp_server_id, version_number)
+    targets = [payload.team_id, payload.project_id, payload.agent_id]
+    if sum(item is not None for item in targets) != 1:
+        raise HTTPException(status_code=422, detail="attachment must have exactly one target scope")
+
+    target_team_id = payload.team_id
+    target_project = None
+    if payload.team_id is not None:
+        require_team_access(
+            session, actor, payload.team_id, action="mcp_server.attach", resource_type="team"
+        )
+    elif payload.project_id is not None:
+        target_project = require_project_access(
+            session, actor, payload.project_id, action="mcp_server.attach"
+        )
+        target_team_id = target_project.team_id
+    else:
+        target_agent = session.get(Agent, payload.agent_id)
+        if target_agent is None:
+            raise HTTPException(status_code=422, detail="agent not found")
+        require_team_access(
+            session,
+            actor,
+            target_agent.team_id,
+            action="mcp_server.attach",
+            resource_type="agent",
+        )
+        target_team_id = target_agent.team_id
+
+    credential = None
+    if payload.credential_id is not None:
+        credential = session.get(Credential, payload.credential_id)
+        if credential is None or not can_access_owned_scope(session, actor, credential):
+            raise HTTPException(status_code=404, detail="credential not found")
+        credential_matches = credential.team_id == target_team_id
+        if target_project is not None:
+            credential_matches = credential_matches or credential.project_id == target_project.id
+        if not credential_matches:
+            raise HTTPException(status_code=403, detail="credential is outside the attachment scope")
+
+    attachment = McpServerAttachment(
+        mcp_server_version_id=version.id,
+        credential_id=credential.id if credential else None,
+        team_id=payload.team_id,
+        project_id=payload.project_id,
+        agent_id=payload.agent_id,
+        created_by=actor.id,
+    )
+    session.add(attachment)
+    session.flush()
+    session.add(
+        AuditEvent(
+            project_id=payload.project_id,
+            event_type="mcp.attachment.created",
+            payload={
+                "actor_id": str(actor.id),
+                "mcp_server_id": str(server.id),
+                "mcp_server_version_id": str(version.id),
+                "attachment_id": str(attachment.id),
+                "target_scope": (
+                    "team" if payload.team_id else "project" if payload.project_id else "agent"
+                ),
+                "credential_configured": credential is not None,
+                "credential_material_redacted": True,
+            },
+        )
+    )
+    session.refresh(attachment)
+    return _attachment_to_read(attachment)
+
+
+@router.get(
+    "/{mcp_server_id}/versions/{version_number}/attachments",
+    response_model=list[McpServerAttachmentRead],
+)
+def list_mcp_server_attachments(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[McpServerAttachmentRead]:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, server, action="mcp_server.attachment.list")
+    version = _get_version(session, mcp_server_id, version_number)
+    attachments = session.execute(
+        select(McpServerAttachment)
+        .where(McpServerAttachment.mcp_server_version_id == version.id)
+        .order_by(McpServerAttachment.created_at)
+    ).scalars()
+    return [
+        _attachment_to_read(item)
+        for item in attachments
+        if _can_access_attachment_target(session, actor, item)
+    ]
+
+
+@router.delete(
+    "/{mcp_server_id}/versions/{version_number}/attachments/{attachment_id}",
+    response_model=McpServerAttachmentRead,
+)
+def revoke_mcp_server_attachment(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    attachment_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServerAttachmentRead:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, server, action="mcp_server.attachment.revoke")
+    version = _get_version(session, mcp_server_id, version_number)
+    attachment = session.get(McpServerAttachment, attachment_id)
+    if attachment is None or attachment.mcp_server_version_id != version.id:
+        raise HTTPException(status_code=404, detail="mcp server attachment not found")
+    if not _can_access_attachment_target(session, actor, attachment):
+        raise HTTPException(status_code=404, detail="mcp server attachment not found")
+    if attachment.revoked_at is None:
+        attachment.revoked_at = datetime.now(timezone.utc)
+        session.add(
+            AuditEvent(
+                project_id=attachment.project_id,
+                event_type="mcp.attachment.revoked",
+                payload={
+                    "actor_id": str(actor.id),
+                    "mcp_server_id": str(server.id),
+                    "mcp_server_version_id": str(version.id),
+                    "attachment_id": str(attachment.id),
+                    "credential_material_redacted": True,
+                },
+            )
+        )
+        session.flush()
+    return _attachment_to_read(attachment)
 
 
 @router.get("/{mcp_server_id}/versions/{version_number}/tools", response_model=list[dict[str, Any]])

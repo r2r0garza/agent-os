@@ -92,6 +92,17 @@ for the Sprint 4 automated suite and manual demonstration covering versioned
 agent configuration, credential redaction, policy and budget enforcement,
 pinned worker snapshots, frontend evidence, and restart continuity.
 
+### MCP definition and credential scopes
+
+MCP server versions contain shareable, redacted connection and tool metadata.
+Credentials are granted separately through revocable team, project, or agent
+attachments under
+`/api/v1/mcp-servers/{server_id}/versions/{version_number}/attachments`.
+Making a team-owned MCP definition `team` or `public` never grants its owner's
+credential. A consuming scope must attach its own accessible credential, and
+workers re-check the definition and attachment immediately before each MCP tool
+side effect so visibility changes or credential revocation fail closed.
+
 ## Durable approvals and budget governance verification
 
 See [docs/durable-approvals-budget-verification.md](docs/durable-approvals-budget-verification.md)

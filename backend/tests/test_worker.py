@@ -40,8 +40,10 @@ from agentic_os.domain.models import (
     Budget,
     BudgetReservation,
     CostLedgerEntry,
+    Credential,
     Goal,
     McpServer,
+    McpServerAttachment,
     McpServerVersion,
     ObservabilityRecord,
     Policy,
@@ -58,6 +60,7 @@ from agentic_os.domain.models import (
 )
 from agentic_os.sandbox import runtime_available
 from agentic_os.worker import claim_ready_task, run_task_worker_once
+from agentic_os.worker.configuration import ConfigurationSnapshotError, resolve_run_configuration
 from agentic_os.worker.governance import (
     BudgetActionContext,
     BudgetExhaustedError,
@@ -846,6 +849,74 @@ class WorkerTestCase(unittest.TestCase):
             }
             self.assertIn("policy.decision", event_types)
             self.assertNotIn("tool.invoked", event_types)
+
+    def test_revoked_mcp_credential_grant_fails_before_tool_invocation(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            goal = session.get(Goal, task.goal_id)
+            project = session.get(Project, goal.project_id)
+            agent_version = session.get(AgentVersion, task.assigned_agent_version_id)
+            agent = session.get(Agent, agent_version.agent_id)
+            mcp_version = session.get(
+                McpServerVersion,
+                uuid.UUID(agent_version.capability_manifest["mcp_server_version_id"]),
+            )
+            mcp_version.connection_config = {
+                **mcp_version.connection_config,
+                "credential_required": True,
+            }
+            credential = Credential(
+                team_id=project.team_id,
+                created_by=goal.created_by,
+                name="Runtime MCP credential",
+                credential_type="api_key",
+                encrypted_material="encrypted-test-material",
+            )
+            session.add(credential)
+            session.flush()
+            grant = McpServerAttachment(
+                mcp_server_version_id=mcp_version.id,
+                credential_id=credential.id,
+                agent_id=agent.id,
+                created_by=goal.created_by,
+            )
+            session.add(grant)
+            previous_run = Run(
+                task_id=task.id,
+                attempt_number=1,
+                idempotency_key=f"preflight-{uuid.uuid4()}",
+                lease_token=0,
+                agent_version_id=agent_version.id,
+                status="failed",
+            )
+            session.add(previous_run)
+            session.flush()
+            resolved = resolve_run_configuration(
+                session, task=task, run=previous_run, project=project
+            )
+            self.assertEqual(
+                resolved.configuration["mcp_servers"][0]["credential_grant_id"],
+                str(grant.id),
+            )
+            grant.revoked_at = datetime.now(timezone.utc)
+            session.commit()
+            task_id = task.id
+
+        with self.Session() as session, mock.patch(
+            "agentic_os.worker.runner.invoke_tool"
+        ) as invoke_tool:
+            with self.assertRaisesRegex(ConfigurationSnapshotError, "no longer available"):
+                run_task_worker_once(session, "worker-revoked-grant")
+            session.commit()
+            invoke_tool.assert_not_called()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+            events = list(
+                session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            )
+            self.assertNotIn("tool.invoked", {event.event_type for event in events})
 
     def test_policy_approval_required_blocks_task_in_safe_state(self) -> None:
         with self.Session() as session:

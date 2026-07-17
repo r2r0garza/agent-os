@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from agentic_os.domain.models import (
@@ -16,6 +16,9 @@ from agentic_os.domain.models import (
     AgentVersionSkill,
     ApprovalModeConfiguration,
     Budget,
+    Credential,
+    McpServer,
+    McpServerAttachment,
     McpServerVersion,
     ModelProfileVersion,
     Policy,
@@ -87,6 +90,60 @@ class ResolvedRunConfiguration:
                 if descriptor.get("name") == tool_name:
                     return copy.deepcopy(descriptor)
         raise ConfigurationSnapshotError(f"tool {tool_name!r} is not configured in snapshot {self.snapshot_id}")
+
+    def validate_tool_access(
+        self, session: Session, *, tool_name: str, project: Project
+    ) -> None:
+        """Re-check mutable MCP access immediately before a tool side effect."""
+
+        agent_id = uuid.UUID(self.configuration["agent"]["id"])
+        for configured in self.configuration["mcp_servers"]:
+            if not any(
+                descriptor.get("name") == tool_name
+                for descriptor in configured["connection_config"].get("tools", [])
+            ):
+                continue
+            server = session.get(McpServer, uuid.UUID(configured["mcp_server_id"]))
+            if server is None or not (
+                server.team_id == project.team_id
+                or server.project_id == project.id
+                or (server.project_id is None and server.visibility in ("team", "public"))
+            ):
+                raise ConfigurationSnapshotError(
+                    f"MCP definition access for tool {tool_name!r} is no longer available"
+                )
+            if configured["connection_config"].get("credential_required") is not True:
+                return
+            raw_grant_id = configured.get("credential_grant_id")
+            grant = (
+                session.get(McpServerAttachment, uuid.UUID(raw_grant_id))
+                if raw_grant_id
+                else None
+            )
+            if (
+                grant is None
+                or grant.revoked_at is not None
+                or grant.mcp_server_version_id != uuid.UUID(configured["id"])
+                or not (
+                    grant.agent_id == agent_id
+                    or grant.project_id == project.id
+                    or grant.team_id == project.team_id
+                )
+            ):
+                raise ConfigurationSnapshotError(
+                    f"MCP credential access for tool {tool_name!r} is no longer available"
+                )
+            credential = session.get(Credential, grant.credential_id) if grant.credential_id else None
+            if credential is None or not (
+                credential.team_id == project.team_id or credential.project_id == project.id
+            ):
+                raise ConfigurationSnapshotError(
+                    f"MCP credential access for tool {tool_name!r} is outside the run scope"
+                )
+            return
+        raise ConfigurationSnapshotError(
+            f"tool {tool_name!r} is not configured in snapshot {self.snapshot_id}"
+        )
 
 
 def resolve_run_configuration(
@@ -171,7 +228,50 @@ def resolve_run_configuration(
             raise ConfigurationSnapshotError(
                 f"MCP server version {attachment.mcp_server_version_id} not found"
             )
+        server = session.get(McpServer, version.mcp_server_id)
+        if server is None:
+            raise ConfigurationSnapshotError(f"MCP server {version.mcp_server_id} not found")
+        definition_accessible = (
+            server.team_id == project.team_id
+            or server.project_id == project.id
+            or (server.project_id is None and server.visibility in ("team", "public"))
+        )
+        if not definition_accessible:
+            raise ConfigurationSnapshotError(
+                f"MCP definition {server.id} is not accessible to project {project.id}"
+            )
         connection_config = copy.deepcopy(version.connection_config or {})
+        grants = list(
+            session.execute(
+                select(McpServerAttachment).where(
+                    McpServerAttachment.mcp_server_version_id == version.id,
+                    McpServerAttachment.revoked_at.is_(None),
+                    or_(
+                        McpServerAttachment.agent_id == agent.id,
+                        McpServerAttachment.project_id == project.id,
+                        McpServerAttachment.team_id == project.team_id,
+                    ),
+                )
+            ).scalars()
+        )
+        grants.sort(
+            key=lambda item: (
+                0 if item.agent_id == agent.id else 1 if item.project_id == project.id else 2,
+                item.created_at,
+            )
+        )
+        grant = grants[0] if grants else None
+        credential = session.get(Credential, grant.credential_id) if grant and grant.credential_id else None
+        if credential is not None and not (
+            credential.team_id == project.team_id or credential.project_id == project.id
+        ):
+            raise ConfigurationSnapshotError(
+                f"MCP credential grant {grant.id} is outside the run scope"
+            )
+        if connection_config.get("credential_required") is True and credential is None:
+            raise ConfigurationSnapshotError(
+                f"MCP server version {version.id} requires an active scoped credential grant"
+            )
         for descriptor in connection_config.get("tools", []):
             name = descriptor.get("name")
             if not isinstance(name, str) or not name:
@@ -190,7 +290,8 @@ def resolve_run_configuration(
                 "mcp_server_id": str(version.mcp_server_id),
                 "version_number": version.version_number,
                 "connection_config": connection_config,
-                "credential_id": str(version.credential_id) if version.credential_id else None,
+                "credential_grant_id": str(grant.id) if grant else None,
+                "credential_configured": credential is not None,
                 "attachment_config": copy.deepcopy(attachment.attachment_config or {}),
             }
         )

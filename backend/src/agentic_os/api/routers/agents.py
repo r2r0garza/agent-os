@@ -178,6 +178,18 @@ def _require_same_team(session: Session, agent: Agent, resource: object, label: 
         raise HTTPException(status_code=403, detail=f"{label} belongs to another team")
 
 
+def _require_mcp_definition_access(agent: Agent, server: McpServer | None) -> None:
+    """Allow cross-team definition reuse without granting credential access."""
+
+    if server is None:
+        raise HTTPException(status_code=422, detail="MCP server not found")
+    if server.team_id == agent.team_id:
+        return
+    if server.project_id is None and server.visibility in ("team", "public"):
+        return
+    raise HTTPException(status_code=403, detail="MCP server definition is not accessible")
+
+
 def _resolve_model_version(session: Session, agent: Agent, payload: AgentVersionCreate) -> tuple[uuid.UUID | None, uuid.UUID | None]:
     profile_id = payload.model_profile_id
     version = None
@@ -375,7 +387,7 @@ def create_agent_version(
         item = session.get(McpServerVersion, attachment.version_id)
         if item is None:
             raise HTTPException(status_code=422, detail="MCP server version not found")
-        _require_same_team(session, agent, session.get(McpServer, item.mcp_server_id), "MCP server")
+        _require_mcp_definition_access(agent, session.get(McpServer, item.mcp_server_id))
         mcp_rows.append((item, attachment.config))
     policy_rows = []
     for version_id in payload.policy_set_version_ids:

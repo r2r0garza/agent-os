@@ -455,7 +455,7 @@ class McpServer(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "mcp_servers"
     __table_args__ = (
         CheckConstraint(
-            "team_id IS NOT NULL OR project_id IS NOT NULL", name="owner_scope_required"
+            "(team_id IS NOT NULL) <> (project_id IS NOT NULL)", name="exactly_one_owner_scope"
         ),
     )
 
@@ -469,6 +469,7 @@ class McpServer(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
+    visibility: Mapped[str] = mapped_column(AgentVisibility, nullable=False, server_default="private")
 
 
 class McpServerVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
@@ -486,6 +487,45 @@ class McpServerVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     credential_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="RESTRICT"), nullable=True
     )
+
+
+class McpServerAttachment(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    """A revocable permission to use an MCP definition in one runtime scope.
+
+    Definitions and their versions contain shareable, non-secret connection
+    metadata.  Credential permission lives here instead, attached to exactly
+    one team, project, or agent.  This prevents definition visibility from
+    implicitly granting credential use.
+    """
+
+    __tablename__ = "mcp_server_attachments"
+    __table_args__ = (
+        CheckConstraint(
+            "((team_id IS NOT NULL)::int + (project_id IS NOT NULL)::int + "
+            "(agent_id IS NOT NULL)::int) = 1",
+            name="exactly_one_target_scope",
+        ),
+    )
+
+    mcp_server_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("mcp_server_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("credentials.id", ondelete="RESTRICT"), nullable=True
+    )
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True
+    )
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=True
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AgentVersionMcpServer(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):

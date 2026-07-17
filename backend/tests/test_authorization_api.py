@@ -171,6 +171,112 @@ class AuthorizationApiTests(unittest.TestCase):
             401,
         )
 
+    def test_public_mcp_definition_does_not_share_scoped_credentials(self) -> None:
+        secret = "mcp-secret-that-must-not-leak"
+        server_response = client.post(
+            "/api/v1/mcp-servers",
+            json={"name": "Public MCP", "visibility": "public"},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(server_response.status_code, 201, server_response.text)
+        server = server_response.json()
+        version_response = client.post(
+            f"/api/v1/mcp-servers/{server['id']}/versions",
+            json={
+                "credential": secret,
+                "connection_config": {
+                    "url": "https://mcp.example.test",
+                    "headers": {"Authorization": secret},
+                    "tools": [{"name": "echo"}],
+                },
+            },
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(version_response.status_code, 201, version_response.text)
+        owner_version = version_response.json()
+        self.assertTrue(owner_version["credential_configured"])
+        self.assertNotIn(secret, version_response.text)
+
+        outsider_version = client.get(
+            f"/api/v1/mcp-servers/{server['id']}/versions/1",
+            headers=self._headers(self.outsider),
+        )
+        self.assertEqual(outsider_version.status_code, 200, outsider_version.text)
+        self.assertFalse(outsider_version.json()["credential_configured"])
+        self.assertIsNone(outsider_version.json()["credential_id"])
+        self.assertNotIn(secret, outsider_version.text)
+
+        outsider_credential = client.post(
+            "/api/v1/credentials",
+            json={
+                "name": "Outsider MCP credential",
+                "credential_type": "api_key",
+                "material": "outsider-secret",
+            },
+            headers=self._headers(self.outsider),
+        ).json()
+        attachment_response = client.post(
+            f"/api/v1/mcp-servers/{server['id']}/versions/1/attachments",
+            json={
+                "team_id": outsider_credential["team_id"],
+                "credential_id": outsider_credential["id"],
+            },
+            headers=self._headers(self.outsider),
+        )
+        self.assertEqual(attachment_response.status_code, 201, attachment_response.text)
+        self.assertTrue(attachment_response.json()["credential_configured"])
+        self.assertNotIn("outsider-secret", attachment_response.text)
+
+        owner_credential = client.post(
+            "/api/v1/credentials",
+            json={
+                "name": "Owner-only MCP credential",
+                "credential_type": "api_key",
+                "material": "owner-secret",
+            },
+            headers=self._headers(self.owner),
+        ).json()
+        denied = client.post(
+            f"/api/v1/mcp-servers/{server['id']}/versions/1/attachments",
+            json={
+                "team_id": outsider_credential["team_id"],
+                "credential_id": owner_credential["id"],
+            },
+            headers=self._headers(self.outsider),
+        )
+        # Definition access is public, but another scope's credential remains inaccessible.
+        self.assertIn(denied.status_code, (404, 422))
+
+        project_credential = client.post(
+            "/api/v1/credentials",
+            json={
+                "name": "Project MCP credential",
+                "credential_type": "api_key",
+                "material": "project-secret",
+                "project_id": str(self.project.id),
+            },
+            headers=self._headers(self.owner),
+        ).json()
+        project_attachment = client.post(
+            f"/api/v1/mcp-servers/{server['id']}/versions/1/attachments",
+            json={
+                "project_id": str(self.project.id),
+                "credential_id": project_credential["id"],
+            },
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(project_attachment.status_code, 201, project_attachment.text)
+        audit = client.get(
+            "/api/v1/audit-events",
+            params={"project_id": str(self.project.id)},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(audit.status_code, 200, audit.text)
+        self.assertNotIn("project-secret", audit.text)
+        self.assertTrue(
+            any(item["event_type"] == "mcp.attachment.created" for item in audit.json())
+        )
+
     def test_actor_attribution_and_default_operator_compatibility(self) -> None:
         created = client.post(
             "/api/v1/projects",

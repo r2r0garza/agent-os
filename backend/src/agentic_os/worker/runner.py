@@ -360,6 +360,11 @@ def _execute_claimed_task(
     )
     tool_results: dict[str, dict] = {}
     for tool_name in enabled_tools:
+        # Definition visibility and credential grants are mutable authority,
+        # unlike the pinned configuration payload. Re-check them before any
+        # budget reservation or external tool side effect so revocation fails
+        # closed even when a retry reuses an older snapshot.
+        resolved.validate_tool_access(session, tool_name=tool_name, project=project)
         descriptor = resolved.tool_descriptor(tool_name)
         pricing = descriptor.get("pricing") or {}
         chargeable = pricing.get("chargeable") is True
