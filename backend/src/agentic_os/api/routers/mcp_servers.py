@@ -20,7 +20,7 @@ from agentic_os.api.authorization import (
 )
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
-from agentic_os.api.secrets import encrypt_secret
+from agentic_os.secrets import encrypt_secret
 from agentic_os.domain.models import (
     Agent,
     AuditEvent,

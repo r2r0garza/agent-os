@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from agentic_os.api.authorization import actor_team_ids, current_actor, primary_team_id, require_owned_scope
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
-from agentic_os.api.secrets import decrypt_secret, encrypt_secret
+from agentic_os.secrets import decrypt_secret, encrypt_secret
 from agentic_os.domain.models import (
     Credential,
     ModelProfile,

@@ -41,6 +41,7 @@ from agentic_os.worker.governance import (
     release_action_cost,
     reserve_action_cost,
 )
+from agentic_os.worker.harness import HarnessExecutionError, execute_model_harness
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, release_lease, renew_lease
 from agentic_os.worker.sandbox_execution import SandboxControlInterrupt, execute_task_sandbox
 from agentic_os.worker.tools import invoke_tool
@@ -419,6 +420,44 @@ def _execute_claimed_task(
         requested_by=goal.created_by,
     )
     tool_results: dict[str, dict] = {}
+    model_profile = configuration["model_profile"]
+    harness_config = capability_manifest.get("harness")
+    if harness_config is not None:
+        if model_profile is None:
+            raise TaskExecutionError(
+                f"agent version {agent['version_id']} declares a harness configuration "
+                "without an attached model profile"
+            )
+        _check_control()
+        try:
+            harness_result = execute_model_harness(
+                session,
+                task=task,
+                run=run,
+                project=project,
+                context=context,
+                model_profile=model_profile,
+                instructions=agent["instructions"],
+                required_capabilities=list(harness_config.get("required_capabilities") or []),
+            )
+        except HarnessExecutionError as error:
+            raise TaskExecutionError(str(error)) from error
+        tool_results["model"] = harness_result
+        session.add(
+            AuditEvent(
+                project_id=project_id,
+                goal_id=task.goal_id,
+                task_id=task.id,
+                run_id=run.id,
+                event_type="harness.output_recorded",
+                payload={
+                    "thread_id": harness_result["thread_id"],
+                    "configuration_snapshot_id": str(resolved.snapshot_id),
+                },
+            )
+        )
+        session.flush()
+
     for tool_name in enabled_tools:
         _check_control()
         # Definition visibility and credential grants are mutable authority,

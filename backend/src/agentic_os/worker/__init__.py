@@ -1,3 +1,10 @@
+from agentic_os.worker.harness import (
+    HarnessCapabilityError,
+    HarnessExecutionError,
+    HarnessSettings,
+    execute_model_harness,
+    thread_id_for_task,
+)
 from agentic_os.worker.leases import (
     DEFAULT_LEASE_SECONDS,
     LeaseLostError,
@@ -26,6 +33,9 @@ from agentic_os.worker.workspace import (
 
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
+    "HarnessCapabilityError",
+    "HarnessExecutionError",
+    "HarnessSettings",
     "LeaseLostError",
     "InvalidResourceKeyError",
     "TOOL_REGISTRY",
@@ -39,6 +49,7 @@ __all__ = [
     "canonical_resource_key",
     "claim_ready_task",
     "evaluate_policy",
+    "execute_model_harness",
     "execute_task_sandbox",
     "invoke_tool",
     "promote_workspace_changes",
@@ -48,4 +59,5 @@ __all__ = [
     "run_scheduler_once",
     "run_task_worker_once",
     "summarize_worker_heartbeats",
+    "thread_id_for_task",
 ]
