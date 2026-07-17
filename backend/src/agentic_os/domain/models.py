@@ -29,6 +29,21 @@ AgentVisibility = Enum("private", "team", "public", name="visibility", validate_
 GoalStatus = Enum(
     "draft", "active", "paused", "completed", "cancelled", "failed", name="goal_status", validate_strings=True
 )
+GoalControlAction = Enum(
+    "pause", "resume", "cancel", name="goal_control_action", validate_strings=True
+)
+GoalControlCommandStatus = Enum(
+    "requested", "applied", "rejected",
+    name="goal_control_command_status", validate_strings=True,
+)
+GoalSteeringRequestStatus = Enum(
+    "requested", "applied", "rejected",
+    name="goal_steering_request_status", validate_strings=True,
+)
+TaskGraphRevisionChange = Enum(
+    "unchanged", "added", "revised", "superseded",
+    name="task_graph_revision_change", validate_strings=True,
+)
 TaskStatus = Enum(
     "pending", "ready", "running", "blocked", "completed", "failed", "cancelled",
     name="task_status", validate_strings=True,
@@ -134,6 +149,18 @@ class ProjectMember(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
 
 class Goal(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "goals"
+    __table_args__ = (
+        CheckConstraint("control_version >= 0", name="goal_control_version_non_negative"),
+        CheckConstraint(
+            "active_graph_revision_number >= 0",
+            name="goal_graph_revision_non_negative",
+        ),
+        CheckConstraint(
+            "forced_termination_completed_at IS NULL "
+            "OR forced_termination_requested_at IS NOT NULL",
+            name="goal_forced_termination_completion_requires_request",
+        ),
+    )
 
     project_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
@@ -144,6 +171,26 @@ class Goal(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(GoalStatus, nullable=False, server_default="draft")
+    control_version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    pending_control: Mapped[str | None] = mapped_column(GoalControlAction, nullable=True)
+    control_requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    control_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancellation_grace_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    forced_termination_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    forced_termination_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    active_graph_revision_number: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default="0"
+    )
 
 
 class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -253,6 +300,229 @@ class TaskDependency(Base):
     )
     depends_on_task_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
+class GoalLifecycleCommand(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "goal_lifecycle_commands"
+    __table_args__ = (
+        UniqueConstraint(
+            "goal_id", "idempotency_key", name="uq_goal_lifecycle_commands_goal_idempotency"
+        ),
+        CheckConstraint(
+            "applied_at IS NULL OR applied_at >= created_at",
+            name="goal_lifecycle_command_application_not_before_request",
+        ),
+        CheckConstraint(
+            "status <> 'applied' OR applied_at IS NOT NULL",
+            name="goal_lifecycle_command_applied_has_timestamp",
+        ),
+        CheckConstraint(
+            "forced_termination_completed_at IS NULL "
+            "OR forced_termination_requested_at IS NOT NULL",
+            name="goal_lifecycle_command_forced_completion_requires_request",
+        ),
+        Index(
+            "ix_goal_lifecycle_commands_goal_status",
+            "goal_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    command_type: Mapped[str] = mapped_column(GoalControlAction, nullable=False)
+    status: Mapped[str] = mapped_column(
+        GoalControlCommandStatus, nullable=False, server_default="requested"
+    )
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prior_goal_status: Mapped[str | None] = mapped_column(GoalStatus, nullable=True)
+    target_goal_status: Mapped[str | None] = mapped_column(GoalStatus, nullable=True)
+    cancellation_grace_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    forced_termination_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    forced_termination_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class GoalSteeringRequest(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "goal_steering_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "goal_id", "idempotency_key", name="uq_goal_steering_requests_goal_idempotency"
+        ),
+        CheckConstraint(
+            "base_revision_number >= 0",
+            name="goal_steering_request_base_revision_non_negative",
+        ),
+        CheckConstraint(
+            "applied_revision_number IS NULL OR "
+            "applied_revision_number > base_revision_number",
+            name="goal_steering_request_applied_revision_advances",
+        ),
+        CheckConstraint(
+            "resolved_at IS NULL OR resolved_at >= created_at",
+            name="goal_steering_request_resolution_not_before_request",
+        ),
+        CheckConstraint(
+            "status <> 'applied' OR "
+            "(applied_revision_number IS NOT NULL AND resolved_at IS NOT NULL)",
+            name="goal_steering_request_applied_has_resolution",
+        ),
+        Index(
+            "ix_goal_steering_requests_goal_status",
+            "goal_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        GoalSteeringRequestStatus, nullable=False, server_default="requested"
+    )
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    base_revision_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    applied_revision_number: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class TaskGraphRevision(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "task_graph_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "goal_id", "revision_number", name="uq_task_graph_revisions_goal_revision"
+        ),
+        UniqueConstraint(
+            "steering_request_id", name="uq_task_graph_revisions_steering_request"
+        ),
+        CheckConstraint(
+            "revision_number > 0", name="task_graph_revision_number_positive"
+        ),
+        CheckConstraint(
+            "parent_revision_number IS NULL "
+            "OR (parent_revision_number >= 0 AND parent_revision_number < revision_number)",
+            name="task_graph_revision_parent_precedes_revision",
+        ),
+        Index(
+            "ix_task_graph_revisions_goal_created",
+            "goal_id",
+            "created_at",
+        ),
+    )
+
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="CASCADE"), nullable=False
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    steering_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_steering_requests.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    revision_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    parent_revision_number: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    graph_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    assignment_evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    policy_context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    budget_context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class TaskGraphRevisionTask(Base, CreatedAtMixin):
+    __tablename__ = "task_graph_revision_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "(change_type = 'revised' AND supersedes_task_id IS NOT NULL) "
+            "OR (change_type <> 'revised')",
+            name="task_graph_revision_revised_task_has_predecessor",
+        ),
+    )
+
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("task_graph_revisions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    change_type: Mapped[str] = mapped_column(
+        TaskGraphRevisionChange, nullable=False, server_default="unchanged"
+    )
+    supersedes_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=True
+    )
+    task_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class GoalLifecycleEvent(Base, UUIDPrimaryKeyMixin):
+    __tablename__ = "goal_lifecycle_events"
+    __table_args__ = (
+        Index(
+            "ix_goal_lifecycle_events_goal_sequence",
+            "goal_id",
+            "sequence_number",
+            unique=True,
+        ),
+    )
+
+    sequence_number: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(always=True),
+        nullable=False,
+        unique=True,
+    )
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="CASCADE"), nullable=False
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    lifecycle_command_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_lifecycle_commands.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    steering_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_steering_requests.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    graph_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("task_graph_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    prior_goal_status: Mapped[str | None] = mapped_column(GoalStatus, nullable=True)
+    resulting_goal_status: Mapped[str | None] = mapped_column(GoalStatus, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 

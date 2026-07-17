@@ -32,6 +32,9 @@ from agentic_os.domain.models import (
     Credential,
     CostLedgerEntry,
     Goal,
+    GoalLifecycleCommand,
+    GoalLifecycleEvent,
+    GoalSteeringRequest,
     McpServer,
     McpServerVersion,
     ModelProfile,
@@ -46,6 +49,8 @@ from agentic_os.domain.models import (
     SkillVersion,
     Task,
     TaskDependency,
+    TaskGraphRevision,
+    TaskGraphRevisionTask,
     Team,
     TeamMembership,
     TelemetryExportAttempt,
@@ -111,8 +116,13 @@ class DomainMigrationTests(unittest.TestCase):
             "projects",
             "project_members",
             "goals",
+            "goal_lifecycle_commands",
+            "goal_lifecycle_events",
+            "goal_steering_requests",
             "tasks",
             "task_dependencies",
+            "task_graph_revisions",
+            "task_graph_revision_tasks",
             "runs",
             "agents",
             "agent_versions",
@@ -168,6 +178,329 @@ class DomainMigrationTests(unittest.TestCase):
 
             count = session.execute(text("SELECT count(*) FROM teams")).scalar_one()
             self.assertGreaterEqual(count, 2)
+
+    def test_goal_controls_and_graph_revisions_survive_session_restart(self) -> None:
+        now = datetime.now(UTC)
+        with self.Session() as session:
+            team = Team(name="Lifecycle Team")
+            operator = User(
+                email=f"lifecycle-{uuid.uuid4()}@example.test",
+                display_name="Lifecycle Operator",
+            )
+            session.add_all([team, operator])
+            session.flush()
+            session.add(TeamMembership(team_id=team.id, user_id=operator.id))
+            project = Project(
+                team_id=team.id,
+                created_by=operator.id,
+                name="Lifecycle Project",
+            )
+            session.add(project)
+            session.flush()
+            goal = Goal(
+                project_id=project.id,
+                created_by=operator.id,
+                title="Durably steer this goal",
+                status="active",
+                active_graph_revision_number=1,
+            )
+            session.add(goal)
+            session.flush()
+
+            original_task = Task(
+                goal_id=goal.id,
+                created_by=operator.id,
+                title="Original unfinished task",
+                status="running",
+            )
+            session.add(original_task)
+            session.flush()
+            initial_revision = TaskGraphRevision(
+                goal_id=goal.id,
+                created_by=operator.id,
+                revision_number=1,
+                graph_snapshot={"tasks": [str(original_task.id)], "dependencies": []},
+            )
+            session.add(initial_revision)
+            session.flush()
+            session.add(
+                TaskGraphRevisionTask(
+                    revision_id=initial_revision.id,
+                    task_id=original_task.id,
+                    change_type="added",
+                    task_snapshot={
+                        "title": original_task.title,
+                        "status": original_task.status,
+                    },
+                )
+            )
+
+            model_profile = ModelProfile(
+                team_id=team.id,
+                created_by=operator.id,
+                name="lifecycle-model",
+                base_url="https://example.test/v1",
+                model_identifier="test-model",
+                api_key_ciphertext="encrypted",
+            )
+            agent = Agent(
+                team_id=team.id,
+                created_by=operator.id,
+                name="Lifecycle Agent",
+            )
+            session.add_all([model_profile, agent])
+            session.flush()
+            agent_version = AgentVersion(
+                agent_id=agent.id,
+                version_number=1,
+                capability_manifest={"capabilities": ["lifecycle"]},
+                model_profile_id=model_profile.id,
+            )
+            session.add(agent_version)
+            session.flush()
+            original_run = Run(
+                task_id=original_task.id,
+                attempt_number=1,
+                idempotency_key=f"{original_task.id}:1",
+                lease_token=1,
+                agent_version_id=agent_version.id,
+                status="running",
+            )
+            session.add(original_run)
+            session.flush()
+            original_artifact = Artifact(
+                project_id=project.id,
+                goal_id=goal.id,
+                task_id=original_task.id,
+                run_id=original_run.id,
+                created_by=operator.id,
+                name="partial.md",
+            )
+            session.add(original_artifact)
+            session.flush()
+            original_artifact_version = ArtifactVersion(
+                artifact_id=original_artifact.id,
+                version_number=1,
+                content_hash="sha256:" + "7" * 64,
+                storage_ref="local://partial.md",
+            )
+            session.add(original_artifact_version)
+
+            cancel_command = GoalLifecycleCommand(
+                goal_id=goal.id,
+                requested_by=operator.id,
+                command_type="cancel",
+                status="applied",
+                idempotency_key=f"{goal.id}:cancel:1",
+                reason="Operator stopped the goal",
+                prior_goal_status="active",
+                target_goal_status="cancelled",
+                cancellation_grace_expires_at=now + timedelta(seconds=30),
+                forced_termination_requested_at=now + timedelta(seconds=31),
+                forced_termination_completed_at=now + timedelta(seconds=32),
+                applied_at=now + timedelta(seconds=1),
+                evidence={"authorization": "team_member", "safe_boundary": "checkpoint"},
+            )
+            session.add(cancel_command)
+            session.flush()
+            goal.control_version = 1
+            goal.pending_control = "cancel"
+            goal.control_requested_by = operator.id
+            goal.control_requested_at = now
+            goal.cancellation_grace_expires_at = cancel_command.cancellation_grace_expires_at
+            goal.forced_termination_requested_at = (
+                cancel_command.forced_termination_requested_at
+            )
+            goal.forced_termination_completed_at = (
+                cancel_command.forced_termination_completed_at
+            )
+            session.add(
+                GoalLifecycleEvent(
+                    goal_id=goal.id,
+                    actor_id=operator.id,
+                    lifecycle_command_id=cancel_command.id,
+                    event_type="goal.cancel.requested",
+                    prior_goal_status="active",
+                    resulting_goal_status="active",
+                    payload={"control_version": 1},
+                )
+            )
+
+            steering_request = GoalSteeringRequest(
+                goal_id=goal.id,
+                requested_by=operator.id,
+                status="applied",
+                idempotency_key=f"{goal.id}:steer:1",
+                instruction="Replace the unfinished task with a safer plan",
+                base_revision_number=1,
+                applied_revision_number=2,
+                resolved_at=now + timedelta(seconds=2),
+                evidence={"authorization": "team_member"},
+            )
+            session.add(steering_request)
+            session.flush()
+            replacement_task = Task(
+                goal_id=goal.id,
+                created_by=operator.id,
+                title="Replacement planned task",
+                status="pending",
+            )
+            session.add(replacement_task)
+            session.flush()
+            revised_graph = TaskGraphRevision(
+                goal_id=goal.id,
+                created_by=operator.id,
+                steering_request_id=steering_request.id,
+                revision_number=2,
+                parent_revision_number=1,
+                change_summary="Supersede unfinished work without rewriting its attempt",
+                graph_snapshot={
+                    "tasks": [str(replacement_task.id)],
+                    "dependencies": [],
+                },
+                assignment_evidence={"state": "unassigned"},
+                policy_context={"policy_version_ids": []},
+                budget_context={"inherited": True},
+            )
+            session.add(revised_graph)
+            session.flush()
+            session.add(
+                TaskGraphRevisionTask(
+                    revision_id=revised_graph.id,
+                    task_id=replacement_task.id,
+                    change_type="revised",
+                    supersedes_task_id=original_task.id,
+                    task_snapshot={
+                        "title": replacement_task.title,
+                        "status": replacement_task.status,
+                    },
+                )
+            )
+            goal.active_graph_revision_number = 2
+            session.add_all(
+                [
+                    GoalLifecycleEvent(
+                        goal_id=goal.id,
+                        actor_id=operator.id,
+                        steering_request_id=steering_request.id,
+                        event_type="goal.steering.applied",
+                        prior_goal_status="active",
+                        resulting_goal_status="active",
+                        payload={"revision_number": 2},
+                    ),
+                    GoalLifecycleEvent(
+                        goal_id=goal.id,
+                        actor_id=operator.id,
+                        lifecycle_command_id=cancel_command.id,
+                        graph_revision_id=revised_graph.id,
+                        event_type="goal.cancel.forced_termination_completed",
+                        prior_goal_status="active",
+                        resulting_goal_status="cancelled",
+                        payload={"control_version": 1},
+                    ),
+                ]
+            )
+            goal.status = "cancelled"
+            goal.pending_control = None
+            session.commit()
+
+            goal_id = goal.id
+            operator_id = operator.id
+            original_task_id = original_task.id
+            original_run_id = original_run.id
+            original_artifact_version_id = original_artifact_version.id
+
+        # A new session represents the durable restart/recovery boundary.
+        with self.Session() as session:
+            persisted_goal = session.get(Goal, goal_id)
+            self.assertIsNotNone(persisted_goal)
+            self.assertEqual(persisted_goal.status, "cancelled")
+            self.assertEqual(persisted_goal.control_version, 1)
+            self.assertEqual(persisted_goal.active_graph_revision_number, 2)
+            self.assertIsNotNone(persisted_goal.forced_termination_completed_at)
+
+            revisions = session.execute(
+                text(
+                    "SELECT revision_number FROM task_graph_revisions "
+                    "WHERE goal_id = :goal_id ORDER BY revision_number"
+                ),
+                {"goal_id": goal_id},
+            ).scalars().all()
+            self.assertEqual(revisions, [1, 2])
+
+            event_rows = session.execute(
+                text(
+                    "SELECT actor_id, event_type, sequence_number "
+                    "FROM goal_lifecycle_events WHERE goal_id = :goal_id "
+                    "ORDER BY sequence_number"
+                ),
+                {"goal_id": goal_id},
+            ).all()
+            self.assertEqual(
+                [row.event_type for row in event_rows],
+                [
+                    "goal.cancel.requested",
+                    "goal.steering.applied",
+                    "goal.cancel.forced_termination_completed",
+                ],
+            )
+            self.assertTrue(all(row.actor_id == operator_id for row in event_rows))
+            self.assertEqual(
+                [row.sequence_number for row in event_rows],
+                sorted(row.sequence_number for row in event_rows),
+            )
+
+            # Superseding unfinished work records a new graph entry; it never
+            # rewrites the original task, attempt, or immutable artifact version.
+            self.assertEqual(session.get(Task, original_task_id).status, "running")
+            self.assertEqual(session.get(Run, original_run_id).attempt_number, 1)
+            self.assertEqual(
+                session.get(ArtifactVersion, original_artifact_version_id).content_hash,
+                "sha256:" + "7" * 64,
+            )
+
+    def test_goal_control_and_steering_idempotency_is_enforced(self) -> None:
+        with self.Session() as session:
+            team = Team(name="Lifecycle Idempotency Team")
+            operator = User(
+                email=f"lifecycle-idempotency-{uuid.uuid4()}@example.test",
+                display_name="Lifecycle Operator",
+            )
+            session.add_all([team, operator])
+            session.flush()
+            project = Project(
+                team_id=team.id,
+                created_by=operator.id,
+                name="Lifecycle Idempotency Project",
+            )
+            session.add(project)
+            session.flush()
+            goal = Goal(
+                project_id=project.id,
+                created_by=operator.id,
+                title="Idempotent controls",
+                status="active",
+            )
+            session.add(goal)
+            session.flush()
+            session.add_all(
+                [
+                    GoalLifecycleCommand(
+                        goal_id=goal.id,
+                        requested_by=operator.id,
+                        command_type="pause",
+                        idempotency_key="same-command",
+                    ),
+                    GoalLifecycleCommand(
+                        goal_id=goal.id,
+                        requested_by=operator.id,
+                        command_type="pause",
+                        idempotency_key="same-command",
+                    ),
+                ]
+            )
+            with self.assertRaises(IntegrityError):
+                session.commit()
 
     def test_observability_records_link_canonical_evidence_and_export_states(self) -> None:
         with self.Session() as session:

@@ -1,8 +1,7 @@
-"""Repository-local factories for multi-user/team test scenarios.
+"""Repository-local factories for durable domain test scenarios.
 
-Sprint 8 (team access and resource sharing) needs several tests to set up
-more than one user, team, or team membership. These helpers centralize that
-setup so individual test modules do not each hand-roll the same boilerplate.
+These helpers centralize common multi-user, lifecycle-control, and graph
+revision setup so individual test modules do not hand-roll the same records.
 """
 
 from __future__ import annotations
@@ -12,7 +11,17 @@ from typing import Iterable
 
 from sqlalchemy.orm import Session
 
-from agentic_os.domain.models import Project, ProjectMember, Team, TeamMembership, User
+from agentic_os.domain.models import (
+    Goal,
+    GoalLifecycleCommand,
+    GoalSteeringRequest,
+    Project,
+    ProjectMember,
+    TaskGraphRevision,
+    Team,
+    TeamMembership,
+    User,
+)
 
 
 def make_team(session: Session, *, name: str | None = None) -> Team:
@@ -53,6 +62,92 @@ def make_project(session: Session, team: Team, creator: User, *, name: str = "Pr
     session.add(project)
     session.flush()
     return project
+
+
+def make_goal(
+    session: Session,
+    project: Project,
+    creator: User,
+    *,
+    title: str = "Goal",
+    status: str = "active",
+) -> Goal:
+    goal = Goal(
+        project_id=project.id,
+        created_by=creator.id,
+        title=title,
+        status=status,
+    )
+    session.add(goal)
+    session.flush()
+    return goal
+
+
+def make_lifecycle_command(
+    session: Session,
+    goal: Goal,
+    actor: User,
+    *,
+    command_type: str,
+    idempotency_key: str | None = None,
+) -> GoalLifecycleCommand:
+    command = GoalLifecycleCommand(
+        goal_id=goal.id,
+        requested_by=actor.id,
+        command_type=command_type,
+        idempotency_key=idempotency_key or f"{goal.id}:{command_type}:{uuid.uuid4()}",
+        prior_goal_status=goal.status,
+    )
+    session.add(command)
+    session.flush()
+    return command
+
+
+def make_steering_request(
+    session: Session,
+    goal: Goal,
+    actor: User,
+    *,
+    instruction: str = "Revise the unfinished work",
+    base_revision_number: int | None = None,
+    idempotency_key: str | None = None,
+) -> GoalSteeringRequest:
+    request = GoalSteeringRequest(
+        goal_id=goal.id,
+        requested_by=actor.id,
+        instruction=instruction,
+        base_revision_number=(
+            goal.active_graph_revision_number
+            if base_revision_number is None
+            else base_revision_number
+        ),
+        idempotency_key=idempotency_key or f"{goal.id}:steer:{uuid.uuid4()}",
+    )
+    session.add(request)
+    session.flush()
+    return request
+
+
+def make_task_graph_revision(
+    session: Session,
+    goal: Goal,
+    actor: User,
+    *,
+    revision_number: int,
+    parent_revision_number: int | None = None,
+    steering_request: GoalSteeringRequest | None = None,
+) -> TaskGraphRevision:
+    revision = TaskGraphRevision(
+        goal_id=goal.id,
+        created_by=actor.id,
+        steering_request_id=steering_request.id if steering_request is not None else None,
+        revision_number=revision_number,
+        parent_revision_number=parent_revision_number,
+        graph_snapshot={"tasks": [], "dependencies": []},
+    )
+    session.add(revision)
+    session.flush()
+    return revision
 
 
 def make_project_member(
