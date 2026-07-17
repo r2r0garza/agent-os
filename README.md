@@ -137,6 +137,14 @@ plus the manual end-to-end smoke sequence (setup → submit governed goal →
 restart → recover → backup → restore → preflight/upgrade) and the frontend
 operational views that surface it.
 
+## Team VM deployment topology
+
+See [docs/team-vm-deployment.md](docs/team-vm-deployment.md) for the Sprint 10
+cloud-VM/team deployment topology: how the local Compose roles map onto a
+shared team VM, the TLS/proxy edge, ports, durable volume/secret boundaries,
+restart ordering, and independently scaled workers that subsequent Sprint 10
+issues implement against.
+
 ## Deterministic code index
 
 The committed `.code-index/` covers tracked Python backend and TypeScript/TSX or
