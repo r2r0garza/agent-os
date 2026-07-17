@@ -42,6 +42,7 @@ import { AccessWorkspace } from "@/components/access-workspace"
 import { AdminConcurrentHealth } from "@/components/admin-concurrent-health"
 import { ArtifactWorkspace } from "@/components/artifact-workspace"
 import { ConcurrentWorkspacePanel } from "@/components/concurrent-workspace-panel"
+import { CapabilityLifecycleWorkspace } from "@/components/capability-lifecycle-workspace"
 import { GoalLifecyclePanel } from "@/components/goal-lifecycle-panel"
 import { GovernanceOperations } from "@/components/governance-operations"
 import {
@@ -736,6 +737,13 @@ export function OperatorWorkspace() {
           skills={inventory.skills}
           servers={inventory.servers}
           onLookupsChange={setGovernanceLookups}
+        />
+
+        <CapabilityLifecycleWorkspace
+          agents={inventory.agents}
+          skills={inventory.skills}
+          servers={inventory.servers}
+          onInventoryRefresh={loadInventory}
         />
 
         <GovernanceOperations

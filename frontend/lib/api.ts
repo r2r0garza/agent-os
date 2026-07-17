@@ -275,8 +275,19 @@ export interface AgentVersion {
   default_budget_id: Identifier | null
   skill_attachments: VersionAttachment[]
   mcp_server_attachments: VersionAttachment[]
+  skill_grants: SkillGrant[]
+  mcp_tool_grants: McpToolGrant[]
   policy_set_version_ids: Identifier[]
   created_at: string
+}
+
+export interface SkillPackageResource {
+  path: string
+  content: string
+  media_type?: string | null
+  metadata: Record<string, unknown>
+  sha256?: string
+  size_bytes?: number
 }
 
 export interface Skill {
@@ -303,7 +314,57 @@ export interface SkillVersion {
   version_number: number
   content_ref: string
   resource_metadata: Record<string, unknown>
+  manifest: Record<string, unknown>
+  instructions: string | null
+  resources: SkillPackageResource[]
+  declared_capabilities: string[]
+  provenance: Record<string, unknown>
+  package_hash: string | null
+  validation_status: string
+  validation_diagnostics: Record<string, unknown>[]
   created_at: string
+}
+
+export interface SkillPackageExport {
+  format_version: number
+  name: string
+  manifest: Record<string, unknown>
+  instructions: string | null
+  resources: SkillPackageResource[]
+  declared_capabilities: string[]
+  provenance: Record<string, unknown>
+  package_hash: string | null
+  validation_status: string
+  validation_diagnostics: Record<string, unknown>[]
+}
+
+export interface SkillGrant {
+  version_id: Identifier
+  skill_id: Identifier
+  resource_paths: string[]
+  declared_capabilities: string[]
+  package_hash: string | null
+  provenance: Record<string, unknown>
+  policy_metadata: Record<string, unknown>
+  granted_by: Identifier | null
+  granted_at: string
+}
+
+export interface McpGrantedTool {
+  name: string
+  descriptor_hash: string
+  timeout_ms: number | null
+  output_limit_bytes: number | null
+}
+
+export interface McpToolGrant {
+  version_id: Identifier
+  mcp_server_id: Identifier
+  tools: McpGrantedTool[]
+  policy_metadata: Record<string, unknown>
+  credential_configured: boolean
+  granted_by: Identifier | null
+  granted_at: string
 }
 
 export interface McpServer {
@@ -324,6 +385,36 @@ export interface McpServerVersion {
   credential_configured: boolean
   credential_id: Identifier | null
   created_at: string
+}
+
+export interface McpServerHealthCheck {
+  id: Identifier
+  mcp_server_version_id: Identifier
+  status: string
+  tool_count: number
+  latency_ms: number | null
+  request_metadata: Record<string, unknown>
+  diagnostics: Record<string, unknown>[]
+  checked_at: string
+  created_at: string
+}
+
+export interface McpServerTool {
+  id: Identifier
+  mcp_server_version_id: Identifier
+  tool_name: string
+  description: string | null
+  input_schema: Record<string, unknown>
+  schema_valid: boolean
+  schema_validation_errors: Record<string, unknown>[]
+  descriptor_hash: string
+  credential_scope_required: boolean
+  enabled: boolean
+  timeout_ms: number | null
+  output_limit_bytes: number | null
+  last_discovered_at: string
+  created_at: string
+  updated_at: string
 }
 
 export interface McpServerAttachment {
@@ -436,8 +527,21 @@ export interface RunSnapshot {
   default_budget_id?: Identifier | null
   skill_version_ids?: Identifier[]
   skill_version_id?: Identifier | null
+  skill_resource_grants?: Array<{
+    skill_version_id: Identifier
+    resource_paths: string[]
+    package_hash: string | null
+    declared_capabilities: string[]
+    grant_type: string
+  }>
   mcp_server_version_ids?: Identifier[]
   mcp_server_version_id?: Identifier | null
+  mcp_tool_grants?: Array<{
+    mcp_server_version_id: Identifier
+    descriptor_hashes: Record<string, string | null>
+    credential_configured: boolean
+    grant_type: string
+  }>
   enabled_tools?: string[]
   policy_decision?: string
   policy_evaluations?: Record<string, unknown>[]
@@ -749,10 +853,20 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     let message = `Request failed (${response.status})`
     try {
       const body = (await response.json()) as {
-        detail?: string
+        detail?: string | { code?: string; diagnostics?: Array<{ code?: string }> }
         error?: string
       }
-      message = body.detail ?? body.error ?? message
+      if (typeof body.detail === "string") {
+        message = body.detail
+      } else if (body.detail) {
+        const diagnostics = body.detail.diagnostics
+          ?.map((item) => item.code)
+          .filter(Boolean)
+          .join(", ")
+        message = [body.detail.code, diagnostics].filter(Boolean).join(": ") || message
+      } else {
+        message = body.error ?? message
+      }
     } catch {
       // Preserve the status-based fallback for non-JSON upstream responses.
     }

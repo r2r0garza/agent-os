@@ -259,8 +259,29 @@ def _execute_claimed_task(
         "default_budget_id": configuration["budget"]["id"] if configuration["budget"] else None,
         "skill_version_ids": [item["id"] for item in skills],
         "skill_version_id": skills[0]["id"] if len(skills) == 1 else None,
+        "skill_resource_grants": [
+            {
+                "skill_version_id": item["id"],
+                "resource_paths": item.get("resource_paths", []),
+                "package_hash": item.get("package_hash"),
+                "declared_capabilities": item.get("declared_capabilities", []),
+                "grant_type": item.get("grant_type"),
+            }
+            for item in skills
+            if item.get("grant_type") == "skill_resources"
+        ],
         "mcp_server_version_ids": [item["id"] for item in mcp_servers],
         "mcp_server_version_id": mcp_servers[0]["id"] if len(mcp_servers) == 1 else None,
+        "mcp_tool_grants": [
+            {
+                "mcp_server_version_id": item["id"],
+                "descriptor_hashes": item.get("pinned_tool_descriptor_hashes", {}),
+                "credential_configured": item.get("credential_configured", False),
+                "grant_type": item.get("grant_type"),
+            }
+            for item in mcp_servers
+            if item.get("grant_type") == "mcp_tools"
+        ],
         "enabled_tools": enabled_tools,
         "policy_decision": policy_decision,
         "policy_evaluations": policy_evaluations,

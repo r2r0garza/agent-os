@@ -123,6 +123,53 @@ describe("RunEvidencePanel model invocation evidence", () => {
     expect(screen.getByText(/prompt tokens: 12/)).toBeInTheDocument()
   })
 
+  it("shows pinned package resources, descriptor hashes, and rejected tool diagnostics", async () => {
+    installFetchMock(
+      emptyEvidence({
+        audit_events: [
+          makeAuditEvent({
+            event_type: "tool.rejected",
+            payload: { tool: "echo", reason_code: "mcp_health_degraded" },
+          }),
+        ],
+      })
+    )
+    const user = userEvent.setup()
+    render(
+      <RunEvidencePanel
+        run={makeRun({
+          snapshot: {
+            agent_version_number: 2,
+            skill_version_ids: ["skill-version-1"],
+            skill_resource_grants: [{
+              skill_version_id: "skill-version-1",
+              resource_paths: ["references/guide.md"],
+              package_hash: "a".repeat(64),
+              declared_capabilities: ["research"],
+              grant_type: "skill_resources",
+            }],
+            mcp_server_version_ids: ["mcp-version-1"],
+            mcp_tool_grants: [{
+              mcp_server_version_id: "mcp-version-1",
+              descriptor_hashes: { echo: "d".repeat(64) },
+              credential_configured: true,
+              grant_type: "mcp_tools",
+            }],
+            enabled_tools: ["echo"],
+          },
+        })}
+        agents={[]}
+        lookups={lookups}
+      />
+    )
+
+    await user.click(screen.getByRole("button", { name: /View pinned snapshot/ }))
+    expect(await screen.findByText(/Granted skill resources:/)).toBeInTheDocument()
+    expect(screen.getByText(/references\/guide.md · package aaaaaaaaaaaa/)).toBeInTheDocument()
+    expect(screen.getByText(/echo dddddddddddd/)).toBeInTheDocument()
+    expect(screen.getByText(/tool.rejected · mcp_health_degraded/)).toBeInTheDocument()
+  })
+
   it("surfaces a failed model invocation with its diagnostic", async () => {
     installFetchMock(
       emptyEvidence({

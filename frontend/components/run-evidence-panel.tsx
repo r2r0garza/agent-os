@@ -34,6 +34,8 @@ const ENFORCEMENT_EVENT_TYPES = new Set([
 const EVIDENCE_EVENT_TYPES = new Set([
   ...ENFORCEMENT_EVENT_TYPES,
   "tool.invoked",
+  "tool.rejected",
+  "tool.output_truncated",
   "skill.invoked",
 ])
 const HARNESS_EVENT_TYPES = new Set([
@@ -263,6 +265,27 @@ export function RunEvidencePanel({
                   </Badge>
                 ) : null}
               </div>
+              {(snapshot.skill_resource_grants?.length ||
+                snapshot.mcp_tool_grants?.length) ? (
+                <div className="mt-2 grid gap-1 rounded-md border p-2">
+                  {(snapshot.skill_resource_grants ?? []).map((grant) => (
+                    <div key={grant.skill_version_id}>
+                      <span className="font-medium">Granted skill resources:</span>{" "}
+                      {grant.resource_paths.join(", ") || "none"} · package{" "}
+                      {grant.package_hash?.slice(0, 12) ?? "hash unavailable"}
+                    </div>
+                  ))}
+                  {(snapshot.mcp_tool_grants ?? []).map((grant) => (
+                    <div key={grant.mcp_server_version_id}>
+                      <span className="font-medium">Granted MCP descriptors:</span>{" "}
+                      {Object.entries(grant.descriptor_hashes)
+                        .map(([name, hash]) => `${name} ${hash?.slice(0, 12) ?? "hash unavailable"}`)
+                        .join(", ") || "none"}{" "}
+                      · credential {grant.credential_configured ? "scoped" : "not configured"}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
 
             {snapshot.model_profile_version_id ? (
@@ -393,6 +416,7 @@ export function RunEvidencePanel({
                     )
                     const denied =
                       decision === "deny" ||
+                      event.event_type === "tool.rejected" ||
                       event.event_type === "budget.exhausted" ||
                       event.event_type === "workspace.promotion_denied" ||
                       event.event_type === "workspace.promotion_conflict"
@@ -418,6 +442,9 @@ export function RunEvidencePanel({
                           />
                           {event.event_type}
                           {decision ? ` · ${decision}` : ""}
+                          {event.event_type === "tool.rejected" && event.payload.reason_code
+                            ? ` · ${String(event.payload.reason_code)}`
+                            : ""}
                         </span>
                         <span className="text-muted-foreground">
                           {displayDate(event.occurred_at)}

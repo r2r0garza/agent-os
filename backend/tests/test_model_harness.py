@@ -515,6 +515,29 @@ class ModelHarnessTestCase(unittest.TestCase):
         with self.Session() as session:
             run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
             self.assertEqual(run.status, "completed")
+            self.assertEqual(
+                run.snapshot["skill_resource_grants"],
+                [
+                    {
+                        "skill_version_id": run.snapshot["skill_version_ids"][0],
+                        "resource_paths": ["notes/granted.md"],
+                        "package_hash": "sha256:test-package",
+                        "declared_capabilities": [],
+                        "grant_type": "skill_resources",
+                    }
+                ],
+            )
+            self.assertEqual(
+                run.snapshot["mcp_tool_grants"],
+                [
+                    {
+                        "mcp_server_version_id": run.snapshot["mcp_server_version_ids"][0],
+                        "descriptor_hashes": {"echo": "sha256:echo-fixture"},
+                        "credential_configured": False,
+                        "grant_type": "mcp_tools",
+                    }
+                ],
+            )
 
     def test_harness_tool_dispatch_fails_closed_when_granted_tool_disabled(self) -> None:
         mcp_tool_grant = {
