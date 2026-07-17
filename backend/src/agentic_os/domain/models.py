@@ -704,7 +704,13 @@ class Skill(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 class SkillVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     __tablename__ = "skill_versions"
-    __table_args__ = (UniqueConstraint("skill_id", "version_number", name="uq_skill_versions_skill_version"),)
+    __table_args__ = (
+        UniqueConstraint("skill_id", "version_number", name="uq_skill_versions_skill_version"),
+        CheckConstraint(
+            "validation_status IN ('legacy', 'valid')",
+            name="valid_validation_status",
+        ),
+    )
 
     skill_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("skills.id", ondelete="CASCADE"), nullable=False
@@ -712,6 +718,20 @@ class SkillVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     content_ref: Mapped[str] = mapped_column(Text, nullable=False)
     resource_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    package_manifest: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resources: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    declared_capabilities: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    package_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    validation_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="legacy"
+    )
+    validation_diagnostics: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
 
 
 class SkillInstallation(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):

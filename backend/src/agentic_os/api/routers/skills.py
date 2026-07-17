@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,6 +19,10 @@ from agentic_os.api.authorization import (
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.domain.models import AgentVersionSkill, Skill, SkillInstallation, SkillVersion, User
+from agentic_os.skill_packages import (
+    redact_skill_package_export,
+    validate_and_normalize_skill_package,
+)
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
@@ -57,9 +62,21 @@ class SkillInstallationRead(BaseModel):
     created_at: datetime
 
 
+class SkillPackageResource(BaseModel):
+    path: str
+    content: str
+    media_type: str | None = None
+    metadata: dict = Field(default_factory=dict)
+
+
 class SkillVersionCreate(BaseModel):
-    content_ref: str
+    content_ref: str | None = None
     resource_metadata: dict = Field(default_factory=dict)
+    manifest: dict | None = None
+    instructions: str | None = None
+    resources: list[SkillPackageResource] | None = None
+    declared_capabilities: list[str] | None = None
+    provenance: dict = Field(default_factory=dict)
 
 
 class SkillVersionRead(BaseModel):
@@ -70,7 +87,28 @@ class SkillVersionRead(BaseModel):
     version_number: int
     content_ref: str
     resource_metadata: dict
+    manifest: dict
+    instructions: str | None
+    resources: list[dict]
+    declared_capabilities: list[str]
+    provenance: dict
+    package_hash: str | None
+    validation_status: str
+    validation_diagnostics: list[dict]
     created_at: datetime
+
+
+class SkillPackageExport(BaseModel):
+    format_version: int = 1
+    name: str
+    manifest: dict
+    instructions: str | None
+    resources: list[dict]
+    declared_capabilities: list[str]
+    provenance: dict
+    package_hash: str | None
+    validation_status: str
+    validation_diagnostics: list[dict]
 
 
 def _version_to_read(version: SkillVersion) -> SkillVersionRead:
@@ -80,6 +118,14 @@ def _version_to_read(version: SkillVersion) -> SkillVersionRead:
         version_number=version.version_number,
         content_ref=version.content_ref,
         resource_metadata=redact_mapping(version.resource_metadata),
+        manifest=redact_mapping(version.package_manifest),
+        instructions=version.instructions,
+        resources=redact_mapping(version.resources),
+        declared_capabilities=version.declared_capabilities,
+        provenance=redact_mapping(version.provenance),
+        package_hash=version.package_hash,
+        validation_status=version.validation_status,
+        validation_diagnostics=version.validation_diagnostics,
         created_at=version.created_at,
     )
 
@@ -218,6 +264,14 @@ def install_skill_version(
         version_number=1,
         content_ref=source_version.content_ref,
         resource_metadata=source_version.resource_metadata,
+        package_manifest=source_version.package_manifest,
+        instructions=source_version.instructions,
+        resources=source_version.resources,
+        declared_capabilities=source_version.declared_capabilities,
+        provenance=source_version.provenance,
+        package_hash=source_version.package_hash,
+        validation_status=source_version.validation_status,
+        validation_diagnostics=source_version.validation_diagnostics,
     )
     session.add(installed_version)
     session.add(
@@ -255,6 +309,51 @@ def create_skill_version(
     actor: User = Depends(current_actor),
 ) -> SkillVersionRead:
     skill = _get_skill_for_mutation(session, actor, skill_id)
+    package_requested = any(
+        value is not None
+        for value in (
+            payload.manifest,
+            payload.instructions,
+            payload.resources,
+            payload.declared_capabilities,
+        )
+    )
+    package: dict[str, Any] | None = None
+    if package_requested:
+        package, diagnostics = validate_and_normalize_skill_package(
+            manifest=payload.manifest,
+            instructions=payload.instructions,
+            resources=(
+                [resource.model_dump() for resource in payload.resources]
+                if payload.resources is not None
+                else None
+            ),
+            declared_capabilities=payload.declared_capabilities,
+            provenance=payload.provenance,
+        )
+        if diagnostics:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_skill_package",
+                    "diagnostics": diagnostics,
+                },
+            )
+        assert package is not None
+    elif not payload.content_ref:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_skill_package",
+                "diagnostics": [
+                    {
+                        "code": "package_or_content_ref_required",
+                        "location": "body",
+                        "message": "provide a package manifest or a legacy content_ref",
+                    }
+                ],
+            },
+        )
     next_version = (
         session.execute(
             select(func.coalesce(func.max(SkillVersion.version_number), 0)).where(
@@ -266,8 +365,16 @@ def create_skill_version(
     version = SkillVersion(
         skill_id=skill.id,
         version_number=next_version,
-        content_ref=payload.content_ref,
+        content_ref=payload.content_ref or f"sha256:{package['package_hash']}",
         resource_metadata=payload.resource_metadata,
+        package_manifest=package["manifest"] if package else {},
+        instructions=package["instructions"] if package else None,
+        resources=package["resources"] if package else [],
+        declared_capabilities=package["declared_capabilities"] if package else [],
+        provenance=package["provenance"] if package else {},
+        package_hash=package["package_hash"] if package else None,
+        validation_status="valid" if package else "legacy",
+        validation_diagnostics=[],
     )
     session.add(version)
     session.flush()
@@ -304,3 +411,35 @@ def get_skill_version(
     if version is None:
         raise HTTPException(status_code=404, detail="skill version not found")
     return _version_to_read(version)
+
+
+@router.get(
+    "/{skill_id}/versions/{version_number}/export",
+    response_model=SkillPackageExport,
+)
+def export_skill_version(
+    skill_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> SkillPackageExport:
+    skill = _get_skill(session, actor, skill_id)
+    version = session.execute(
+        select(SkillVersion).where(
+            SkillVersion.skill_id == skill_id,
+            SkillVersion.version_number == version_number,
+        )
+    ).scalar_one_or_none()
+    if version is None:
+        raise HTTPException(status_code=404, detail="skill version not found")
+    return SkillPackageExport(
+        name=skill.name,
+        manifest=redact_skill_package_export(version.package_manifest),
+        instructions=version.instructions,
+        resources=redact_skill_package_export(version.resources),
+        declared_capabilities=version.declared_capabilities,
+        provenance=redact_skill_package_export(version.provenance),
+        package_hash=version.package_hash,
+        validation_status=version.validation_status,
+        validation_diagnostics=version.validation_diagnostics,
+    )

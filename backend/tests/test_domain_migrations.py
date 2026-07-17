@@ -180,6 +180,31 @@ class DomainMigrationTests(unittest.TestCase):
             count = session.execute(text("SELECT count(*) FROM teams")).scalar_one()
             self.assertGreaterEqual(count, 2)
 
+    def test_skill_versions_persist_governed_package_evidence(self) -> None:
+        with self.engine.connect() as connection:
+            columns = {
+                row[0]
+                for row in connection.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'skill_versions'"
+                    )
+                )
+            }
+        self.assertTrue(
+            {
+                "package_manifest",
+                "instructions",
+                "resources",
+                "declared_capabilities",
+                "provenance",
+                "package_hash",
+                "validation_status",
+                "validation_diagnostics",
+            }
+            <= columns
+        )
+
     def test_goal_controls_and_graph_revisions_survive_session_restart(self) -> None:
         now = datetime.now(UTC)
         with self.Session() as session:
