@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.bootstrap import ensure_default_team_membership
 from agentic_os.api.deps import get_session
 from agentic_os.domain.models import Project
 
@@ -32,8 +32,7 @@ class ProjectRead(BaseModel):
 
 @router.post("", response_model=ProjectRead, status_code=201)
 def create_project(payload: ProjectCreate, session: Session = Depends(get_session)) -> Project:
-    team = ensure_default_team(session)
-    user = ensure_default_user(session)
+    team, user = ensure_default_team_membership(session)
     project = Project(team_id=team.id, created_by=user.id, name=payload.name)
     session.add(project)
     session.flush()

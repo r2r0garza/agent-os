@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
 from agentic_os.api.deps import get_session
 from agentic_os.api.ownership import require_default_team_access, require_project_access
 from agentic_os.api.redaction import redact_mapping
@@ -55,8 +55,7 @@ def _get_policy_set(session: Session, policy_set_id: uuid.UUID) -> PolicySet:
 
 @router.post("", response_model=PolicySetRead, status_code=201)
 def create_policy_set(payload: PolicySetCreate, session: Session = Depends(get_session)) -> PolicySet:
-    team = ensure_default_team(session)
-    user = ensure_default_user(session)
+    team, user = ensure_default_team_membership(session)
     if payload.team_id is not None and payload.project_id is not None:
         raise HTTPException(status_code=422, detail="policy set must have exactly one owner scope")
     if payload.team_id is not None and payload.team_id != team.id:

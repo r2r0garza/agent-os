@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, SecretStr
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
 from agentic_os.api.deps import get_session
 from agentic_os.api.ownership import require_default_team_access, require_project_access
 from agentic_os.api.redaction import redact_mapping
@@ -47,8 +47,7 @@ def _to_read(credential: Credential) -> CredentialRead:
 
 @router.post("", response_model=CredentialRead, status_code=201)
 def create_credential(payload: CredentialCreate, session: Session = Depends(get_session)) -> CredentialRead:
-    team = ensure_default_team(session)
-    user = ensure_default_user(session)
+    team, user = ensure_default_team_membership(session)
     if payload.team_id is not None and payload.project_id is not None:
         raise HTTPException(status_code=422, detail="credential must have exactly one owner scope")
     if payload.team_id is not None and payload.team_id != team.id:

@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
 from agentic_os.api.deps import get_session
 from agentic_os.api.ownership import owner_team_id, require_default_team_access
 from agentic_os.api.redaction import redact_mapping
@@ -170,8 +170,7 @@ def _version_to_read(session: Session, version: AgentVersion) -> AgentVersionRea
 
 @router.post("", response_model=AgentRead, status_code=201)
 def create_agent(payload: AgentCreate, session: Session = Depends(get_session)) -> Agent:
-    team = ensure_default_team(session)
-    user = ensure_default_user(session)
+    team, user = ensure_default_team_membership(session)
     agent = Agent(team_id=team.id, created_by=user.id, name=payload.name, visibility=payload.visibility)
     session.add(agent)
     session.flush()

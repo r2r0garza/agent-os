@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
 from agentic_os.api.deps import get_session
 from agentic_os.api.ownership import require_default_team_access
 from agentic_os.api.redaction import redact_mapping
@@ -61,8 +61,7 @@ def _version_to_read(version: SkillVersion) -> SkillVersionRead:
 
 @router.post("", response_model=SkillRead, status_code=201)
 def create_skill(payload: SkillCreate, session: Session = Depends(get_session)) -> Skill:
-    team = ensure_default_team(session)
-    user = ensure_default_user(session)
+    team, user = ensure_default_team_membership(session)
     skill = Skill(team_id=team.id, created_by=user.id, name=payload.name, visibility=payload.visibility)
     session.add(skill)
     session.flush()

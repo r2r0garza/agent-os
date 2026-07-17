@@ -24,6 +24,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from agentic_os.domain.base import Base, CreatedAtMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
 UserRole = Enum("admin", "regular_user", name="user_role", validate_strings=True)
+TeamMemberRole = Enum("owner", "member", name="team_member_role", validate_strings=True)
 AgentVisibility = Enum("private", "team", "public", name="visibility", validate_strings=True)
 GoalStatus = Enum(
     "draft", "active", "paused", "completed", "cancelled", "failed", name="goal_status", validate_strings=True
@@ -101,6 +102,7 @@ class TeamMembership(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    role: Mapped[str] = mapped_column(TeamMemberRole, nullable=False, server_default="member")
 
 
 class Project(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -125,6 +127,9 @@ class ProjectMember(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class Goal(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -146,6 +151,9 @@ class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     goal_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("goals.id", ondelete="CASCADE"), nullable=False
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -355,6 +363,30 @@ class AgentVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     )
 
 
+class AgentInstallation(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    """Lineage record for an agent installed from a team-visible or public source version.
+
+    Installing pins an immutable source version into a new, independently
+    governed `Agent` row owned by the installing team; the source owner
+    cannot mutate the installed copy and the installer cannot edit the source.
+    """
+
+    __tablename__ = "agent_installations"
+    __table_args__ = (
+        UniqueConstraint("installed_agent_id", name="uq_agent_installations_installed_agent"),
+    )
+
+    installed_agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False
+    )
+    source_agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    installed_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
 class Skill(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "skills"
 
@@ -378,6 +410,30 @@ class SkillVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     content_ref: Mapped[str] = mapped_column(Text, nullable=False)
     resource_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+
+
+class SkillInstallation(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    """Lineage record for a skill installed from a team-visible or public source version.
+
+    Mirrors `AgentInstallation`: the installed skill is a new, independently
+    governed `Skill` row owned by the installing team, pinned to the source
+    version at install time.
+    """
+
+    __tablename__ = "skill_installations"
+    __table_args__ = (
+        UniqueConstraint("installed_skill_id", name="uq_skill_installations_installed_skill"),
+    )
+
+    installed_skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("skills.id", ondelete="CASCADE"), nullable=False
+    )
+    source_skill_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("skill_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    installed_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
 
 
 class AgentVersionSkill(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):

@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
 from agentic_os.api.deps import get_session
 from agentic_os.api.ownership import require_default_team_access
 from agentic_os.api.redaction import redact_mapping
@@ -118,8 +118,7 @@ def _profile_to_read(profile: ModelProfile) -> ModelProfileRead:
 
 @router.post("", response_model=ModelProfileRead, status_code=201)
 def create_model_profile(payload: ModelProfileCreate, session: Session = Depends(get_session)) -> ModelProfileRead:
-    team = ensure_default_team(session)
-    user = ensure_default_user(session)
+    team, user = ensure_default_team_membership(session)
     credential_id = payload.credential_id
     api_key_ciphertext = encrypt_secret("")
     if payload.api_key is not None:
