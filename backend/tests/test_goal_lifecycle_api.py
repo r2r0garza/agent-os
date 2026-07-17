@@ -13,7 +13,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from sqlalchemy import create_engine, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
-from agentic_os.domain.models import GoalLifecycleEvent, Task, TaskGraphRevisionTask
+from agentic_os.domain.models import (
+    GoalLifecycleEvent,
+    GoalSteeringRequest,
+    Task,
+    TaskDependency,
+    TaskGraphRevision,
+    TaskGraphRevisionTask,
+)
 from factories import (
     make_goal,
     make_project,
@@ -254,6 +261,225 @@ class GoalLifecycleApiTests(unittest.TestCase):
             f"/api/v1/goals/{self.goal.id}/graph-revisions/999", headers=self._headers(self.owner)
         )
         self.assertEqual(missing.status_code, 404)
+
+    def test_apply_steering_adds_and_revises_tasks_as_a_durable_revision(self) -> None:
+        with SessionLocal.begin() as session:
+            research = Task(
+                goal_id=self.goal.id,
+                created_by=self.owner.id,
+                title="Research",
+                status="completed",
+                policy_ids=[],
+            )
+            draft = Task(
+                goal_id=self.goal.id,
+                created_by=self.owner.id,
+                title="Draft",
+                status="ready",
+                required_capabilities={"writing": True},
+                policy_ids=[],
+                assignment_status="assigned",
+                assignment_rationale={"reason": "best writer"},
+            )
+            publish = Task(
+                goal_id=self.goal.id,
+                created_by=self.owner.id,
+                title="Publish",
+                status="blocked",
+                policy_ids=[],
+            )
+            session.add_all([research, draft, publish])
+            session.flush()
+            session.add_all(
+                [
+                    TaskDependency(task_id=draft.id, depends_on_task_id=research.id),
+                    TaskDependency(task_id=publish.id, depends_on_task_id=draft.id),
+                ]
+            )
+            session.flush()
+            research_id = research.id
+            draft_id = draft.id
+            publish_id = publish.id
+
+        steer = client.post(
+            f"/api/v1/goals/{self.goal.id}/steer",
+            json={"instruction": "Revise the draft and add a review before publishing"},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(steer.status_code, 201, steer.text)
+        request_id = steer.json()["id"]
+        apply = client.post(
+            f"/api/v1/goals/{self.goal.id}/steering-requests/{request_id}/apply",
+            json={
+                "change_summary": "Revise draft and insert review",
+                "changes": [
+                    {
+                        "change_type": "revised",
+                        "task_id": str(draft_id),
+                        "task": {
+                            "client_id": "revised-draft",
+                            "title": "Revised draft",
+                            "required_capabilities": {"writing": True},
+                        },
+                    },
+                    {
+                        "change_type": "added",
+                        "task": {
+                            "client_id": "review",
+                            "title": "Review revised draft",
+                            "depends_on": ["revised-draft"],
+                        },
+                    },
+                ],
+            },
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(apply.status_code, 201, apply.text)
+        body = apply.json()
+        self.assertEqual(body["revision_number"], 1)
+        self.assertEqual(body["parent_revision_number"], 0)
+        self.assertEqual(body["created_by"], str(self.owner.id))
+        self.assertEqual(
+            {entry["change_type"] for entry in body["tasks"]},
+            {"added", "revised", "superseded"},
+        )
+
+        with SessionLocal() as session:
+            request = session.get(GoalSteeringRequest, uuid.UUID(request_id))
+            revision = session.execute(
+                select(TaskGraphRevision).where(
+                    TaskGraphRevision.steering_request_id == request.id
+                )
+            ).scalar_one()
+            goal = session.get(type(self.goal), self.goal.id)
+            old_draft = session.get(Task, draft_id)
+            revised_draft = session.execute(
+                select(Task).where(
+                    Task.goal_id == self.goal.id,
+                    Task.title == "Revised draft",
+                )
+            ).scalar_one()
+            review = session.execute(
+                select(Task).where(
+                    Task.goal_id == self.goal.id,
+                    Task.title == "Review revised draft",
+                )
+            ).scalar_one()
+            dependencies = {
+                (row.task_id, row.depends_on_task_id)
+                for row in session.execute(select(TaskDependency)).scalars()
+            }
+
+            self.assertEqual(request.status, "applied")
+            self.assertEqual(request.applied_revision_number, 1)
+            self.assertEqual(goal.active_graph_revision_number, 1)
+            self.assertEqual(old_draft.status, "cancelled")
+            self.assertEqual(revised_draft.assignment_status, "unassigned")
+            self.assertEqual(
+                revision.assignment_evidence[str(draft_id)]["assignment_rationale"],
+                {"reason": "best writer"},
+            )
+            self.assertFalse(
+                revision.assignment_evidence[str(draft_id)]["effective"]
+            )
+            self.assertEqual(
+                revision.assignment_evidence[str(draft_id)]["replacement_task_id"],
+                str(revised_draft.id),
+            )
+            self.assertIn((revised_draft.id, research_id), dependencies)
+            self.assertIn((review.id, revised_draft.id), dependencies)
+            self.assertIn((publish_id, revised_draft.id), dependencies)
+            self.assertNotIn((publish_id, draft_id), dependencies)
+            self.assertIn(str(revised_draft.id), revision.assignment_evidence)
+            self.assertIn(str(review.id), revision.policy_context)
+            self.assertIn(str(review.id), revision.budget_context)
+
+        replay = client.post(
+            f"/api/v1/goals/{self.goal.id}/steering-requests/{request_id}/apply",
+            json={
+                "change_summary": "Ignored replay payload",
+                "changes": [
+                    {
+                        "change_type": "added",
+                        "task": {"client_id": "ignored", "title": "Ignored"},
+                    }
+                ],
+            },
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(replay.status_code, 201, replay.text)
+        self.assertEqual(replay.json()["id"], body["id"])
+
+    def test_apply_steering_rejects_completed_task_mutation(self) -> None:
+        with SessionLocal.begin() as session:
+            completed = Task(
+                goal_id=self.goal.id,
+                created_by=self.owner.id,
+                title="Immutable completed work",
+                status="completed",
+            )
+            session.add(completed)
+            session.flush()
+            completed_id = completed.id
+
+        steer = client.post(
+            f"/api/v1/goals/{self.goal.id}/steer",
+            json={"instruction": "Replace completed work"},
+            headers=self._headers(self.owner),
+        )
+        response = client.post(
+            (
+                f"/api/v1/goals/{self.goal.id}/steering-requests/"
+                f"{steer.json()['id']}/apply"
+            ),
+            json={
+                "change_summary": "Attempt unsafe rewrite",
+                "changes": [
+                    {
+                        "change_type": "superseded",
+                        "task_id": str(completed_id),
+                    }
+                ],
+            },
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        with SessionLocal() as session:
+            self.assertEqual(session.get(Task, completed_id).status, "completed")
+            request = session.get(GoalSteeringRequest, uuid.UUID(steer.json()["id"]))
+            self.assertEqual(request.status, "requested")
+
+    def test_apply_steering_rejects_stale_base_revision(self) -> None:
+        steer = client.post(
+            f"/api/v1/goals/{self.goal.id}/steer",
+            json={
+                "instruction": "Apply against revision zero",
+                "base_revision_number": 0,
+            },
+            headers=self._headers(self.owner),
+        )
+        with SessionLocal.begin() as session:
+            goal = session.get(type(self.goal), self.goal.id)
+            goal.active_graph_revision_number = 1
+
+        response = client.post(
+            (
+                f"/api/v1/goals/{self.goal.id}/steering-requests/"
+                f"{steer.json()['id']}/apply"
+            ),
+            json={
+                "change_summary": "Stale addition",
+                "changes": [
+                    {
+                        "change_type": "added",
+                        "task": {"client_id": "late", "title": "Late task"},
+                    }
+                ],
+            },
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("base revision is stale", response.json()["detail"])
 
     def test_cross_team_and_admin_access(self) -> None:
         outsider_response = client.post(

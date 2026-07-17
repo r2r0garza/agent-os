@@ -3,21 +3,26 @@ from __future__ import annotations
 import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.authorization import current_actor, require_resource_access
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.domain.models import (
+    Budget,
     Goal,
     GoalLifecycleCommand,
     GoalLifecycleEvent,
     GoalSteeringRequest,
+    Policy,
     Project,
+    Task,
+    TaskDependency,
     TaskGraphRevision,
     TaskGraphRevisionTask,
     User,
@@ -35,6 +40,7 @@ GOAL_LIFECYCLE_TRANSITIONS: dict[str, dict[str, object]] = {
 }
 
 NON_STEERABLE_GOAL_STATUSES = {"completed", "cancelled", "failed"}
+STEERABLE_TASK_STATUSES = {"pending", "ready", "blocked", "failed"}
 
 
 class LifecycleCommandRequest(BaseModel):
@@ -52,6 +58,77 @@ class SteeringRequestCreate(BaseModel):
     def _validate_instruction(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("instruction must not be empty")
+        return value
+
+
+class SteeringTaskSpec(BaseModel):
+    client_id: str
+    title: str
+    description: str | None = None
+    required_capabilities: dict = Field(default_factory=dict)
+    capability_rationale: dict = Field(default_factory=dict)
+    expected_outputs: list = Field(default_factory=list)
+    resource_intent: list = Field(default_factory=list)
+    policy_ids: list[uuid.UUID] | None = None
+    budget_id: uuid.UUID | None = None
+    depends_on: list[str] | None = None
+
+    @field_validator("client_id", "title")
+    @classmethod
+    def _validate_non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be empty")
+        return value
+
+
+class SteeringTaskChange(BaseModel):
+    change_type: Literal["added", "revised", "superseded"]
+    task_id: uuid.UUID | None = None
+    task: SteeringTaskSpec | None = None
+
+    @model_validator(mode="after")
+    def _validate_change_shape(self) -> "SteeringTaskChange":
+        if self.change_type in {"added", "revised"} and self.task is None:
+            raise ValueError(f"task is required for {self.change_type} changes")
+        if self.change_type == "superseded" and self.task is not None:
+            raise ValueError("task must be omitted for superseded changes")
+        if self.change_type in {"revised", "superseded"} and self.task_id is None:
+            raise ValueError(f"task_id is required for {self.change_type} changes")
+        if self.change_type == "added" and self.task_id is not None:
+            raise ValueError("task_id must be omitted for added changes")
+        return self
+
+
+class SteeringRevisionApply(BaseModel):
+    change_summary: str
+    changes: list[SteeringTaskChange]
+
+    @field_validator("change_summary")
+    @classmethod
+    def _validate_change_summary(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("change_summary must not be empty")
+        return value
+
+    @field_validator("changes")
+    @classmethod
+    def _validate_changes(cls, value: list[SteeringTaskChange]) -> list[SteeringTaskChange]:
+        if not value:
+            raise ValueError("changes must not be empty")
+        client_ids = [
+            change.task.client_id
+            for change in value
+            if change.task is not None
+        ]
+        if len(client_ids) != len(set(client_ids)):
+            raise ValueError("task client_id values must be unique")
+        target_ids = [
+            change.task_id
+            for change in value
+            if change.task_id is not None
+        ]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("a task may be changed at most once per revision")
         return value
 
 
@@ -164,6 +241,61 @@ def _redacted_revision(revision: TaskGraphRevision) -> TaskGraphRevisionRead:
 def _redacted_event(event: GoalLifecycleEvent) -> GoalLifecycleEventRead:
     result = GoalLifecycleEventRead.model_validate(event)
     return result.model_copy(update={"payload": redact_mapping(result.payload)})
+
+
+def _task_snapshot(task: Task) -> dict:
+    return {
+        "id": str(task.id),
+        "title": task.title,
+        "description": task.description,
+        "status": task.status,
+        "required_capabilities": task.required_capabilities,
+        "capability_rationale": task.capability_rationale,
+        "expected_outputs": task.expected_outputs,
+        "resource_intent": task.resource_intent,
+        "policy_ids": task.policy_ids,
+        "knowledge_artifact_ids": task.knowledge_artifact_ids,
+        "budget_id": str(task.budget_id) if task.budget_id else None,
+        "assigned_agent_version_id": (
+            str(task.assigned_agent_version_id)
+            if task.assigned_agent_version_id
+            else None
+        ),
+        "assignment_status": task.assignment_status,
+        "assignment_candidates": task.assignment_candidates,
+        "assignment_rationale": task.assignment_rationale,
+    }
+
+
+def _find_cycle(
+    adjacency: dict[uuid.UUID, set[uuid.UUID]],
+) -> list[uuid.UUID] | None:
+    visiting: set[uuid.UUID] = set()
+    visited: set[uuid.UUID] = set()
+    path: list[uuid.UUID] = []
+
+    def visit(task_id: uuid.UUID) -> list[uuid.UUID] | None:
+        visiting.add(task_id)
+        path.append(task_id)
+        for dependency_id in adjacency.get(task_id, set()):
+            if dependency_id in visiting:
+                start = path.index(dependency_id)
+                return path[start:] + [dependency_id]
+            if dependency_id not in visited:
+                cycle = visit(dependency_id)
+                if cycle is not None:
+                    return cycle
+        path.pop()
+        visiting.remove(task_id)
+        visited.add(task_id)
+        return None
+
+    for task_id in adjacency:
+        if task_id not in visited:
+            cycle = visit(task_id)
+            if cycle is not None:
+                return cycle
+    return None
 
 
 def _load_goal(session: Session, goal_id: uuid.UUID) -> Goal:
@@ -513,6 +645,424 @@ def list_steering_requests(
         .order_by(GoalSteeringRequest.created_at)
     ).scalars()
     return [_redacted_steering_request(request) for request in requests]
+
+
+def _resolve_steering_dependencies(
+    references: list[str],
+    *,
+    client_ids: dict[str, uuid.UUID],
+    active_task_ids: set[uuid.UUID],
+    task_label: str,
+) -> set[uuid.UUID]:
+    resolved: set[uuid.UUID] = set()
+    for reference in references:
+        if reference in client_ids:
+            dependency_id = client_ids[reference]
+        else:
+            try:
+                dependency_id = uuid.UUID(reference)
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"task {task_label!r} depends on unknown reference {reference!r}",
+                ) from error
+            if dependency_id not in active_task_ids:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"task {task_label!r} depends on inactive or unknown task {reference!r}",
+                )
+        resolved.add(dependency_id)
+    return resolved
+
+
+def _validate_task_context(
+    session: Session,
+    task_spec: SteeringTaskSpec,
+) -> None:
+    if task_spec.budget_id is not None and session.get(Budget, task_spec.budget_id) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"budget {task_spec.budget_id} not found",
+        )
+    for policy_id in task_spec.policy_ids or []:
+        if session.get(Policy, policy_id) is None:
+            raise HTTPException(status_code=422, detail=f"policy {policy_id} not found")
+
+
+def _build_steering_revision(
+    session: Session,
+    *,
+    goal: Goal,
+    request: GoalSteeringRequest,
+    actor: User,
+    payload: SteeringRevisionApply,
+) -> TaskGraphRevision:
+    tasks = list(
+        session.execute(
+            select(Task).where(Task.goal_id == goal.id).with_for_update()
+        ).scalars()
+    )
+    tasks_by_id = {task.id: task for task in tasks}
+    target_ids = {
+        change.task_id for change in payload.changes if change.task_id is not None
+    }
+    for target_id in target_ids:
+        target = tasks_by_id.get(target_id)
+        if target is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"task {target_id} does not belong to goal",
+            )
+        if target.status not in STEERABLE_TASK_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"task {target_id} in status {target.status!r} cannot be changed",
+            )
+
+    client_ids = {
+        change.task.client_id: uuid.uuid4()
+        for change in payload.changes
+        if change.task is not None
+    }
+    superseded_ids = {
+        change.task_id
+        for change in payload.changes
+        if change.change_type in {"revised", "superseded"}
+        and change.task_id is not None
+    }
+    active_task_ids = set(tasks_by_id) - superseded_ids
+    active_task_ids.update(client_ids.values())
+
+    dependency_rows = list(
+        session.execute(
+            select(TaskDependency).where(TaskDependency.task_id.in_(tasks_by_id))
+        ).scalars()
+    )
+    adjacency: dict[uuid.UUID, set[uuid.UUID]] = {
+        task_id: set() for task_id in active_task_ids
+    }
+    for dependency in dependency_rows:
+        if (
+            dependency.task_id in active_task_ids
+            and dependency.depends_on_task_id in tasks_by_id
+        ):
+            adjacency[dependency.task_id].add(dependency.depends_on_task_id)
+
+    revision_changes: list[tuple[Task, str, uuid.UUID | None]] = []
+    replacement_by_target: dict[uuid.UUID, uuid.UUID] = {}
+    for change in payload.changes:
+        if change.task is None:
+            continue
+        _validate_task_context(session, change.task)
+        new_task_id = client_ids[change.task.client_id]
+        predecessor = change.task_id if change.change_type == "revised" else None
+        inherited = tasks_by_id.get(predecessor) if predecessor is not None else None
+        policy_ids = (
+            inherited.policy_ids
+            if inherited is not None and change.task.policy_ids is None
+            else [str(policy_id) for policy_id in change.task.policy_ids or []]
+        )
+        budget_id = (
+            inherited.budget_id
+            if inherited is not None
+            and "budget_id" not in change.task.model_fields_set
+            else change.task.budget_id
+        )
+        new_task = Task(
+            id=new_task_id,
+            goal_id=goal.id,
+            created_by=actor.id,
+            title=change.task.title,
+            description=change.task.description,
+            required_capabilities=change.task.required_capabilities,
+            capability_rationale=change.task.capability_rationale,
+            expected_outputs=change.task.expected_outputs,
+            resource_intent=change.task.resource_intent,
+            policy_ids=policy_ids,
+            knowledge_artifact_ids=(
+                inherited.knowledge_artifact_ids if inherited is not None else []
+            ),
+            budget_id=budget_id,
+            assigned_agent_version_id=None,
+            assignment_status="unassigned",
+            assignment_candidates=[],
+            assignment_rationale={},
+            assignment_updated_at=None,
+        )
+        session.add(new_task)
+        tasks_by_id[new_task.id] = new_task
+        revision_changes.append((new_task, change.change_type, predecessor))
+        if predecessor is not None:
+            replacement_by_target[predecessor] = new_task.id
+            if change.task.depends_on is None:
+                adjacency[new_task.id] = {
+                    replacement_by_target.get(dependency_id, dependency_id)
+                    for dependency_id in {
+                        dependency.depends_on_task_id
+                        for dependency in dependency_rows
+                        if dependency.task_id == predecessor
+                    }
+                    if dependency_id in active_task_ids
+                    or dependency_id in replacement_by_target
+                }
+
+    rewired_task_ids: set[uuid.UUID] = set()
+    for old_task_id, replacement_id in replacement_by_target.items():
+        for task_id, dependencies in adjacency.items():
+            if old_task_id in dependencies:
+                dependencies.remove(old_task_id)
+                dependencies.add(replacement_id)
+                rewired_task_ids.add(task_id)
+
+    for change in payload.changes:
+        if change.task is None:
+            continue
+        if change.task.depends_on is not None:
+            new_task_id = client_ids[change.task.client_id]
+            adjacency[new_task_id] = _resolve_steering_dependencies(
+                change.task.depends_on,
+                client_ids=client_ids,
+                active_task_ids=active_task_ids,
+                task_label=change.task.client_id,
+            )
+
+    for change in payload.changes:
+        if change.change_type != "superseded" or change.task_id is None:
+            continue
+        active_dependents = [
+            task_id
+            for task_id, dependencies in adjacency.items()
+            if change.task_id in dependencies
+        ]
+        if active_dependents:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"task {change.task_id} has active dependents; revise it with a "
+                    "replacement instead of superseding it"
+                ),
+            )
+
+    for task_id, dependencies in adjacency.items():
+        if task_id in dependencies:
+            raise HTTPException(
+                status_code=422,
+                detail=f"task {task_id} cannot depend on itself",
+            )
+    cycle = _find_cycle(adjacency)
+    if cycle is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"task graph contains a dependency cycle: {[str(node) for node in cycle]}",
+        )
+
+    for target_id in superseded_ids:
+        target = tasks_by_id[target_id]
+        target.status = "cancelled"
+        revision_changes.append((target, "superseded", None))
+
+    session.flush()
+    if superseded_ids:
+        session.execute(
+            delete(TaskDependency).where(
+                (TaskDependency.task_id.in_(superseded_ids))
+                | (TaskDependency.depends_on_task_id.in_(superseded_ids))
+            )
+        )
+    changed_task_ids = set(client_ids.values()) | superseded_ids
+    if changed_task_ids:
+        session.execute(
+            delete(TaskDependency).where(TaskDependency.task_id.in_(changed_task_ids))
+        )
+    for task_id, dependencies in adjacency.items():
+        if task_id not in changed_task_ids and task_id not in rewired_task_ids:
+            continue
+        session.execute(delete(TaskDependency).where(TaskDependency.task_id == task_id))
+        for dependency_id in dependencies:
+            session.add(
+                TaskDependency(
+                    task_id=task_id,
+                    depends_on_task_id=dependency_id,
+                )
+            )
+    session.flush()
+
+    effective_tasks = [
+        task for task in tasks_by_id.values() if task.id in active_task_ids
+    ]
+    graph_snapshot = {
+        "tasks": [_task_snapshot(task) for task in effective_tasks],
+        "dependencies": [
+            {
+                "task_id": str(task_id),
+                "depends_on_task_id": str(dependency_id),
+            }
+            for task_id, dependencies in adjacency.items()
+            for dependency_id in dependencies
+        ],
+        "superseded_task_ids": [str(task_id) for task_id in superseded_ids],
+    }
+    revision = TaskGraphRevision(
+        goal_id=goal.id,
+        created_by=actor.id,
+        steering_request_id=request.id,
+        revision_number=goal.active_graph_revision_number + 1,
+        parent_revision_number=goal.active_graph_revision_number,
+        change_summary=payload.change_summary,
+        graph_snapshot=graph_snapshot,
+        assignment_evidence={
+            str(task.id): {
+                "assigned_agent_version_id": (
+                    str(task.assigned_agent_version_id)
+                    if task.assigned_agent_version_id
+                    else None
+                ),
+                "assignment_status": task.assignment_status,
+                "assignment_candidates": task.assignment_candidates,
+                "assignment_rationale": task.assignment_rationale,
+                "effective": task.id in active_task_ids,
+                "replacement_task_id": (
+                    str(replacement_by_target[task.id])
+                    if task.id in replacement_by_target
+                    else None
+                ),
+            }
+            for task in tasks_by_id.values()
+        },
+        policy_context={
+            str(task.id): {"policy_ids": task.policy_ids}
+            for task in effective_tasks
+        },
+        budget_context={
+            str(task.id): {
+                "budget_id": str(task.budget_id) if task.budget_id else None
+            }
+            for task in effective_tasks
+        },
+    )
+    session.add(revision)
+    session.flush()
+    for task, change_type, supersedes_task_id in revision_changes:
+        session.add(
+            TaskGraphRevisionTask(
+                revision_id=revision.id,
+                task_id=task.id,
+                change_type=change_type,
+                supersedes_task_id=supersedes_task_id,
+                task_snapshot=_task_snapshot(task),
+            )
+        )
+    session.flush()
+    return revision
+
+
+@router.post(
+    "/goals/{goal_id}/steering-requests/{request_id}/apply",
+    response_model=TaskGraphRevisionDetailRead,
+    status_code=201,
+)
+def apply_steering_request(
+    goal_id: uuid.UUID,
+    request_id: uuid.UUID,
+    payload: SteeringRevisionApply,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> TaskGraphRevisionDetailRead:
+    goal = session.execute(
+        select(Goal).where(Goal.id == goal_id).with_for_update()
+    ).scalar_one_or_none()
+    if goal is None:
+        raise HTTPException(status_code=404, detail="goal not found")
+    project = require_resource_access(
+        session,
+        actor,
+        goal,
+        action="goal.steering_requests.apply",
+        resource_type="goal",
+    )
+    request = session.execute(
+        select(GoalSteeringRequest)
+        .where(
+            GoalSteeringRequest.id == request_id,
+            GoalSteeringRequest.goal_id == goal_id,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(status_code=404, detail="steering request not found")
+    if request.status == "applied":
+        revision = session.execute(
+            select(TaskGraphRevision).where(
+                TaskGraphRevision.steering_request_id == request.id
+            )
+        ).scalar_one()
+    else:
+        if request.status != "requested":
+            raise HTTPException(status_code=409, detail="steering request is not pending")
+        if goal.status in NON_STEERABLE_GOAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"cannot apply steering to goal in status {goal.status!r}",
+            )
+        if request.base_revision_number != goal.active_graph_revision_number:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "steering request base revision is stale: "
+                    f"expected {goal.active_graph_revision_number}, "
+                    f"received {request.base_revision_number}"
+                ),
+            )
+        revision = _build_steering_revision(
+            session,
+            goal=goal,
+            request=request,
+            actor=actor,
+            payload=payload,
+        )
+        now = datetime.now(timezone.utc)
+        request.status = "applied"
+        request.applied_revision_number = revision.revision_number
+        request.resolved_at = now
+        request.evidence = {
+            "change_summary": payload.change_summary,
+            "change_count": len(payload.changes),
+            "graph_revision_id": str(revision.id),
+            "applied_by": str(actor.id),
+        }
+        goal.active_graph_revision_number = revision.revision_number
+        _record_lifecycle_event(
+            session,
+            project,
+            goal,
+            actor,
+            event_type="goal.steering.applied",
+            steering_request_id=request.id,
+            graph_revision_id=revision.id,
+            prior_status=goal.status,
+            resulting_status=goal.status,
+            payload={
+                "change_summary": payload.change_summary,
+                "revision_number": revision.revision_number,
+                "parent_revision_number": revision.parent_revision_number,
+            },
+        )
+
+    revision_tasks = list(
+        session.execute(
+            select(TaskGraphRevisionTask).where(
+                TaskGraphRevisionTask.revision_id == revision.id
+            )
+        ).scalars()
+    )
+    base = _redacted_revision(revision)
+    return TaskGraphRevisionDetailRead(
+        **base.model_dump(),
+        tasks=[
+            TaskGraphRevisionTaskRead.model_validate(task)
+            for task in revision_tasks
+        ],
+    )
 
 
 @router.get(
