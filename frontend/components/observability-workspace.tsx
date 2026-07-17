@@ -24,6 +24,7 @@ import {
 
 import {
   ApiError,
+  Identifier,
   ObservabilityHealth,
   ObservabilityRecord,
   Run,
@@ -61,9 +62,178 @@ function shortId(value: string | null) {
 function statusVariant(status: string | null) {
   if (["failed", "dropped", "unavailable", "stale"].includes(status ?? ""))
     return "destructive" as const
-  if (["delayed", "degraded", "pending"].includes(status ?? ""))
+  if (["delayed", "degraded", "pending", "recovering"].includes(status ?? ""))
     return "secondary" as const
   return "outline" as const
+}
+
+interface MaintenanceSummary {
+  headline: string
+  tone: "ok" | "warn"
+  lines: string[]
+  failLines: string[]
+}
+
+function summarizeMaintenanceEvidence(
+  eventType: string,
+  evidence: Record<string, unknown>
+): MaintenanceSummary {
+  const stringLines = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string")
+      : []
+  const failLines = (lines: string[]) =>
+    lines.filter((line) => line.startsWith("[FAIL]"))
+
+  switch (eventType) {
+    case "operations.setup_check": {
+      const lines = stringLines(evidence.report)
+      const fails = failLines(lines)
+      const ok = evidence.ok === true
+      return {
+        headline: ok
+          ? "Preflight passed"
+          : `Preflight failed (${fails.length} check${fails.length === 1 ? "" : "s"})`,
+        tone: ok ? "ok" : "warn",
+        lines,
+        failLines: fails,
+      }
+    }
+    case "operations.upgrade_preflight": {
+      const lines = stringLines(evidence.configuration)
+      const fails = failLines(lines)
+      const mode =
+        typeof evidence.deployment_mode === "string"
+          ? evidence.deployment_mode
+          : "unknown"
+      const ready = evidence.ready === true && fails.length === 0
+      return {
+        headline: `${mode} upgrade preflight ${ready ? "ready" : "blocked"}`,
+        tone: ready ? "ok" : "warn",
+        lines: [
+          ...(typeof evidence.migrations === "string"
+            ? [`migrations: ${evidence.migrations}`]
+            : []),
+          ...lines,
+          ...(typeof evidence.rollback === "string"
+            ? [`rollback: ${evidence.rollback}`]
+            : []),
+        ],
+        failLines: fails,
+      }
+    }
+    case "operations.migration_status":
+    case "operations.migration_apply": {
+      const detail =
+        typeof evidence.detail === "string"
+          ? evidence.detail
+          : "no detail recorded"
+      return { headline: detail, tone: "ok", lines: [], failLines: [] }
+    }
+    case "operations.backup_created": {
+      const manifest = (evidence.manifest ?? {}) as Record<string, unknown>
+      const artifacts = Array.isArray(manifest.artifacts)
+        ? manifest.artifacts.length
+        : 0
+      const backup =
+        typeof evidence.backup === "string"
+          ? evidence.backup
+          : "unknown destination"
+      return {
+        headline: `Backup created: ${backup}`,
+        tone: "ok",
+        lines: [
+          `${artifacts} artifact file${artifacts === 1 ? "" : "s"} included`,
+          "master key must be restored separately",
+        ],
+        failLines: [],
+      }
+    }
+    case "operations.restore_completed": {
+      const artifactRoot =
+        typeof evidence.artifact_root === "string"
+          ? evidence.artifact_root
+          : "unknown target"
+      const files =
+        typeof evidence.artifact_files === "number"
+          ? evidence.artifact_files
+          : 0
+      const nextStep =
+        typeof evidence.next_step === "string" ? evidence.next_step : ""
+      return {
+        headline: `Restore completed to ${artifactRoot}`,
+        tone: "ok",
+        lines: [
+          `${files} artifact file${files === 1 ? "" : "s"} restored`,
+          ...(nextStep ? [nextStep] : []),
+        ],
+        failLines: [],
+      }
+    }
+    default:
+      return {
+        headline: eventType.replace("operations.", "").replaceAll("_", " "),
+        tone: "ok",
+        lines: [JSON.stringify(evidence)],
+        failLines: [],
+      }
+  }
+}
+
+function MaintenanceEvidenceCard({
+  event,
+  expanded,
+  onToggle,
+}: {
+  event: ObservabilityHealth["maintenance"]["events"][number]
+  expanded: boolean
+  onToggle: () => void
+}) {
+  const summary = summarizeMaintenanceEvidence(event.event_type, event.evidence)
+  return (
+    <div className="rounded-lg bg-muted/40 p-2 text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Badge variant={summary.tone === "warn" ? "destructive" : "outline"}>
+            {event.event_type.replace("operations.", "").replaceAll("_", " ")}
+          </Badge>
+          <span className="font-medium">{summary.headline}</span>
+        </div>
+        <span className="text-muted-foreground">
+          {displayDate(event.occurred_at)}
+        </span>
+      </div>
+      {summary.lines.length ? (
+        <ul className="mt-1 grid gap-0.5">
+          {summary.lines.map((line, index) => (
+            <li
+              key={index}
+              className={
+                summary.failLines.includes(line)
+                  ? "text-destructive"
+                  : "text-muted-foreground"
+              }
+            >
+              {line}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      <Button
+        variant="ghost"
+        size="sm"
+        className="mt-1 h-auto p-0 text-[11px]"
+        onClick={onToggle}
+      >
+        {expanded ? "Hide raw evidence" : "Show raw evidence"}
+      </Button>
+      {expanded ? (
+        <pre className="mt-1 overflow-auto rounded bg-background p-2 text-[11px] whitespace-pre-wrap text-muted-foreground">
+          {JSON.stringify(event.evidence, null, 2)}
+        </pre>
+      ) : null}
+    </div>
+  )
 }
 
 function EvidenceLink({
@@ -308,6 +478,9 @@ export function ObservabilityWorkspace({
   const [healthLoading, setHealthLoading] = useState(false)
   const [healthError, setHealthError] = useState("")
   const [adminDenied, setAdminDenied] = useState(false)
+  const [expandedEvents, setExpandedEvents] = useState<Set<Identifier>>(
+    new Set()
+  )
   const effectiveRunId = runs.some((run) => run.id === selectedRunId)
     ? selectedRunId
     : ""
@@ -411,6 +584,27 @@ export function ObservabilityWorkspace({
       latestRecordAt: records[0]?.occurred_at ?? null,
     }
   }, [records, runs])
+
+  const deploymentMode = useMemo(() => {
+    const withMode = health?.maintenance.events.find(
+      (event) => typeof event.evidence.deployment_mode === "string"
+    )
+    return withMode
+      ? (withMode.evidence.deployment_mode as string)
+      : null
+  }, [health])
+
+  function toggleEventEvidence(eventId: Identifier) {
+    setExpandedEvents((current) => {
+      const next = new Set(current)
+      if (next.has(eventId)) {
+        next.delete(eventId)
+      } else {
+        next.add(eventId)
+      }
+      return next
+    })
+  }
 
   return (
     <section className="mb-6 grid gap-6">
@@ -652,8 +846,18 @@ export function ObservabilityWorkspace({
                 <HealthTile
                   label="Workers"
                   status={health.workers.status}
-                  detail={`${health.workers.active} active · ${health.workers.stale} stale · ${health.workers.retry_count} retries`}
+                  detail={`${health.workers.active} active${health.workers.capacity != null ? ` / ${health.workers.capacity} capacity` : ""} · ${health.workers.stale} stale · ${health.workers.missing_worker_ids.length} missing heartbeat · ${health.workers.retry_count} retries`}
                   icon={<Activity className="size-4" />}
+                />
+                <HealthTile
+                  label="Deployment mode"
+                  status={deploymentMode ? "healthy" : "pending"}
+                  detail={
+                    deploymentMode
+                      ? `${deploymentMode} (from latest upgrade preflight evidence)`
+                      : "Run 'operations upgrade-preflight' to record deployment mode evidence"
+                  }
+                  icon={<ShieldCheck className="size-4" />}
                 />
                 <HealthTile
                   label="Sandbox"
@@ -699,6 +903,15 @@ export function ObservabilityWorkspace({
                       )
                     )}
                   </div>
+                  <p className="mt-3 text-[11px] text-muted-foreground">
+                    Run these operator commands from the repository root. On a
+                    team VM, the proxy&apos;s TLS certificate and private key
+                    are backed up and restored separately; see{" "}
+                    <code className="rounded bg-muted/60 px-1">
+                      docs/team-vm-deployment.md
+                    </code>
+                    .
+                  </p>
                 </div>
                 <div className="rounded-xl border bg-background p-3">
                   <div className="mb-3 flex items-center gap-2 text-sm font-medium">
@@ -708,29 +921,19 @@ export function ObservabilityWorkspace({
                   {health.maintenance.events.length ? (
                     <div className="grid gap-2">
                       {health.maintenance.events.map((event) => (
-                        <div
+                        <MaintenanceEvidenceCard
                           key={event.id}
-                          className="rounded-lg bg-muted/40 p-2 text-xs"
-                        >
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span className="font-medium">
-                              {event.event_type
-                                .replace("operations.", "")
-                                .replaceAll("_", " ")}
-                            </span>
-                            <span className="text-muted-foreground">
-                              {displayDate(event.occurred_at)}
-                            </span>
-                          </div>
-                          <p className="mt-1 line-clamp-2 font-mono text-[11px] break-all text-muted-foreground">
-                            {JSON.stringify(event.evidence)}
-                          </p>
-                        </div>
+                          event={event}
+                          expanded={expandedEvents.has(event.id)}
+                          onToggle={() => toggleEventEvidence(event.id)}
+                        />
                       ))}
                     </div>
                   ) : (
                     <div className="rounded-lg border border-dashed p-5 text-center text-sm text-muted-foreground">
                       No maintenance command evidence has been recorded yet.
+                      Run a setup-check, backup, restore, or upgrade-preflight
+                      command to populate this evidence.
                     </div>
                   )}
                 </div>

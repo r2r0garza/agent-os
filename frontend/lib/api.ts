@@ -629,6 +629,9 @@ export interface ObservabilityHealth {
     lease_count: number
     retry_count: number
     failure_count: number
+    capacity: number | null
+    live_worker_ids: string[]
+    missing_worker_ids: string[]
   }
   sandbox: {
     status: string
