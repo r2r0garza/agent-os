@@ -25,17 +25,20 @@ def planned_governed_actions(
     for tool_name in resolved.enabled_tools:
         descriptor = resolved.tool_descriptor(tool_name)
         owner_id = next(
-            server["id"]
-            for server in configuration["mcp_servers"]
-            if descriptor in server["connection_config"].get("tools", [])
+            (
+                server["id"]
+                for server in configuration["mcp_servers"]
+                if descriptor in server["connection_config"].get("tools", [])
+            ),
+            None,
         )
-        actions.append(
-            {
-                "action_type": "mcp.call",
-                "tool": tool_name,
-                "mcp_server_version_id": owner_id,
-            }
-        )
+        action = {
+            "action_type": "mcp.call" if owner_id else "tool.call",
+            "tool": tool_name,
+        }
+        if owner_id:
+            action["mcp_server_version_id"] = owner_id
+        actions.append(action)
     sandbox = configuration["agent"]["capability_manifest"].get("sandbox")
     if sandbox:
         actions.append({"action_type": "sandbox.lifecycle", "image": sandbox.get("image", "alpine:latest")})

@@ -17,6 +17,17 @@ TOOL_REGISTRY: dict[str, ToolHandler] = {
     "echo": _echo_tool,
 }
 
+BUILTIN_TOOL_DESCRIPTORS: dict[str, dict[str, Any]] = {
+    "echo": {
+        "name": "echo",
+        "description": "Return the supplied governed arguments.",
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": True,
+        },
+    },
+}
+
 
 def invoke_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:

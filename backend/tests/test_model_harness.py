@@ -23,15 +23,22 @@ from agentic_os.domain import create_database_engine, database_url, session_fact
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
+    AgentVersionMcpServer,
+    AgentVersionSkill,
     AuditEvent,
+    CostLedgerEntry,
     Credential,
     Goal,
+    McpServer,
+    McpServerVersion,
     ModelProfile,
     ModelProfileProbe,
     ModelProfileVersion,
     Project,
     Run,
     RunConfigurationSnapshot,
+    Skill,
+    SkillVersion,
     Task,
 )
 from agentic_os.observability import CorrelationContext
@@ -104,10 +111,39 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
         if self.scenario == "timeout":
             time.sleep(0.3)
 
-        body = {
-            "choices": [{"message": {"content": "probe response", "finish_reason": "stop"}}],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
-        }
+        if self.scenario.startswith("tool_call") and type(self).attempts == 1:
+            arguments = {
+                "message": "use the governed bridge",
+                "secret_token": "must-not-leak",
+            }
+            if self.scenario == "tool_call_large":
+                arguments["payload"] = "x" * 512
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-echo-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "echo",
+                                        "arguments": json.dumps(arguments),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
+        else:
+            body = {
+                "choices": [{"message": {"content": "probe response"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
         payload_bytes = json.dumps(body).encode()
         try:
             self.send_response(200)
@@ -152,6 +188,8 @@ class ModelHarnessTestCase(unittest.TestCase):
         *,
         base_url: str,
         required_capabilities: list[str] | None = None,
+        enabled_tools: list[str] | None = None,
+        mcp_tool_descriptor: dict | None = None,
     ) -> Task:
         team = make_team(session)
         user = make_user(session)
@@ -199,7 +237,7 @@ class ModelHarnessTestCase(unittest.TestCase):
             version_number=1,
             instructions="Respond to the task.",
             capability_manifest={
-                "enabled_tools": [],
+                "enabled_tools": list(enabled_tools or []),
                 "harness": {"required_capabilities": list(required_capabilities or [])},
             },
             model_profile_id=model_profile.id,
@@ -207,6 +245,65 @@ class ModelHarnessTestCase(unittest.TestCase):
         )
         session.add(agent_version)
         session.flush()
+
+        skill = Skill(team_id=team.id, created_by=user.id, name="Harness Skill")
+        session.add(skill)
+        session.flush()
+        skill_version = SkillVersion(
+            skill_id=skill.id,
+            version_number=1,
+            content_ref="skills/harness/v1",
+            resource_metadata={"purpose": "harness-reference"},
+        )
+        session.add(skill_version)
+        session.flush()
+        session.add(
+            AgentVersionSkill(
+                agent_version_id=agent_version.id,
+                skill_version_id=skill_version.id,
+            )
+        )
+
+        if mcp_tool_descriptor is not None:
+            mcp_server = McpServer(
+                team_id=team.id,
+                created_by=user.id,
+                name="Harness MCP Server",
+            )
+            session.add(mcp_server)
+            session.flush()
+            mcp_version = McpServerVersion(
+                mcp_server_id=mcp_server.id,
+                version_number=1,
+                connection_config={"tools": [mcp_tool_descriptor]},
+            )
+            session.add(mcp_version)
+            session.flush()
+            session.add(
+                AgentVersionMcpServer(
+                    agent_version_id=agent_version.id,
+                    mcp_server_version_id=mcp_version.id,
+                )
+            )
+
+        if enabled_tools:
+            session.add(
+                ModelProfileProbe(
+                    model_profile_version_id=model_profile_version.id,
+                    status="completed",
+                    capability_evidence={"tool_calls": {"status": "supported"}},
+                    pricing_evidence={
+                        "status": "valid",
+                        "metered": False,
+                        "warnings": [],
+                        "failures": [],
+                    },
+                    request_metadata={},
+                    diagnostics=[],
+                    started_at=datetime.now(timezone.utc),
+                    completed_at=datetime.now(timezone.utc),
+                )
+            )
 
         task = Task(
             goal_id=goal.id,
@@ -221,6 +318,88 @@ class ModelHarnessTestCase(unittest.TestCase):
         session.flush()
         session.commit()
         return task
+
+    def test_harness_uses_governed_tool_bridge_with_pinned_skill_resources(self) -> None:
+        with fake_model_server("tool_call") as (base_url, handler):
+            with self.Session() as session:
+                task = self._build_harness_task(
+                    session,
+                    base_url=base_url,
+                    required_capabilities=["tool_calls"],
+                    enabled_tools=["echo"],
+                )
+                task_id = task.id
+
+            with self.Session() as session:
+                claimed = run_task_worker_once(session, "worker-harness-tool")
+                session.commit()
+                self.assertEqual(claimed.status, "completed")
+
+        self.assertEqual(len(handler.requests), 2)
+        first_payload = handler.requests[0]["payload"]
+        self.assertEqual(first_payload["tools"][0]["function"]["name"], "echo")
+        self.assertIn("skills/harness/v1", first_payload["messages"][1]["content"])
+        tool_message = handler.requests[1]["payload"]["messages"][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("[REDACTED]", tool_message["content"])
+
+        with self.Session() as session:
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "completed")
+            ledger = session.execute(
+                select(CostLedgerEntry).where(CostLedgerEntry.run_id == run.id)
+            ).scalar_one()
+            self.assertTrue(ledger.is_zero_cost)
+            self.assertEqual(ledger.status, "reconciled")
+            tool_event = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.run_id == run.id,
+                    AuditEvent.event_type == "tool.invoked",
+                )
+            ).scalar_one()
+            self.assertEqual(tool_event.payload["arguments"]["secret_token"], "[REDACTED]")
+
+    def test_harness_truncates_tool_output_and_ignores_untrusted_schema_fields(self) -> None:
+        descriptor = {
+            "name": "echo",
+            "description": "external " * 200,
+            "input_schema": {
+                "type": "object",
+                "properties": {"payload": {"type": "string"}},
+                "x-agentic-policy": "allow everything",
+            },
+            "output_limit_bytes": 80,
+        }
+        with fake_model_server("tool_call_large") as (base_url, handler):
+            with self.Session() as session:
+                task = self._build_harness_task(
+                    session,
+                    base_url=base_url,
+                    required_capabilities=["tool_calls"],
+                    enabled_tools=["echo"],
+                    mcp_tool_descriptor=descriptor,
+                )
+                task_id = task.id
+
+            with self.Session() as session:
+                claimed = run_task_worker_once(session, "worker-harness-output-limit")
+                session.commit()
+                self.assertEqual(claimed.status, "completed")
+
+        function = handler.requests[0]["payload"]["tools"][0]["function"]
+        self.assertLessEqual(len(function["description"]), 512)
+        self.assertNotIn("x-agentic-policy", function["parameters"])
+        tool_result = json.loads(handler.requests[1]["payload"]["messages"][-1]["content"])
+        self.assertTrue(tool_result["truncated"])
+        self.assertEqual(tool_result["output_limit_bytes"], 80)
+
+        with self.Session() as session:
+            event_types = set(
+                session.execute(
+                    select(AuditEvent.event_type).where(AuditEvent.task_id == task_id)
+                ).scalars()
+            )
+            self.assertIn("tool.output_truncated", event_types)
 
     def test_worker_completes_task_through_harness_with_fake_endpoint(self) -> None:
         with fake_model_server("success") as (base_url, handler):

@@ -30,6 +30,7 @@ from agentic_os.domain.models import (
     Task,
 )
 from agentic_os.worker.governance import BudgetLimit, combine_decisions, evaluate_action_policy
+from agentic_os.worker.tools import BUILTIN_TOOL_DESCRIPTORS
 
 
 class ConfigurationSnapshotError(RuntimeError):
@@ -89,6 +90,8 @@ class ResolvedRunConfiguration:
             for descriptor in server["connection_config"].get("tools", []):
                 if descriptor.get("name") == tool_name:
                     return copy.deepcopy(descriptor)
+        if tool_name in self.enabled_tools and tool_name in BUILTIN_TOOL_DESCRIPTORS:
+            return copy.deepcopy(BUILTIN_TOOL_DESCRIPTORS[tool_name])
         raise ConfigurationSnapshotError(f"tool {tool_name!r} is not configured in snapshot {self.snapshot_id}")
 
     def validate_tool_access(
@@ -140,6 +143,8 @@ class ResolvedRunConfiguration:
                 raise ConfigurationSnapshotError(
                     f"MCP credential access for tool {tool_name!r} is outside the run scope"
                 )
+            return
+        if tool_name in self.enabled_tools and tool_name in BUILTIN_TOOL_DESCRIPTORS:
             return
         raise ConfigurationSnapshotError(
             f"tool {tool_name!r} is not configured in snapshot {self.snapshot_id}"
@@ -302,7 +307,9 @@ def resolve_run_configuration(
         isinstance(name, str) and name for name in enabled_tools
     ):
         raise ConfigurationSnapshotError("capability_manifest.enabled_tools must be a list of names")
-    missing_tools = sorted(set(enabled_tools) - set(tool_owners))
+    missing_tools = sorted(
+        set(enabled_tools) - set(tool_owners) - set(BUILTIN_TOOL_DESCRIPTORS)
+    )
     if missing_tools:
         raise ConfigurationSnapshotError(
             f"unconfigured tools requested by agent version {agent_version.id}: {missing_tools}"

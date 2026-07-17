@@ -44,6 +44,7 @@ from agentic_os.worker.governance import (
 from agentic_os.worker.harness import HarnessExecutionError, execute_model_harness
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, release_lease, renew_lease
 from agentic_os.worker.sandbox_execution import SandboxControlInterrupt, execute_task_sandbox
+from agentic_os.worker.tool_bridge import GovernedToolBridge, ToolBridgeError
 from agentic_os.worker.tools import invoke_tool
 from agentic_os.worker.workspace import promote_workspace_changes
 
@@ -422,6 +423,7 @@ def _execute_claimed_task(
     tool_results: dict[str, dict] = {}
     model_profile = configuration["model_profile"]
     harness_config = capability_manifest.get("harness")
+    harness_bridge = None
     if harness_config is not None:
         if model_profile is None:
             raise TaskExecutionError(
@@ -429,7 +431,22 @@ def _execute_claimed_task(
                 "without an attached model profile"
             )
         _check_control()
+        harness_bridge = GovernedToolBridge(
+            session=session,
+            resolved=resolved,
+            task=task,
+            run=run,
+            project=project,
+            goal=goal,
+            context=context,
+            control_check=_check_control,
+        )
         try:
+            required_capabilities = list(
+                harness_config.get("required_capabilities") or []
+            )
+            if enabled_tools and "tool_calls" not in required_capabilities:
+                required_capabilities.append("tool_calls")
             harness_result = execute_model_harness(
                 session,
                 task=task,
@@ -438,9 +455,12 @@ def _execute_claimed_task(
                 context=context,
                 model_profile=model_profile,
                 instructions=agent["instructions"],
-                required_capabilities=list(harness_config.get("required_capabilities") or []),
+                required_capabilities=required_capabilities,
+                tools=harness_bridge.descriptors(),
+                skill_resources=harness_bridge.skill_resources(),
+                tool_executor=harness_bridge.invoke,
             )
-        except HarnessExecutionError as error:
+        except (HarnessExecutionError, ToolBridgeError) as error:
             raise TaskExecutionError(str(error)) from error
         tool_results["model"] = harness_result
         session.add(
@@ -458,7 +478,9 @@ def _execute_claimed_task(
         )
         session.flush()
 
-    for tool_name in enabled_tools:
+    # Model-backed runs dispatch enabled tools only when requested by the
+    # harness. Deterministic runs retain the earlier eager execution path.
+    for tool_name in ([] if harness_bridge is not None else enabled_tools):
         _check_control()
         # Definition visibility and credential grants are mutable authority,
         # unlike the pinned configuration payload. Re-check them before any
