@@ -31,6 +31,14 @@ class GoalRead(BaseModel):
     title: str
     description: str | None
     status: str
+    control_version: int
+    pending_control: str | None
+    control_requested_by: uuid.UUID | None
+    control_requested_at: datetime | None
+    cancellation_grace_expires_at: datetime | None
+    forced_termination_requested_at: datetime | None
+    forced_termination_completed_at: datetime | None
+    active_graph_revision_number: int
     created_at: datetime
     updated_at: datetime
 
