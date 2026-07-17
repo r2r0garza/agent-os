@@ -178,6 +178,45 @@ def require_team_access(
     raise HTTPException(status_code=404, detail=f"{resource_type} not found")
 
 
+def can_view_shared_definition(session: Session, actor: User, resource: Any) -> bool:
+    """Read access for agent/skill definitions, which extends beyond team ownership by visibility.
+
+    Team membership always grants access. Beyond that, `team` and `public`
+    visibility grant read access to any actor with at least one team
+    membership (or an admin); `private` never extends past the home team.
+    Mutation endpoints must not use this helper — they require actual home
+    team membership regardless of visibility.
+    """
+
+    if actor.role == "admin":
+        return True
+    if has_team_access(session, actor, resource.team_id):
+        return True
+    return resource.visibility in ("team", "public")
+
+
+def require_shared_definition_access(
+    session: Session,
+    actor: User,
+    resource: Any,
+    *,
+    action: str,
+    resource_type: str,
+) -> None:
+    if can_view_shared_definition(session, actor, resource):
+        return
+    _record_decision(
+        session,
+        actor,
+        decision="deny",
+        action=action,
+        resource_type=resource_type,
+        reason="resource_not_accessible",
+        commit=True,
+    )
+    raise HTTPException(status_code=404, detail=f"{resource_type} not found")
+
+
 def can_access_owned_scope(session: Session, actor: User, resource: Any) -> bool:
     project_id = getattr(resource, "project_id", None)
     if project_id is not None:

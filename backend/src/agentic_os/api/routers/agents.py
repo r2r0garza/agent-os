@@ -5,16 +5,23 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.authorization import actor_team_ids, current_actor, primary_team_id, require_team_access
+from agentic_os.api.authorization import (
+    actor_team_ids,
+    current_actor,
+    primary_team_id,
+    require_shared_definition_access,
+    require_team_access,
+)
 from agentic_os.api.deps import get_session
 from agentic_os.api.ownership import owner_team_id
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.domain.capabilities import CAPABILITY_CATALOG
 from agentic_os.domain.models import (
     Agent,
+    AgentInstallation,
     AgentVersion,
     AgentVersionMcpServer,
     AgentVersionPolicySet,
@@ -26,6 +33,8 @@ from agentic_os.domain.models import (
     ModelProfileVersion,
     PolicySet,
     PolicySetVersion,
+    Run,
+    RunConfigurationSnapshot,
     Skill,
     SkillVersion,
     User,
@@ -48,10 +57,24 @@ class AgentRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     team_id: uuid.UUID
+    created_by: uuid.UUID
     name: str
     visibility: str
     created_at: datetime
     updated_at: datetime
+
+
+class AgentInstallCreate(BaseModel):
+    name: str | None = None
+
+
+class AgentInstallationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    installed_agent_id: uuid.UUID
+    source_agent_version_id: uuid.UUID
+    installed_by: uuid.UUID
+    created_at: datetime
 
 
 class VersionAttachmentCreate(BaseModel):
@@ -119,11 +142,35 @@ class AgentVersionRead(BaseModel):
 
 
 def _get_agent(session: Session, actor: User, agent_id: uuid.UUID) -> Agent:
+    """Read access: home team membership, or `team`/`public` visibility, or admin."""
+
     agent = session.get(Agent, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
-    require_team_access(session, actor, agent.team_id, action="agent.read", resource_type="agent")
+    require_shared_definition_access(session, actor, agent, action="agent.read", resource_type="agent")
     return agent
+
+
+def _get_agent_for_mutation(session: Session, actor: User, agent_id: uuid.UUID) -> Agent:
+    """Mutation access: home team membership only. Visibility never grants edit rights."""
+
+    agent = session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    require_team_access(session, actor, agent.team_id, action="agent.write", resource_type="agent")
+    return agent
+
+
+def _agent_has_dependents(session: Session, agent_id: uuid.UUID) -> bool:
+    version_ids = select(AgentVersion.id).where(AgentVersion.agent_id == agent_id)
+    for stmt in (
+        select(Run.id).where(Run.agent_version_id.in_(version_ids)),
+        select(RunConfigurationSnapshot.id).where(RunConfigurationSnapshot.agent_version_id.in_(version_ids)),
+        select(AgentInstallation.id).where(AgentInstallation.source_agent_version_id.in_(version_ids)),
+    ):
+        if session.execute(stmt.limit(1)).first() is not None:
+            return True
+    return False
 
 
 def _require_same_team(session: Session, agent: Agent, resource: object, label: str) -> None:
@@ -193,7 +240,7 @@ def list_agents(
 ) -> list[Agent]:
     stmt = select(Agent)
     if actor.role != "admin":
-        stmt = stmt.where(Agent.team_id.in_(actor_team_ids(session, actor)))
+        stmt = stmt.where(or_(Agent.team_id.in_(actor_team_ids(session, actor)), Agent.visibility == "public"))
     return list(session.execute(stmt.order_by(Agent.created_at)).scalars())
 
 
@@ -213,12 +260,92 @@ def update_agent(
     session: Session = Depends(get_session),
     actor: User = Depends(current_actor),
 ) -> Agent:
-    agent = _get_agent(session, actor, agent_id)
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    agent = _get_agent_for_mutation(session, actor, agent_id)
+    updates = payload.model_dump(exclude_unset=True)
+    if "visibility" in updates and updates["visibility"] != agent.visibility:
+        if actor.role != "admin" and agent.created_by != actor.id:
+            raise HTTPException(status_code=403, detail="only the owner or an admin can change visibility")
+    for key, value in updates.items():
         setattr(agent, key, value)
     session.flush()
     session.refresh(agent)
     return agent
+
+
+@router.delete("/{agent_id}", status_code=204, response_model=None)
+def delete_agent(
+    agent_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> None:
+    agent = _get_agent_for_mutation(session, actor, agent_id)
+    if _agent_has_dependents(session, agent_id):
+        raise HTTPException(status_code=409, detail="agent has runs or installations referencing its versions")
+    session.delete(agent)
+    session.flush()
+
+
+@router.post("/{agent_id}/versions/{version_number}/install", response_model=AgentRead, status_code=201)
+def install_agent_version(
+    agent_id: uuid.UUID,
+    version_number: int,
+    payload: AgentInstallCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Agent:
+    """Pin a `team`/`public` source version into a new, independently governed agent.
+
+    The installed agent is a fresh resource owned by the installer's team; it
+    starts private and is decoupled from later edits to the source agent.
+    """
+
+    source_agent = _get_agent(session, actor, agent_id)
+    source_version = session.execute(
+        select(AgentVersion).where(AgentVersion.agent_id == agent_id, AgentVersion.version_number == version_number)
+    ).scalar_one_or_none()
+    if source_version is None:
+        raise HTTPException(status_code=404, detail="agent version not found")
+
+    installed_agent = Agent(
+        team_id=primary_team_id(session, actor),
+        created_by=actor.id,
+        name=payload.name or source_agent.name,
+        visibility="private",
+    )
+    session.add(installed_agent)
+    session.flush()
+    installed_version = AgentVersion(
+        agent_id=installed_agent.id,
+        version_number=1,
+        capability_manifest=source_version.capability_manifest,
+        instructions=source_version.instructions,
+    )
+    session.add(installed_version)
+    session.add(
+        AgentInstallation(
+            installed_agent_id=installed_agent.id,
+            source_agent_version_id=source_version.id,
+            installed_by=actor.id,
+        )
+    )
+    session.flush()
+    session.refresh(installed_agent)
+    return installed_agent
+
+
+@router.get("/{agent_id}/installation", response_model=AgentInstallationRead)
+def get_agent_installation(
+    agent_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> AgentInstallation:
+    _get_agent(session, actor, agent_id)
+    installation = session.execute(
+        select(AgentInstallation).where(AgentInstallation.installed_agent_id == agent_id)
+    ).scalar_one_or_none()
+    if installation is None:
+        raise HTTPException(status_code=404, detail="agent installation not found")
+    return installation
 
 
 @router.post("/{agent_id}/versions", response_model=AgentVersionRead, status_code=201)
@@ -228,7 +355,7 @@ def create_agent_version(
     session: Session = Depends(get_session),
     actor: User = Depends(current_actor),
 ) -> AgentVersionRead:
-    agent = _get_agent(session, actor, agent_id)
+    agent = _get_agent_for_mutation(session, actor, agent_id)
     profile_id, profile_version_id = _resolve_model_version(session, agent, payload)
     if payload.default_budget_id is not None:
         budget = session.get(Budget, payload.default_budget_id)
