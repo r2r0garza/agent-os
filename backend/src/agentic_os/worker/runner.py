@@ -57,6 +57,7 @@ def run_task_worker_once(
     *,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
     on_run_started: Callable[[], None] | None = None,
+    on_promoted: Callable[[], None] | None = None,
 ) -> Task | None:
     """Claim and execute at most one ready task.
 
@@ -70,6 +71,14 @@ def run_task_worker_once(
     happens. It exists so restart-recovery verification can pause a real
     worker process at a controlled, persisted mid-run point before killing
     it.
+
+    ``on_promoted``, when provided, is invoked immediately after workspace
+    promotion returns, while the promotion's resource-revision and lease
+    mutations are still only staged in this transaction (not committed). It
+    exists so failure-injection verification can pause a real worker process
+    right after promotion runs but before the surrounding transaction
+    commits, proving a kill in that window rolls the promotion back entirely
+    rather than leaving a partially-applied revision.
     """
     reconcile_goal_controls(session)
     task = claim_ready_task(session, worker_id, lease_seconds=lease_seconds)
@@ -95,7 +104,14 @@ def run_task_worker_once(
     _fail_interrupted_previous_attempt(session, task, project_id=project_id)
 
     try:
-        _execute_claimed_task(session, task, worker_id, project_id=project_id, on_run_started=on_run_started)
+        _execute_claimed_task(
+            session,
+            task,
+            worker_id,
+            project_id=project_id,
+            on_run_started=on_run_started,
+            on_promoted=on_promoted,
+        )
     except GoalControlInterrupt as interrupt:
         run = session.execute(
             select(Run)
@@ -177,6 +193,7 @@ def _execute_claimed_task(
     *,
     project_id: uuid.UUID | None,
     on_run_started: Callable[[], None] | None = None,
+    on_promoted: Callable[[], None] | None = None,
 ) -> None:
     if project_id is None:
         raise TaskExecutionError(f"task {task.id} has no resolvable project through its goal")
@@ -693,6 +710,8 @@ def _execute_claimed_task(
     renew_lease(session, task, worker_id)
 
     promote_workspace_changes(session, task, run, worker_id)
+    if on_promoted is not None:
+        on_promoted()
     _check_control()
 
     citation_summary = [

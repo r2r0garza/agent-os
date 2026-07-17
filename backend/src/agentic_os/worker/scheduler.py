@@ -130,6 +130,7 @@ def run_scheduler_once(
     worker_count: int = 1,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
     on_run_started: Callable[[], None] | None = None,
+    on_promoted: Callable[[], None] | None = None,
     telemetry_exporter: TelemetryExporter | None = None,
 ) -> SchedulerResult:
     """Run up to ``worker_count`` claim/execute loops concurrently until no
@@ -169,6 +170,7 @@ def run_scheduler_once(
                         worker_id,
                         lease_seconds=lease_seconds,
                         on_run_started=on_run_started,
+                        on_promoted=on_promoted,
                     )
                 except Exception as error:
                     session.commit()

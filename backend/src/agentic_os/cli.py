@@ -125,6 +125,18 @@ def _run_worker_run_once(worker_id: str | None, lease_seconds: int | None, worke
             print(f"run started; pausing {pause_seconds}s for restart-recovery verification", file=sys.stderr)
             time.sleep(pause_seconds)
 
+    promoted_pause_seconds_raw = os.environ.get("AGENTIC_OS_WORKER_TEST_PAUSE_AFTER_PROMOTION_SECONDS")
+    on_promoted = None
+    if promoted_pause_seconds_raw:
+        promoted_pause_seconds = float(promoted_pause_seconds_raw)
+
+        def on_promoted() -> None:
+            print(
+                f"workspace promoted; pausing {promoted_pause_seconds}s for failure-injection verification",
+                file=sys.stderr,
+            )
+            time.sleep(promoted_pause_seconds)
+
     engine = create_database_engine()
     session_maker = session_factory(engine)
     try:
@@ -134,6 +146,7 @@ def _run_worker_run_once(worker_id: str | None, lease_seconds: int | None, worke
             worker_count=workers,
             lease_seconds=resolved_lease_seconds,
             on_run_started=on_run_started,
+            on_promoted=on_promoted,
         )
     finally:
         engine.dispose()
