@@ -850,6 +850,72 @@ class McpServerAttachment(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class McpServerTool(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """A discovered tool descriptor for one MCP server version.
+
+    Descriptor fields (description, input_schema, descriptor_hash) are
+    untrusted evidence reported by the remote server and cannot carry policy
+    authority. Operator-owned settings (enabled, timeout_ms,
+    output_limit_bytes) are never overwritten by rediscovery of an existing
+    row; only the descriptor evidence is refreshed.
+    """
+
+    __tablename__ = "mcp_server_tools"
+    __table_args__ = (
+        UniqueConstraint(
+            "mcp_server_version_id", "tool_name", name="uq_mcp_server_tools_version_tool"
+        ),
+    )
+
+    mcp_server_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("mcp_server_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    tool_name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_schema: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    schema_valid: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    schema_validation_errors: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    descriptor_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_scope_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    timeout_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_limit_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class McpServerHealthCheck(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    """Append-only diagnostic history of MCP discovery/health check attempts."""
+
+    __tablename__ = "mcp_server_health_checks"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('healthy', 'degraded', 'unreachable', 'malformed')",
+            name="valid_status",
+        ),
+    )
+
+    mcp_server_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("mcp_server_versions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    tool_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    diagnostics: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    triggered_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+
+
 class AgentVersionMcpServer(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     __tablename__ = "agent_version_mcp_servers"
     __table_args__ = (

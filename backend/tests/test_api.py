@@ -1043,5 +1043,189 @@ class HealthEndpointTests(unittest.TestCase):
         self.assertEqual(body["checks"]["master_key"]["status"], "unavailable")
 
 
+class McpDiscoveryApiTests(unittest.TestCase):
+    """MCP discovery/health lifecycle (Sprint 13 exit criterion 2): tool
+    descriptors and diagnostics are persisted as untrusted evidence, tools
+    default disabled, and rediscovery never clobbers operator settings."""
+
+    def _create_version(self) -> tuple[dict, dict]:
+        server = client.post(
+            "/api/v1/mcp-servers", json={"name": f"Discovery server {uuid.uuid4()}"}
+        ).json()
+        version = client.post(
+            f"/api/v1/mcp-servers/{server['id']}/versions",
+            json={
+                "connection_config": {
+                    "url": "https://mcp.example.test/mcp",
+                    "headers": {"X-API-Key": "discovery-header-secret"},
+                },
+                "credential": "discovery-credential-secret",
+            },
+        ).json()
+        return server, version
+
+    def _health_probe_result(self, **overrides: object) -> dict:
+        result = {
+            "status": "healthy",
+            "tool_count": 1,
+            "latency_ms": 12,
+            "request_metadata": {
+                "endpoint": "https://mcp.example.test/mcp",
+                "header_names": ["Authorization", "Content-Type", "X-API-Key"],
+                "timeout_seconds": 2.0,
+                "max_attempts": 2,
+                "attempts": 1,
+            },
+            "diagnostics": [],
+            "tools": [
+                {
+                    "name": "echo",
+                    "description": "Echo input",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "schema_valid": True,
+                    "schema_validation_errors": [],
+                    "descriptor_hash": "hash-v1",
+                    "credential_scope_required": False,
+                }
+            ],
+            "checked_at": datetime.now(UTC),
+        }
+        result.update(overrides)
+        return result
+
+    def test_discovery_persists_untrusted_evidence_defaults_disabled_and_redacts_credential(
+        self,
+    ) -> None:
+        server, version = self._create_version()
+        with mock.patch(
+            "agentic_os.api.routers.mcp_servers.discover_mcp_tools",
+            return_value=self._health_probe_result(),
+        ) as discover:
+            response = client.post(
+                f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/health-checks",
+                json={"timeout_seconds": 1.5, "max_attempts": 1},
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "healthy")
+        self.assertEqual(body["tool_count"], 1)
+        self.assertNotIn("discovery-credential-secret", response.text)
+        self.assertNotIn("discovery-header-secret", response.text)
+
+        self.assertEqual(discover.call_args.kwargs["credential_value"], "discovery-credential-secret")
+        self.assertEqual(discover.call_args.kwargs["url"], "https://mcp.example.test/mcp")
+
+        tools = client.get(
+            f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/discovered-tools"
+        ).json()
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["tool_name"], "echo")
+        self.assertFalse(tools[0]["enabled"])
+        self.assertIsNone(tools[0]["timeout_ms"])
+        self.assertTrue(tools[0]["schema_valid"])
+
+        history = client.get(
+            f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/health-checks"
+        ).json()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["status"], "healthy")
+
+    def test_unreachable_discovery_records_diagnostics_without_creating_tools(self) -> None:
+        server, version = self._create_version()
+        with mock.patch(
+            "agentic_os.api.routers.mcp_servers.discover_mcp_tools",
+            return_value=self._health_probe_result(
+                status="unreachable",
+                tool_count=0,
+                tools=[],
+                diagnostics=[{"code": "timeout", "phase": "request"}],
+            ),
+        ):
+            response = client.post(
+                f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/health-checks",
+                json={},
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["status"], "unreachable")
+
+        tools = client.get(
+            f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/discovered-tools"
+        ).json()
+        self.assertEqual(tools, [])
+
+    def test_enablement_settings_survive_rediscovery(self) -> None:
+        server, version = self._create_version()
+        with mock.patch(
+            "agentic_os.api.routers.mcp_servers.discover_mcp_tools",
+            return_value=self._health_probe_result(),
+        ):
+            client.post(
+                f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/health-checks",
+                json={},
+            )
+
+        enabled = client.patch(
+            f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}"
+            "/discovered-tools/echo",
+            json={"enabled": True, "timeout_ms": 5000, "output_limit_bytes": 2048},
+        )
+        self.assertEqual(enabled.status_code, 200, enabled.text)
+        self.assertTrue(enabled.json()["enabled"])
+        self.assertEqual(enabled.json()["timeout_ms"], 5000)
+
+        with mock.patch(
+            "agentic_os.api.routers.mcp_servers.discover_mcp_tools",
+            return_value=self._health_probe_result(
+                tools=[
+                    {
+                        "name": "echo",
+                        "description": "Echo input v2",
+                        "input_schema": {"type": "object", "properties": {}},
+                        "schema_valid": True,
+                        "schema_validation_errors": [],
+                        "descriptor_hash": "hash-v2",
+                        "credential_scope_required": False,
+                    }
+                ],
+            ),
+        ):
+            client.post(
+                f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/health-checks",
+                json={},
+            )
+
+        tools = client.get(
+            f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/discovered-tools"
+        ).json()
+        self.assertEqual(len(tools), 1)
+        self.assertTrue(tools[0]["enabled"])
+        self.assertEqual(tools[0]["timeout_ms"], 5000)
+        self.assertEqual(tools[0]["output_limit_bytes"], 2048)
+        self.assertEqual(tools[0]["description"], "Echo input v2")
+        self.assertEqual(tools[0]["descriptor_hash"], "hash-v2")
+
+    def test_discovery_denied_for_actor_without_access(self) -> None:
+        server, version = self._create_version()
+        engine = create_database_engine(TEST_DATABASE_URL)
+        with session_factory(engine)() as session:
+            from agentic_os.domain.models import User
+
+            outsider = User(
+                email=f"mcp-outsider-{uuid.uuid4()}@example.test",
+                display_name="MCP outsider",
+            )
+            session.add(outsider)
+            session.commit()
+            outsider_id = outsider.id
+        engine.dispose()
+
+        response = client.post(
+            f"/api/v1/mcp-servers/{server['id']}/versions/{version['version_number']}/health-checks",
+            headers={"x-agentic-user-id": str(outsider_id)},
+            json={},
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+
+
 if __name__ == "__main__":
     unittest.main()

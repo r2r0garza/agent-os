@@ -36,6 +36,8 @@ from agentic_os.domain.models import (
     GoalLifecycleEvent,
     GoalSteeringRequest,
     McpServer,
+    McpServerHealthCheck,
+    McpServerTool,
     McpServerVersion,
     ModelProfile,
     ModelProfileVersion,
@@ -1283,6 +1285,68 @@ class DomainMigrationTests(unittest.TestCase):
 
             session.add(McpServer(created_by=user.id, name="Unscoped MCP server"))
             with self.assertRaises(IntegrityError):
+                session.commit()
+
+    def test_mcp_discovery_evidence_persists_untrusted_descriptors_and_health_history(
+        self,
+    ) -> None:
+        with self.Session() as session:
+            team = Team(name="Discovery Team")
+            session.add(team)
+            session.flush()
+            user = User(email=f"discovery-{uuid.uuid4()}@example.test", display_name="Discovery Owner")
+            session.add(user)
+            session.flush()
+
+            server = McpServer(team_id=team.id, created_by=user.id, name="Discovery MCP Server")
+            session.add(server)
+            session.flush()
+            version = McpServerVersion(
+                mcp_server_id=server.id,
+                version_number=1,
+                connection_config={"url": "https://mcp.example.test/mcp"},
+            )
+            session.add(version)
+            session.flush()
+
+            tool = McpServerTool(
+                mcp_server_version_id=version.id,
+                tool_name="echo",
+                description="Echo tool",
+                input_schema={"type": "object"},
+                schema_valid=True,
+                descriptor_hash="hash-v1",
+            )
+            session.add(tool)
+            health_check = McpServerHealthCheck(
+                mcp_server_version_id=version.id,
+                status="healthy",
+                tool_count=1,
+                triggered_by=user.id,
+            )
+            session.add(health_check)
+            session.commit()
+
+            self.assertFalse(tool.enabled)
+            self.assertIsNone(tool.timeout_ms)
+            self.assertIsNone(tool.output_limit_bytes)
+            tool_id, health_check_id, version_id = tool.id, health_check.id, version.id
+
+        with self.Session() as session:
+            persisted_tool = session.get(McpServerTool, tool_id)
+            persisted_check = session.get(McpServerHealthCheck, health_check_id)
+            self.assertEqual(persisted_tool.descriptor_hash, "hash-v1")
+            self.assertFalse(persisted_tool.enabled)
+            self.assertEqual(persisted_check.status, "healthy")
+
+            with self.assertRaises(IntegrityError):
+                session.add(
+                    McpServerTool(
+                        mcp_server_version_id=version_id,
+                        tool_name="echo",
+                        descriptor_hash="hash-duplicate",
+                    )
+                )
                 session.commit()
 
     def test_credential_redacted_metadata_excludes_secret_material(self) -> None:

@@ -20,17 +20,25 @@ from agentic_os.api.authorization import (
 )
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
-from agentic_os.secrets import encrypt_secret
+from agentic_os.mcp import DiscoverySettings, discover_mcp_tools
+from agentic_os.secrets import decrypt_secret, encrypt_secret
 from agentic_os.domain.models import (
     Agent,
     AuditEvent,
     Credential,
     McpServer,
     McpServerAttachment,
+    McpServerHealthCheck,
+    McpServerTool,
     McpServerVersion,
     Project,
     User,
 )
+
+MIN_TIMEOUT_MS = 1
+MAX_TIMEOUT_MS = 300_000
+MIN_OUTPUT_LIMIT_BYTES = 1
+MAX_OUTPUT_LIMIT_BYTES = 1_048_576
 
 router = APIRouter(prefix="/mcp-servers", tags=["mcp-servers"])
 
@@ -91,6 +99,53 @@ class McpServerAttachmentRead(BaseModel):
     credential_configured: bool
     revoked: bool
     created_at: datetime
+
+
+class McpDiscoveryRequest(BaseModel):
+    timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    max_attempts: int = Field(default=2, ge=1, le=3)
+
+
+class McpServerHealthCheckRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    mcp_server_version_id: uuid.UUID
+    status: str
+    tool_count: int
+    latency_ms: int | None
+    request_metadata: dict
+    diagnostics: list
+    checked_at: datetime
+    created_at: datetime
+
+
+class McpServerToolRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    mcp_server_version_id: uuid.UUID
+    tool_name: str
+    description: str | None
+    input_schema: dict
+    schema_valid: bool
+    schema_validation_errors: list
+    descriptor_hash: str
+    credential_scope_required: bool
+    enabled: bool
+    timeout_ms: int | None
+    output_limit_bytes: int | None
+    last_discovered_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class McpServerToolUpdate(BaseModel):
+    enabled: bool | None = None
+    timeout_ms: int | None = Field(default=None, ge=MIN_TIMEOUT_MS, le=MAX_TIMEOUT_MS)
+    output_limit_bytes: int | None = Field(
+        default=None, ge=MIN_OUTPUT_LIMIT_BYTES, le=MAX_OUTPUT_LIMIT_BYTES
+    )
 
 
 def _version_to_read(
@@ -171,6 +226,62 @@ def _attachment_to_read(attachment: McpServerAttachment) -> McpServerAttachmentR
         revoked=attachment.revoked_at is not None,
         created_at=attachment.created_at,
     )
+
+
+def _health_check_to_read(check: McpServerHealthCheck) -> McpServerHealthCheckRead:
+    return McpServerHealthCheckRead(
+        id=check.id,
+        mcp_server_version_id=check.mcp_server_version_id,
+        status=check.status,
+        tool_count=check.tool_count,
+        latency_ms=check.latency_ms,
+        request_metadata=redact_mapping(check.request_metadata),
+        diagnostics=redact_mapping(check.diagnostics),
+        checked_at=check.checked_at,
+        created_at=check.created_at,
+    )
+
+
+def _tool_to_read(tool: McpServerTool) -> McpServerToolRead:
+    return McpServerToolRead(
+        id=tool.id,
+        mcp_server_version_id=tool.mcp_server_version_id,
+        tool_name=tool.tool_name,
+        description=tool.description,
+        input_schema=redact_mapping(tool.input_schema),
+        schema_valid=tool.schema_valid,
+        schema_validation_errors=redact_mapping(tool.schema_validation_errors),
+        descriptor_hash=tool.descriptor_hash,
+        credential_scope_required=tool.credential_scope_required,
+        enabled=tool.enabled,
+        timeout_ms=tool.timeout_ms,
+        output_limit_bytes=tool.output_limit_bytes,
+        last_discovered_at=tool.last_discovered_at,
+        created_at=tool.created_at,
+        updated_at=tool.updated_at,
+    )
+
+
+def _discovery_credential_value(
+    session: Session, server: McpServer, version: McpServerVersion
+) -> str | None:
+    grants = session.execute(
+        select(McpServerAttachment).where(
+            McpServerAttachment.mcp_server_version_id == version.id,
+            McpServerAttachment.revoked_at.is_(None),
+            McpServerAttachment.credential_id.isnot(None),
+        )
+    ).scalars()
+    for grant in grants:
+        owner_scope_matches = (
+            server.team_id is not None and grant.team_id == server.team_id
+        ) or (server.project_id is not None and grant.project_id == server.project_id)
+        if not owner_scope_matches:
+            continue
+        credential = session.get(Credential, grant.credential_id)
+        if credential is not None:
+            return decrypt_secret(credential.encrypted_material)
+    return None
 
 
 @router.post("", response_model=McpServerRead, status_code=201)
@@ -559,3 +670,191 @@ def get_mcp_server_tools(
     if version is None:
         raise HTTPException(status_code=404, detail="mcp server version not found")
     return redact_mapping(version.connection_config.get("tools", []))
+
+
+@router.post(
+    "/{mcp_server_id}/versions/{version_number}/health-checks",
+    response_model=McpServerHealthCheckRead,
+    status_code=201,
+)
+def run_mcp_server_discovery(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    payload: McpDiscoveryRequest,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServerHealthCheckRead:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, server, action="mcp_server.discovery.run")
+    version = _get_version(session, mcp_server_id, version_number)
+
+    connection_config = version.connection_config or {}
+    credential_value = _discovery_credential_value(session, server, version)
+    result = discover_mcp_tools(
+        url=connection_config.get("url"),
+        headers=connection_config.get("headers") or {},
+        credential_value=credential_value,
+        settings=DiscoverySettings(
+            timeout_seconds=payload.timeout_seconds, max_attempts=payload.max_attempts
+        ),
+    )
+
+    check = McpServerHealthCheck(
+        mcp_server_version_id=version.id,
+        status=result["status"],
+        tool_count=result["tool_count"],
+        latency_ms=result["latency_ms"],
+        request_metadata=result["request_metadata"],
+        diagnostics=result["diagnostics"],
+        checked_at=result["checked_at"],
+        triggered_by=actor.id,
+    )
+    session.add(check)
+
+    if result["status"] in ("healthy", "degraded"):
+        for discovered in result["tools"]:
+            existing = session.execute(
+                select(McpServerTool).where(
+                    McpServerTool.mcp_server_version_id == version.id,
+                    McpServerTool.tool_name == discovered["name"],
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                session.add(
+                    McpServerTool(
+                        mcp_server_version_id=version.id,
+                        tool_name=discovered["name"],
+                        description=discovered["description"],
+                        input_schema=discovered["input_schema"],
+                        schema_valid=discovered["schema_valid"],
+                        schema_validation_errors=discovered["schema_validation_errors"],
+                        descriptor_hash=discovered["descriptor_hash"],
+                        credential_scope_required=discovered["credential_scope_required"],
+                        last_discovered_at=result["checked_at"],
+                    )
+                )
+            else:
+                existing.description = discovered["description"]
+                existing.input_schema = discovered["input_schema"]
+                existing.schema_valid = discovered["schema_valid"]
+                existing.schema_validation_errors = discovered["schema_validation_errors"]
+                existing.descriptor_hash = discovered["descriptor_hash"]
+                existing.credential_scope_required = discovered["credential_scope_required"]
+                existing.last_discovered_at = result["checked_at"]
+
+    session.flush()
+    session.add(
+        AuditEvent(
+            project_id=server.project_id,
+            event_type="mcp.health_check.recorded",
+            payload={
+                "actor_id": str(actor.id),
+                "mcp_server_id": str(server.id),
+                "mcp_server_version_id": str(version.id),
+                "health_check_id": str(check.id),
+                "status": check.status,
+                "tool_count": check.tool_count,
+                "credential_material_redacted": True,
+            },
+        )
+    )
+    session.flush()
+    session.refresh(check)
+    return _health_check_to_read(check)
+
+
+@router.get(
+    "/{mcp_server_id}/versions/{version_number}/health-checks",
+    response_model=list[McpServerHealthCheckRead],
+)
+def list_mcp_server_health_checks(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[McpServerHealthCheckRead]:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, server, action="mcp_server.discovery.read")
+    version = _get_version(session, mcp_server_id, version_number)
+    checks = session.execute(
+        select(McpServerHealthCheck)
+        .where(McpServerHealthCheck.mcp_server_version_id == version.id)
+        .order_by(McpServerHealthCheck.checked_at.desc())
+    ).scalars()
+    return [_health_check_to_read(check) for check in checks]
+
+
+@router.get(
+    "/{mcp_server_id}/versions/{version_number}/discovered-tools",
+    response_model=list[McpServerToolRead],
+)
+def list_mcp_server_discovered_tools(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[McpServerToolRead]:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(session, actor, server, action="mcp_server.discovery.read")
+    version = _get_version(session, mcp_server_id, version_number)
+    tools = session.execute(
+        select(McpServerTool)
+        .where(McpServerTool.mcp_server_version_id == version.id)
+        .order_by(McpServerTool.tool_name)
+    ).scalars()
+    return [_tool_to_read(tool) for tool in tools]
+
+
+@router.patch(
+    "/{mcp_server_id}/versions/{version_number}/discovered-tools/{tool_name}",
+    response_model=McpServerToolRead,
+)
+def update_mcp_server_discovered_tool(
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    tool_name: str,
+    payload: McpServerToolUpdate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServerToolRead:
+    server = session.get(McpServer, mcp_server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+    _require_server_access(
+        session, actor, server, action="mcp_server.tool.update", mutate=True
+    )
+    version = _get_version(session, mcp_server_id, version_number)
+    tool = session.execute(
+        select(McpServerTool).where(
+            McpServerTool.mcp_server_version_id == version.id,
+            McpServerTool.tool_name == tool_name,
+        )
+    ).scalar_one_or_none()
+    if tool is None:
+        raise HTTPException(status_code=404, detail="mcp server tool not found")
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(tool, key, value)
+    session.flush()
+    session.add(
+        AuditEvent(
+            project_id=server.project_id,
+            event_type="mcp.tool.enablement_updated",
+            payload={
+                "actor_id": str(actor.id),
+                "mcp_server_id": str(server.id),
+                "mcp_server_version_id": str(version.id),
+                "tool_name": tool_name,
+                "updates": updates,
+            },
+        )
+    )
+    session.flush()
+    session.refresh(tool)
+    return _tool_to_read(tool)
