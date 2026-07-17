@@ -362,6 +362,20 @@ export interface TaskGraph {
   dependencies: TaskDependency[]
 }
 
+export interface WorkspaceConflictResource {
+  resource_key: string
+  expected_revision: number
+  actual_revision: number
+}
+
+export interface WorkspaceConflict {
+  project_id: Identifier
+  task_id: Identifier
+  run_id: Identifier
+  occurred_at: string
+  resources: WorkspaceConflictResource[]
+}
+
 export interface RunSnapshot {
   configuration_snapshot_id?: Identifier
   agent_id?: Identifier

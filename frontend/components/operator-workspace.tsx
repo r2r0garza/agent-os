@@ -40,6 +40,7 @@ import {
 } from "@/lib/api"
 import { AccessWorkspace } from "@/components/access-workspace"
 import { ArtifactWorkspace } from "@/components/artifact-workspace"
+import { ConcurrentWorkspacePanel } from "@/components/concurrent-workspace-panel"
 import { GoalLifecyclePanel } from "@/components/goal-lifecycle-panel"
 import { GovernanceOperations } from "@/components/governance-operations"
 import {
@@ -705,6 +706,15 @@ export function OperatorWorkspace() {
             )}
           </CardContent>
         </Card>
+
+        <ConcurrentWorkspacePanel
+          projectId={selectedProjectId}
+          goals={goals}
+          onRefresh={async () => {
+            await loadProjectState(selectedProjectId)
+            if (selectedGoalId) await loadGoalState(selectedGoalId)
+          }}
+        />
 
         <GoalLifecyclePanel
           goalId={selectedGoalId}
