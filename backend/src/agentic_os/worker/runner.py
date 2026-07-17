@@ -26,6 +26,13 @@ from agentic_os.domain.models import (
 from agentic_os.observability import CorrelationContext, record_observability
 from agentic_os.worker.approvals import ensure_action_approvals
 from agentic_os.worker.configuration import ConfigurationSnapshotError, resolve_run_configuration
+from agentic_os.worker.controls import (
+    GoalControlDecision,
+    GoalControlInterrupt,
+    complete_controlled_run,
+    observe_goal_control,
+    reconcile_goal_controls,
+)
 from agentic_os.worker.governance import (
     BudgetActionContext,
     BudgetExhaustedError,
@@ -35,7 +42,7 @@ from agentic_os.worker.governance import (
     reserve_action_cost,
 )
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS, claim_ready_task, release_lease, renew_lease
-from agentic_os.worker.sandbox_execution import execute_task_sandbox
+from agentic_os.worker.sandbox_execution import SandboxControlInterrupt, execute_task_sandbox
 from agentic_os.worker.tools import invoke_tool
 from agentic_os.worker.workspace import promote_workspace_changes
 
@@ -64,17 +71,47 @@ def run_task_worker_once(
     worker process at a controlled, persisted mid-run point before killing
     it.
     """
+    reconcile_goal_controls(session)
     task = claim_ready_task(session, worker_id, lease_seconds=lease_seconds)
     if task is None:
         return None
 
     goal = session.get(Goal, task.goal_id)
     project_id = goal.project_id if goal is not None else None
+    if goal is not None:
+        decision = observe_goal_control(session, goal)
+        if decision is not None:
+            complete_controlled_run(
+                session,
+                goal=goal,
+                task=task,
+                run=None,
+                worker_id=worker_id,
+                project_id=project_id,
+                decision=decision,
+            )
+            return task
 
     _fail_interrupted_previous_attempt(session, task, project_id=project_id)
 
     try:
         _execute_claimed_task(session, task, worker_id, project_id=project_id, on_run_started=on_run_started)
+    except GoalControlInterrupt as interrupt:
+        run = session.execute(
+            select(Run)
+            .where(Run.task_id == task.id, Run.status == "running")
+            .order_by(Run.attempt_number.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        complete_controlled_run(
+            session,
+            goal=goal,
+            task=task,
+            run=run,
+            worker_id=worker_id,
+            project_id=project_id,
+            decision=interrupt.decision,
+        )
     except Exception as error:
         # Reconcile a run created earlier in this same failed attempt so it
         # never lingers as "running" once the attempt has already failed.
@@ -150,6 +187,11 @@ def _execute_claimed_task(
     goal = session.get(Goal, task.goal_id)
     if goal is None:
         raise TaskExecutionError(f"goal {task.goal_id} not found")
+
+    def _check_control() -> None:
+        decision = observe_goal_control(session, goal)
+        if decision is not None:
+            raise GoalControlInterrupt(decision)
 
     attempt_number = (
         session.execute(
@@ -279,6 +321,7 @@ def _execute_claimed_task(
         )
         session.commit()
         on_run_started()
+        _check_control()
 
     if policy_decision == "deny":
         raise TaskExecutionError(f"policy denied execution for agent {agent['id']}")
@@ -360,6 +403,7 @@ def _execute_claimed_task(
     )
     tool_results: dict[str, dict] = {}
     for tool_name in enabled_tools:
+        _check_control()
         # Definition visibility and credential grants are mutable authority,
         # unlike the pinned configuration payload. Re-check them before any
         # budget reservation or external tool side effect so revocation fails
@@ -379,6 +423,7 @@ def _execute_claimed_task(
         # per-budget lock is acquired, which gives concurrent workers one
         # consistent lock order and avoids task-row/budget-row deadlocks.
         session.commit()
+        _check_control()
         try:
             cost = reserve_action_cost(
                 session,
@@ -480,6 +525,15 @@ def _execute_claimed_task(
             attributes={"boundary": "budget_reservation", "tool": tool_name},
         )
         session.commit()
+        try:
+            _check_control()
+        except GoalControlInterrupt:
+            release_action_cost(
+                session,
+                cost,
+                reason="goal control interrupted execution before external side effect",
+            )
+            raise
 
         tool_call_id = uuid.uuid4()
         mcp_call_id = uuid.uuid4()
@@ -597,10 +651,25 @@ def _execute_claimed_task(
 
     sandbox_config = capability_manifest.get("sandbox")
     if sandbox_config:
+        _check_control()
         sandbox_id = uuid.uuid4()
-        sandbox_result = execute_task_sandbox(
-            session, task, run.id, sandbox_config, project_id=project_id
-        )
+        try:
+            sandbox_result = execute_task_sandbox(
+                session,
+                task,
+                run.id,
+                sandbox_config,
+                project_id=project_id,
+                control_check=lambda: (
+                    (decision.action, decision.forced)
+                    if (decision := observe_goal_control(session, goal)) is not None
+                    else None
+                ),
+            )
+        except SandboxControlInterrupt as interrupt:
+            raise GoalControlInterrupt(
+                GoalControlDecision(interrupt.action, forced=interrupt.forced)
+            ) from interrupt
         if sandbox_result["exit_code"] != 0 or sandbox_result["timed_out"]:
             raise TaskExecutionError(
                 f"sandbox execution for task {task.id} did not succeed: {sandbox_result}"
@@ -620,9 +689,11 @@ def _execute_claimed_task(
             },
         )
 
+    _check_control()
     renew_lease(session, task, worker_id)
 
     promote_workspace_changes(session, task, run, worker_id)
+    _check_control()
 
     citation_summary = [
         {

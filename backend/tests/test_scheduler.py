@@ -213,6 +213,28 @@ class SchedulerTestCase(unittest.TestCase):
             self.assertIsNotNone(claimed)
             self.assertEqual(claimed.id, downstream_id)
 
+    def test_claim_skips_tasks_for_paused_and_cancelled_goals(self) -> None:
+        with self.Session() as session:
+            paused_goal, agent_version = self._build_environment(session)
+            paused_goal.status = "paused"
+            paused = self._make_task(session, paused_goal, agent_version, title="Paused")
+
+            cancelled_goal, cancelled_agent_version = self._build_environment(session)
+            cancelled_goal.status = "cancelled"
+            cancelled = self._make_task(
+                session,
+                cancelled_goal,
+                cancelled_agent_version,
+                title="Cancelled",
+            )
+            session.commit()
+            paused_id, cancelled_id = paused.id, cancelled.id
+
+        with self.Session() as session:
+            self.assertIsNone(claim_ready_task(session, "worker-control"))
+            self.assertEqual(session.get(Task, paused_id).status, "pending")
+            self.assertEqual(session.get(Task, cancelled_id).status, "pending")
+
     def test_conflicting_resource_intent_blocks_claim_until_release(self) -> None:
         with self.Session() as session:
             goal, agent_version = self._build_environment(session)

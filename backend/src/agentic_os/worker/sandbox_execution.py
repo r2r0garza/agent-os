@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
+import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
@@ -23,6 +25,15 @@ class SandboxUnavailableError(RuntimeError):
     """Raised when a task requests sandbox execution but no runtime is usable."""
 
 
+class SandboxControlInterrupt(RuntimeError):
+    """Raised after a live sandbox has been stopped for a goal control."""
+
+    def __init__(self, action: str, *, forced: bool) -> None:
+        super().__init__(f"sandbox interrupted by goal {action}")
+        self.action = action
+        self.forced = forced
+
+
 def execute_task_sandbox(
     session: Session,
     task: Task,
@@ -30,6 +41,7 @@ def execute_task_sandbox(
     sandbox_config: dict[str, Any],
     *,
     project_id: uuid.UUID | None,
+    control_check: Callable[[], tuple[str, bool] | None] | None = None,
 ) -> dict[str, Any]:
     """Run one task's sandbox request end to end and persist its lifecycle events.
 
@@ -78,16 +90,77 @@ def execute_task_sandbox(
         )
         session.flush()
 
+    handle = None
+    stopped = False
+    cleaned_up = False
     try:
+        if control_check is not None:
+            control = control_check()
+            if control is not None:
+                raise SandboxControlInterrupt(control[0], forced=control[1])
         handle, created_event = runtime.create(spec)
         _record(created_event)
         try:
             _record(runtime.start(handle))
-            result, exited_event = runtime.wait(handle)
+            wait_result: list[tuple[Any, SandboxLifecycleEvent]] = []
+            wait_error: list[BaseException] = []
+            stop_result: list[SandboxLifecycleEvent] = []
+
+            def _wait() -> None:
+                try:
+                    wait_result.append(runtime.wait(handle))
+                except BaseException as error:
+                    wait_error.append(error)
+
+            wait_thread = threading.Thread(target=_wait, daemon=True)
+            wait_thread.start()
+            control = None
+            stop_thread = None
+            while wait_thread.is_alive():
+                if control_check is not None:
+                    control = control_check()
+                if control is not None and stop_thread is None:
+                    stop_thread = threading.Thread(
+                        target=lambda: stop_result.append(runtime.stop(handle)),
+                        daemon=True,
+                    )
+                    stop_thread.start()
+                if (
+                    control is not None
+                    and control[1]
+                    and stop_thread is not None
+                    and stop_thread.is_alive()
+                    and not cleaned_up
+                ):
+                    _record(
+                        SandboxLifecycleEvent(
+                            event_type="sandbox.forced_termination",
+                            handle_id=handle.id,
+                            payload={"runtime": runtime.name, "control": control[0]},
+                        )
+                    )
+                    _record(runtime.cleanup(handle))
+                    cleaned_up = True
+                time.sleep(0.05)
+            wait_thread.join()
+            if stop_thread is not None:
+                stop_thread.join(timeout=0.1)
+                stopped = not stop_thread.is_alive()
+                if stopped and stop_result:
+                    _record(stop_result[0])
+            if control is not None:
+                raise SandboxControlInterrupt(control[0], forced=control[1])
+            if wait_error:
+                raise wait_error[0]
+            result, exited_event = wait_result[0]
             _record(exited_event)
         finally:
-            _record(runtime.stop(handle))
-            _record(runtime.cleanup(handle))
+            if handle is not None and not stopped and not cleaned_up:
+                _record(runtime.stop(handle))
+                stopped = True
+            if handle is not None and not cleaned_up:
+                _record(runtime.cleanup(handle))
+                cleaned_up = True
     finally:
         shutil.rmtree(workspace_dir, ignore_errors=True)
 

@@ -787,6 +787,53 @@ class WorkerTestCase(unittest.TestCase):
             task = session.get(Task, task_id)
             self.assertEqual(task.status, "completed")
 
+    def test_restart_reconciles_expired_run_for_paused_goal(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id, goal_id = task.id, task.goal_id
+            agent_version_id = task.assigned_agent_version_id
+            session.commit()
+
+        with self.Session() as session:
+            task = claim_ready_task(session, "worker-crashed", lease_seconds=60)
+            task.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            session.add(
+                Run(
+                    task_id=task.id,
+                    attempt_number=1,
+                    idempotency_key=f"{task.id}:1",
+                    lease_token=task.lease_token,
+                    agent_version_id=agent_version_id,
+                    status="running",
+                    started_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+                )
+            )
+            goal = session.get(Goal, goal_id)
+            goal.status = "paused"
+            goal.pending_control = "pause"
+            goal.control_version += 1
+            session.commit()
+
+        with self.Session() as session:
+            self.assertIsNone(run_task_worker_once(session, "worker-restarted"))
+            session.commit()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            goal = session.get(Goal, goal_id)
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(task.status, "pending")
+            self.assertIsNone(task.lease_owner)
+            self.assertEqual(run.status, "cancelled")
+            self.assertEqual(goal.status, "paused")
+            self.assertIsNone(goal.pending_control)
+            event_types = set(
+                session.execute(
+                    select(AuditEvent.event_type).where(AuditEvent.task_id == task_id)
+                ).scalars()
+            )
+            self.assertIn("run.control_recovered", event_types)
+
     def test_policy_deny_blocks_execution_and_fails_task(self) -> None:
         with self.Session() as session:
             task = self._build_ready_task(session)
@@ -1067,6 +1114,87 @@ class WorkerTestCase(unittest.TestCase):
                 },
             )
             self.assertTrue(all(request.status == "pending" for request in requests))
+
+    def test_pause_interrupts_at_run_started_boundary_and_remains_resumable(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id, goal_id = task.id, task.goal_id
+            session.commit()
+
+        def pause_goal() -> None:
+            with self.Session() as control_session:
+                goal = control_session.get(Goal, goal_id)
+                goal.status = "paused"
+                goal.pending_control = "pause"
+                goal.control_version += 1
+                goal.control_requested_at = datetime.now(timezone.utc)
+                control_session.commit()
+
+        with self.Session() as session:
+            result = run_task_worker_once(
+                session,
+                "worker-pause",
+                on_run_started=pause_goal,
+            )
+            session.commit()
+            self.assertEqual(result.status, "pending")
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            goal = session.get(Goal, goal_id)
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(task.status, "pending")
+            self.assertIsNone(task.lease_owner)
+            self.assertEqual(run.status, "cancelled")
+            self.assertEqual(goal.status, "paused")
+            self.assertIsNone(goal.pending_control)
+            event_types = set(
+                session.execute(
+                    select(AuditEvent.event_type).where(AuditEvent.task_id == task_id)
+                ).scalars()
+            )
+            self.assertIn("run.pause_acknowledged", event_types)
+
+    def test_cancel_after_grace_forces_active_attempt_to_cancel(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            task_id, goal_id = task.id, task.goal_id
+            session.commit()
+
+        def cancel_goal() -> None:
+            with self.Session() as control_session:
+                goal = control_session.get(Goal, goal_id)
+                goal.status = "cancelled"
+                goal.pending_control = "cancel"
+                goal.control_version += 1
+                goal.control_requested_at = datetime.now(timezone.utc) - timedelta(seconds=31)
+                goal.cancellation_grace_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                control_session.commit()
+
+        with self.Session() as session:
+            result = run_task_worker_once(
+                session,
+                "worker-cancel",
+                on_run_started=cancel_goal,
+            )
+            session.commit()
+            self.assertEqual(result.status, "cancelled")
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            goal = session.get(Goal, goal_id)
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(task.status, "cancelled")
+            self.assertEqual(run.status, "cancelled")
+            self.assertIsNotNone(goal.forced_termination_requested_at)
+            self.assertIsNotNone(goal.forced_termination_completed_at)
+            self.assertIsNone(goal.pending_control)
+            event_types = set(
+                session.execute(
+                    select(AuditEvent.event_type).where(AuditEvent.task_id == task_id)
+                ).scalars()
+            )
+            self.assertIn("run.cancel_acknowledged", event_types)
 
     def test_every_tool_call_mode_resumes_through_api_with_budget_evidence(self) -> None:
         with self.Session() as session:

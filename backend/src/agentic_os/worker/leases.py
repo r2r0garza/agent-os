@@ -6,7 +6,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql import exists
 
-from agentic_os.domain.models import Task, TaskDependency
+from agentic_os.domain.models import Goal, Task, TaskDependency
 from agentic_os.worker.workspace import (
     acquire_resource_leases,
     release_resource_leases,
@@ -88,7 +88,12 @@ def claim_ready_task(
     for _ in range(_CANDIDATE_BATCH_SIZE):
         stmt = (
             select(Task)
+            .join(Goal, Goal.id == Task.goal_id)
             .where(Task.status.in_(_CLAIMABLE_STATUSES))
+            # API-created goals remain draft while their first task graph is
+            # assigned and executed. Both draft and active are executable;
+            # paused, cancelled, and terminal goals must never dispatch.
+            .where(Goal.status.in_(("draft", "active")))
             .where(Task.assigned_agent_version_id.is_not(None))
             .where(or_(Task.lease_expires_at.is_(None), Task.lease_expires_at < now))
             .where(~exists(unmet_dependency))
