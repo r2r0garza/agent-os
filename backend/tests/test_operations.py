@@ -23,6 +23,7 @@ from agentic_os.operations import (
     create_backup,
     migration_status,
     restore_backup,
+    upgrade_preflight,
     verify_backup,
 )
 
@@ -104,6 +105,75 @@ class LocalOperationsTests(unittest.TestCase):
                 archive.add(unpacked / "agentic-os-backup", arcname="agentic-os-backup")
             with self.assertRaisesRegex(OperationError, "integrity"):
                 verify_backup(tampered, root / "verify")
+
+
+class BackupRootDefaultTests(unittest.TestCase):
+    """AGENTIC_OS_BACKUP_ROOT lets operators omit --output on the team VM."""
+
+    def _environment(self, root: Path) -> dict[str, str]:
+        return {
+            "AGENTIC_OS_DATABASE_URL": "postgresql+psycopg://operator:secret@db.test:5432/agentic_os",
+            "AGENTIC_OS_ARTIFACT_ROOT": str(root / "artifacts"),
+            "AGENTIC_OS_MASTER_KEY_FILE": str(root / "master.key"),
+        }
+
+    def test_backup_without_output_uses_backup_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "artifacts").mkdir()
+            backup_root = root / "backups"
+            environment = self._environment(root)
+            environment["AGENTIC_OS_BACKUP_ROOT"] = str(backup_root)
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch(
+                "agentic_os.operations.subprocess.run", side_effect=LocalOperationsTests._fake_postgres
+            ):
+                result = create_backup()
+            backup_path = Path(result["backup"])
+            self.assertEqual(backup_path.parent, backup_root.resolve())
+            self.assertTrue(backup_path.name.startswith("agentic-os-"))
+            self.assertTrue(backup_path.is_file())
+
+    def test_backup_without_output_or_backup_root_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "artifacts").mkdir()
+            environment = self._environment(root)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                os.environ.pop("AGENTIC_OS_BACKUP_ROOT", None)
+                with self.assertRaisesRegex(OperationError, "AGENTIC_OS_BACKUP_ROOT"):
+                    create_backup()
+
+    def test_backup_without_output_rejects_remote_backup_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "artifacts").mkdir()
+            environment = self._environment(root)
+            environment["AGENTIC_OS_BACKUP_ROOT"] = "s3://bucket/backups"
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with self.assertRaisesRegex(OperationError, "local/mounted"):
+                    create_backup()
+
+
+class UpgradePreflightRollbackGuidanceTests(unittest.TestCase):
+    """Rollback guidance names the TLS certificate/key only for team deployments."""
+
+    def _run_preflight(self, mode: str) -> dict:
+        with mock.patch("agentic_os.operations.setup_check", return_value="[OK] example: fine"), mock.patch(
+            "agentic_os.operations.migration_status", return_value="database is at the migration head"
+        ), mock.patch("agentic_os.operations._record_maintenance_event"), mock.patch.dict(
+            os.environ, {"AGENTIC_OS_DEPLOYMENT_MODE": mode}, clear=False
+        ):
+            return upgrade_preflight()
+
+    def test_team_mode_mentions_tls_certificate(self) -> None:
+        result = self._run_preflight("team")
+        self.assertEqual(result["deployment_mode"], "team")
+        self.assertIn("TLS certificate", result["rollback"])
+
+    def test_local_mode_omits_tls_certificate(self) -> None:
+        result = self._run_preflight("local")
+        self.assertEqual(result["deployment_mode"], "local")
+        self.assertNotIn("TLS certificate", result["rollback"])
 
 
 class MaintenanceEvidenceTests(unittest.TestCase):

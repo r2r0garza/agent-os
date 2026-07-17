@@ -72,7 +72,11 @@ def parser() -> argparse.ArgumentParser:
     )
     migrations.add_argument("action", choices=("status", "apply"))
     backup = operation_actions.add_parser("backup", help="create an integrity-checked local backup")
-    backup.add_argument("--output", required=True, help="new .tar.gz backup path")
+    backup.add_argument(
+        "--output",
+        default=None,
+        help="new .tar.gz backup path; defaults to a timestamped file under AGENTIC_OS_BACKUP_ROOT",
+    )
     verify = operation_actions.add_parser(
         "verify-backup", help="verify a backup without restoring it"
     )

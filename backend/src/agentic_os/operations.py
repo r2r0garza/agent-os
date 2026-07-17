@@ -23,10 +23,13 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agentic_os.config import (
     ARTIFACT_ROOT_ENV,
+    BACKUP_ROOT_ENV,
     MASTER_KEY_ENV,
     MASTER_KEY_FILE_ENV,
+    TEAM_DEPLOYMENT_MODE,
     TELEMETRY_DISABLED_ENV,
     format_report,
+    resolve_deployment_mode,
     run_preflight,
     validate_postgres_tools,
 )
@@ -196,8 +199,26 @@ def _collect_artifacts(source: Path, destination: Path) -> list[dict[str, Any]]:
     return entries
 
 
-def create_backup(output: str | Path) -> dict[str, Any]:
-    target = Path(output).resolve()
+def _resolve_backup_target(output: str | Path | None) -> Path:
+    if output is not None:
+        return Path(output).resolve()
+    backup_root = os.environ.get(BACKUP_ROOT_ENV)
+    if not backup_root:
+        raise OperationError(
+            f"backup output not provided; pass --output or set {BACKUP_ROOT_ENV} to a durable "
+            "local/mounted backup directory"
+        )
+    if "://" in backup_root:
+        raise OperationError(
+            f"{BACKUP_ROOT_ENV} must be a local/mounted durable filesystem path, not a remote URI "
+            f"(got {backup_root!r})"
+        )
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return (Path(backup_root) / f"agentic-os-{timestamp}.tar.gz").resolve()
+
+
+def create_backup(output: str | Path | None = None) -> dict[str, Any]:
+    target = _resolve_backup_target(output)
     if target.exists():
         raise OperationError(f"backup target already exists: {target}")
     artifact_root = Path(
@@ -359,14 +380,22 @@ def restore_backup(
 def upgrade_preflight() -> dict[str, Any]:
     report = setup_check()
     migrations = migration_status()
+    mode = resolve_deployment_mode()
+    rollback = (
+        "Create and verify a backup before upgrade; restore database, artifacts, "
+        "configuration, and matching master key together if rollback is required."
+    )
+    if mode == TEAM_DEPLOYMENT_MODE:
+        rollback += (
+            " On a team VM, also back up and restore the proxy's TLS certificate and "
+            "private key separately; the application backup archive does not include them."
+        )
     result = {
         "ready": True,
+        "deployment_mode": mode,
         "configuration": report.splitlines(),
         "migrations": migrations,
-        "rollback": (
-            "Create and verify a backup before upgrade; restore database, artifacts, "
-            "configuration, and matching master key together if rollback is required."
-        ),
+        "rollback": rollback,
     }
     _record_maintenance_event("operations.upgrade_preflight", result)
     return result

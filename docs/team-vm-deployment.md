@@ -3,9 +3,11 @@
 Sprint 10 extends the [local Compose deployment](local-deployment.md) to a
 single cloud VM that a trusted small team shares. This document defines the
 topology, TLS/proxy responsibilities, ports, durable volumes, restart
-ordering, and security assumptions that subsequent Sprint 10 issues (#62-#66)
-implement against. It does not add operations commands, frontend views, or
-scaling behavior itself; those are separate, dependent issues.
+ordering, and security assumptions that Sprint 10 issues (#62-#66) implement
+against, and documents the resulting configuration validation (#62) and
+setup/migration/backup/restore/upgrade operator commands (#63) as those land.
+It does not add frontend views (#65) or worker-scaling behavior (#64)
+themselves; those remain separate, dependent issues.
 
 ## Scope and non-goals
 
@@ -249,6 +251,134 @@ Additional fail-closed behavior added for team mode:
 Existing local deployment defaults are unaffected: `AGENTIC_OS_DEPLOYMENT_MODE`
 unset (or `local`) skips every team-only check and preserves prior `config
 check` behavior exactly.
+
+## Operator commands (#63)
+
+The same `agentic-os operations` and `agentic-os config` commands documented
+in [local-deployment.md](local-deployment.md#setup-migrations-backup-restore-and-upgrade)
+prepare, preflight, migrate, back up, restore, and upgrade-check a team VM
+deployment. Nothing here introduces a second command surface: team mode only
+changes which environment variables are set and which checks `run_preflight`
+adds, per [config.py](../backend/src/agentic_os/config.py) and the
+["Remote configuration and secret-key validation" section](#remote-configuration-and-secret-key-validation-62)
+above.
+
+Set team-mode environment once per VM (systemd `EnvironmentFile`, a Compose
+`.env` file, or the process supervisor's own mechanism), then run commands
+over SSH or through the process supervisor exactly as locally:
+
+```bash
+export AGENTIC_OS_DEPLOYMENT_MODE=team
+export AGENTIC_OS_PUBLIC_ORIGIN=https://team.example.com
+export AGENTIC_OS_BACKUP_ROOT=/var/backups/agentic-os
+agentic-os config check          # fails closed on TLS origin, master key, backup destination
+agentic-os operations setup-check
+agentic-os operations migrations status
+agentic-os operations migrations apply
+```
+
+### Backup and restore
+
+`AGENTIC_OS_BACKUP_ROOT` is validated for writability by `config check` in
+team mode; `operations backup` now consumes it directly so operators do not
+have to compute a path by hand. Passing `--output` explicitly still works and
+takes priority:
+
+```bash
+agentic-os operations backup
+# -> writes /var/backups/agentic-os/agentic-os-<UTC timestamp>.tar.gz
+agentic-os operations verify-backup /var/backups/agentic-os/agentic-os-20260101T000000Z.tar.gz
+```
+
+The archive contains the same PostgreSQL dump, artifact bytes, sanitized
+configuration description (including whether telemetry export is disabled),
+and SHA-256 integrity evidence as the local deployment; it never includes
+master-key bytes or database credentials. On a team VM, back up these three
+things separately, to encrypted access-controlled storage, alongside every
+archive:
+
+- the `configuration` volume's master-key file (same as local deployment);
+- the proxy's TLS certificate and private key (new for the team VM; the proxy
+  is not an application role, so its key material is never part of the
+  application backup archive);
+- any provisioning-time secret not stored inside the application volumes
+  (for example a managed PostgreSQL connection string), per the "Security
+  assumptions and secrets" section above.
+
+Restore into an isolated database and artifact directory first, exactly as
+[local-deployment.md](local-deployment.md#setup-migrations-backup-restore-and-upgrade)
+documents, then restore the matching master key and TLS material through
+their own channels before pointing the VM's services at the restored state:
+
+```bash
+agentic-os operations restore /var/backups/agentic-os/agentic-os-20260101T000000Z.tar.gz \
+  --target-database-url "$RESTORE_DATABASE_URL" \
+  --target-artifact-root /var/lib/agentic-os/restore-artifacts
+```
+
+### Upgrade preflight and rollback
+
+```bash
+agentic-os operations upgrade-preflight
+```
+
+This runs `setup-check` (including the team-mode TLS/backup/PostgreSQL-tool
+checks) and reports migration status before any destructive step; a
+non-`team` deployment mode is rejected earlier by `config check` if
+`AGENTIC_OS_DEPLOYMENT_MODE` is unset when team-only environment variables are
+present, so upgrade-preflight never reports success on an unvalidated
+configuration. Only apply migrations after preflight succeeds. The command's
+`rollback` field in team mode explicitly calls out backing up and restoring
+the proxy's TLS certificate and private key alongside the database, artifact,
+configuration, and master-key set; database rollback through an Alembic
+downgrade is not the supported recovery path on the team VM either.
+
+### Service lifecycle (manual service-manager or shell integration)
+
+This topology intentionally names no cloud provider or orchestrator. Operators
+start, stop, and restart the roles from the ["Restart ordering and startup
+dependencies"](#restart-ordering-and-startup-dependencies) section above using
+whatever process supervisor already manages the VM (systemd, a process
+manager, or Compose/Podman running directly on the VM). A systemd-flavored
+sketch, using target units to express the same ordering as the local
+`depends_on` chain:
+
+```ini
+# /etc/systemd/system/agentic-os-api.service
+[Unit]
+Description=Agentic OS API
+After=agentic-os-postgres.service
+Requires=agentic-os-postgres.service
+
+[Service]
+EnvironmentFile=/etc/agentic-os/team.env
+ExecStartPre=/usr/local/bin/agentic-os config check
+ExecStartPre=/usr/local/bin/agentic-os operations migrations apply
+ExecStart=/usr/local/bin/uvicorn agentic_os.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+
+# /etc/systemd/system/agentic-os-worker.service
+[Unit]
+Description=Agentic OS worker
+After=agentic-os-api.service agentic-os-sandbox-runtime.service
+Requires=agentic-os-api.service agentic-os-sandbox-runtime.service
+
+[Service]
+EnvironmentFile=/etc/agentic-os/team.env
+ExecStart=/usr/local/bin/agentic-os worker run-once --workers 1
+Restart=on-failure
+```
+
+Operators equally may keep running Compose/Podman directly on the VM (a
+`docker compose -f compose.yaml -f compose.team.yaml up -d` style override
+that removes published host ports and points volumes at the durable paths in
+the "Durable volumes and persistent paths" section) instead of systemd units;
+either integration point satisfies this topology as long as it preserves the
+restart order above and never publishes application ports outside the proxy.
+
+Stopping services (`systemctl stop agentic-os-worker agentic-os-api` or
+`docker compose stop`) never deletes the durable volumes; only an explicit
+`operations backup`/`restore` or manual volume deletion does.
 
 ## What subsequent issues build on this
 
