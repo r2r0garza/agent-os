@@ -19,6 +19,8 @@ from agentic_os.domain.models import (
     Credential,
     McpServer,
     McpServerAttachment,
+    McpServerHealthCheck,
+    McpServerTool,
     McpServerVersion,
     ModelProfileVersion,
     Policy,
@@ -35,6 +37,20 @@ from agentic_os.worker.tools import BUILTIN_TOOL_DESCRIPTORS
 
 class ConfigurationSnapshotError(RuntimeError):
     """Raised when a worker cannot safely resolve its pinned configuration."""
+
+    reason_code = "credential_or_visibility_revoked"
+
+
+class McpToolUnavailableError(ConfigurationSnapshotError):
+    """Raised when a granted MCP tool is no longer discovered, enabled, or schema-valid."""
+
+    reason_code = "tool_disabled"
+
+
+class McpHealthDegradedError(ConfigurationSnapshotError):
+    """Raised when a granted MCP server has no healthy health-check evidence on record."""
+
+    reason_code = "mcp_health_degraded"
 
 
 @dataclass(frozen=True)
@@ -115,6 +131,28 @@ class ResolvedRunConfiguration:
                 raise ConfigurationSnapshotError(
                     f"MCP definition access for tool {tool_name!r} is no longer available"
                 )
+            if configured.get("grant_type") == "mcp_tools":
+                mcp_server_version_id = uuid.UUID(configured["id"])
+                live_tool = session.execute(
+                    select(McpServerTool).where(
+                        McpServerTool.mcp_server_version_id == mcp_server_version_id,
+                        McpServerTool.tool_name == tool_name,
+                    )
+                ).scalar_one_or_none()
+                if live_tool is None or not live_tool.enabled or not live_tool.schema_valid:
+                    raise McpToolUnavailableError(
+                        f"MCP tool {tool_name!r} is no longer enabled with a valid schema"
+                    )
+                latest_health = session.execute(
+                    select(McpServerHealthCheck)
+                    .where(McpServerHealthCheck.mcp_server_version_id == mcp_server_version_id)
+                    .order_by(McpServerHealthCheck.created_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if latest_health is None or latest_health.status != "healthy":
+                    raise McpHealthDegradedError(
+                        f"MCP server for tool {tool_name!r} does not have current healthy status evidence"
+                    )
             if configured["connection_config"].get("credential_required") is not True:
                 return
             raw_grant_id = configured.get("credential_grant_id")
@@ -207,16 +245,37 @@ def resolve_run_configuration(
         version = session.get(SkillVersion, attachment.skill_version_id)
         if version is None:
             raise ConfigurationSnapshotError(f"skill version {attachment.skill_version_id} not found")
-        skills.append(
-            {
-                "id": str(version.id),
-                "skill_id": str(version.skill_id),
-                "version_number": version.version_number,
-                "content_ref": version.content_ref,
-                "resource_metadata": copy.deepcopy(version.resource_metadata or {}),
-                "attachment_config": copy.deepcopy(attachment.attachment_config or {}),
-            }
-        )
+        attachment_config = copy.deepcopy(attachment.attachment_config or {})
+        skill_entry: dict[str, Any] = {
+            "id": str(version.id),
+            "skill_id": str(version.skill_id),
+            "version_number": version.version_number,
+            "content_ref": version.content_ref,
+            "resource_metadata": copy.deepcopy(version.resource_metadata or {}),
+            "attachment_config": attachment_config,
+            "grant_type": attachment_config.get("grant_type"),
+        }
+        if attachment_config.get("grant_type") == "skill_resources":
+            resource_paths = list(attachment_config.get("resource_paths", []))
+            granted_resources = [
+                copy.deepcopy(resource)
+                for resource in (version.resources or [])
+                if isinstance(resource, dict) and resource.get("path") in resource_paths
+            ]
+            missing_paths = sorted(
+                set(resource_paths) - {resource.get("path") for resource in granted_resources}
+            )
+            if missing_paths:
+                raise ConfigurationSnapshotError(
+                    f"granted skill resources {missing_paths} are no longer present on "
+                    f"skill version {version.id}"
+                )
+            skill_entry["resource_paths"] = resource_paths
+            skill_entry["resources"] = granted_resources
+            skill_entry["package_hash"] = version.package_hash
+            skill_entry["declared_capabilities"] = copy.deepcopy(version.declared_capabilities or [])
+            skill_entry["provenance"] = copy.deepcopy(version.provenance or {})
+        skills.append(skill_entry)
 
     mcp_attachments = list(
         session.execute(
@@ -246,6 +305,55 @@ def resolve_run_configuration(
                 f"MCP definition {server.id} is not accessible to project {project.id}"
             )
         connection_config = copy.deepcopy(version.connection_config or {})
+        attachment_config = copy.deepcopy(attachment.attachment_config or {})
+        grant_type = attachment_config.get("grant_type")
+        if grant_type == "mcp_tools":
+            pinned_tools = attachment_config.get("tools", [])
+            if not pinned_tools:
+                raise ConfigurationSnapshotError(
+                    f"MCP tool grant on version {version.id} has no selected tools"
+                )
+            selected_names = [item.get("name") for item in pinned_tools]
+            live_tools = {
+                tool.tool_name: tool
+                for tool in session.execute(
+                    select(McpServerTool).where(
+                        McpServerTool.mcp_server_version_id == version.id,
+                        McpServerTool.tool_name.in_(selected_names),
+                    )
+                ).scalars()
+            }
+            resolved_tools: list[dict[str, Any]] = []
+            for pinned in pinned_tools:
+                name = pinned.get("name")
+                live = live_tools.get(name)
+                if live is None:
+                    raise ConfigurationSnapshotError(
+                        f"granted MCP tool {name!r} is no longer discovered on version {version.id}"
+                    )
+                tool_entry: dict[str, Any] = {
+                    "name": name,
+                    "description": live.description or "",
+                    "input_schema": copy.deepcopy(live.input_schema or {}),
+                }
+                if pinned.get("timeout_ms") is not None:
+                    tool_entry["timeout_ms"] = pinned["timeout_ms"]
+                if pinned.get("output_limit_bytes") is not None:
+                    tool_entry["output_limit_bytes"] = pinned["output_limit_bytes"]
+                resolved_tools.append(
+                    {
+                        **tool_entry,
+                        "pinned_descriptor_hash": pinned.get("descriptor_hash"),
+                        "credential_scope_required": live.credential_scope_required,
+                    }
+                )
+            connection_config["tools"] = [
+                {key: value for key, value in item.items() if key not in ("pinned_descriptor_hash", "credential_scope_required")}
+                for item in resolved_tools
+            ]
+            connection_config["credential_required"] = bool(
+                connection_config.get("credential_required")
+            ) or any(item["credential_scope_required"] for item in resolved_tools)
         grants = list(
             session.execute(
                 select(McpServerAttachment).where(
@@ -297,7 +405,13 @@ def resolve_run_configuration(
                 "connection_config": connection_config,
                 "credential_grant_id": str(grant.id) if grant else None,
                 "credential_configured": credential is not None,
-                "attachment_config": copy.deepcopy(attachment.attachment_config or {}),
+                "attachment_config": attachment_config,
+                "grant_type": grant_type,
+                "pinned_tool_descriptor_hashes": (
+                    {item["name"]: item.get("descriptor_hash") for item in attachment_config.get("tools", [])}
+                    if grant_type == "mcp_tools"
+                    else {}
+                ),
             }
         )
 

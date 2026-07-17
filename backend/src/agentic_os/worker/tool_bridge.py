@@ -158,16 +158,31 @@ class GovernedToolBridge:
         return result
 
     def skill_resources(self) -> list[dict[str, Any]]:
-        return [
-            _redact(
-                {
-                    "skill_version_id": skill["id"],
-                    "content_ref": skill["content_ref"],
-                    "resource_metadata": skill.get("resource_metadata") or {},
-                }
-            )
-            for skill in self.resolved.configuration["skills"]
-        ]
+        result = []
+        for skill in self.resolved.configuration["skills"]:
+            if skill.get("grant_type") == "skill_resources":
+                result.append(
+                    _redact(
+                        {
+                            "skill_version_id": skill["id"],
+                            "resource_paths": skill.get("resource_paths", []),
+                            "resources": skill.get("resources", []),
+                            "declared_capabilities": skill.get("declared_capabilities", []),
+                            "provenance": skill.get("provenance", {}),
+                        }
+                    )
+                )
+            else:
+                result.append(
+                    _redact(
+                        {
+                            "skill_version_id": skill["id"],
+                            "content_ref": skill["content_ref"],
+                            "resource_metadata": skill.get("resource_metadata") or {},
+                        }
+                    )
+                )
+        return result
 
     def invoke(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if tool_name not in self.resolved.enabled_tools:
@@ -185,9 +200,8 @@ class GovernedToolBridge:
                 self.session, tool_name=tool_name, project=self.project
             )
         except ConfigurationSnapshotError as error:
-            self._record_rejection(
-                tool_name, "credential_or_visibility_revoked", reason=str(error)
-            )
+            reason_code = getattr(error, "reason_code", "credential_or_visibility_revoked")
+            self._record_rejection(tool_name, reason_code, reason=str(error))
             raise ToolBridgePolicyError(str(error)) from error
 
         mcp_server_id = None

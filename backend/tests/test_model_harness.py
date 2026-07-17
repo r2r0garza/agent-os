@@ -31,6 +31,8 @@ from agentic_os.domain.models import (
     Credential,
     Goal,
     McpServer,
+    McpServerHealthCheck,
+    McpServerTool,
     McpServerVersion,
     ModelProfile,
     ModelProfileProbe,
@@ -192,6 +194,8 @@ class ModelHarnessTestCase(unittest.TestCase):
         required_capabilities: list[str] | None = None,
         enabled_tools: list[str] | None = None,
         mcp_tool_descriptor: dict | None = None,
+        mcp_tool_grant: dict | None = None,
+        skill_resource_grant: dict | None = None,
         budget_amount_minor_units: int | None = None,
         budget_enforcement_mode: str = "hard_stop",
     ) -> Task:
@@ -266,20 +270,45 @@ class ModelHarnessTestCase(unittest.TestCase):
         skill = Skill(team_id=team.id, created_by=user.id, name="Harness Skill")
         session.add(skill)
         session.flush()
-        skill_version = SkillVersion(
-            skill_id=skill.id,
-            version_number=1,
-            content_ref="skills/harness/v1",
-            resource_metadata={"purpose": "harness-reference"},
-        )
-        session.add(skill_version)
-        session.flush()
-        session.add(
-            AgentVersionSkill(
-                agent_version_id=agent_version.id,
-                skill_version_id=skill_version.id,
+        if skill_resource_grant is not None:
+            skill_version = SkillVersion(
+                skill_id=skill.id,
+                version_number=1,
+                content_ref="skills/harness/v1",
+                resources=skill_resource_grant.get("resources", []),
+                package_hash=skill_resource_grant.get("package_hash", "sha256:test-package"),
+                declared_capabilities=skill_resource_grant.get("declared_capabilities", []),
+                provenance=skill_resource_grant.get("provenance", {}),
+                validation_status="valid",
             )
-        )
+            session.add(skill_version)
+            session.flush()
+            session.add(
+                AgentVersionSkill(
+                    agent_version_id=agent_version.id,
+                    skill_version_id=skill_version.id,
+                    attachment_config={
+                        "grant_type": "skill_resources",
+                        "resource_paths": skill_resource_grant.get("granted_paths", []),
+                    },
+                    granted_by=user.id,
+                )
+            )
+        else:
+            skill_version = SkillVersion(
+                skill_id=skill.id,
+                version_number=1,
+                content_ref="skills/harness/v1",
+                resource_metadata={"purpose": "harness-reference"},
+            )
+            session.add(skill_version)
+            session.flush()
+            session.add(
+                AgentVersionSkill(
+                    agent_version_id=agent_version.id,
+                    skill_version_id=skill_version.id,
+                )
+            )
 
         if mcp_tool_descriptor is not None:
             mcp_server = McpServer(
@@ -302,6 +331,73 @@ class ModelHarnessTestCase(unittest.TestCase):
                     mcp_server_version_id=mcp_version.id,
                 )
             )
+
+        if mcp_tool_grant is not None:
+            mcp_server = McpServer(
+                team_id=team.id,
+                created_by=user.id,
+                name="Harness Governed MCP Server",
+            )
+            session.add(mcp_server)
+            session.flush()
+            mcp_version = McpServerVersion(
+                mcp_server_id=mcp_server.id,
+                version_number=1,
+                connection_config={},
+            )
+            session.add(mcp_version)
+            session.flush()
+
+            tool_rows: dict[str, McpServerTool] = {}
+            for spec in mcp_tool_grant.get("tools", []):
+                row = McpServerTool(
+                    mcp_server_version_id=mcp_version.id,
+                    tool_name=spec["tool_name"],
+                    description=spec.get("description", ""),
+                    input_schema=spec.get("input_schema", {}),
+                    schema_valid=spec.get("schema_valid", True),
+                    descriptor_hash=f"sha256:{spec['tool_name']}-fixture",
+                    credential_scope_required=spec.get("credential_scope_required", False),
+                    enabled=spec.get("enabled", True),
+                    timeout_ms=spec.get("timeout_ms"),
+                    output_limit_bytes=spec.get("output_limit_bytes"),
+                )
+                session.add(row)
+                session.flush()
+                tool_rows[spec["tool_name"]] = row
+
+            granted_names = mcp_tool_grant.get("granted_tool_names", list(tool_rows))
+            session.add(
+                AgentVersionMcpServer(
+                    agent_version_id=agent_version.id,
+                    mcp_server_version_id=mcp_version.id,
+                    attachment_config={
+                        "grant_type": "mcp_tools",
+                        "tools": [
+                            {
+                                "name": name,
+                                "descriptor_hash": tool_rows[name].descriptor_hash,
+                                "timeout_ms": tool_rows[name].timeout_ms,
+                                "output_limit_bytes": tool_rows[name].output_limit_bytes,
+                            }
+                            for name in granted_names
+                        ],
+                    },
+                    granted_by=user.id,
+                )
+            )
+
+            health_status = mcp_tool_grant.get("health_status", "healthy")
+            if health_status is not None:
+                session.add(
+                    McpServerHealthCheck(
+                        mcp_server_version_id=mcp_version.id,
+                        status=health_status,
+                        tool_count=len(tool_rows),
+                        triggered_by=user.id,
+                    )
+                )
+            session.flush()
 
         if enabled_tools:
             session.add(
@@ -375,6 +471,151 @@ class ModelHarnessTestCase(unittest.TestCase):
                 )
             ).scalar_one()
             self.assertEqual(tool_event.payload["arguments"]["secret_token"], "[REDACTED]")
+
+    def test_harness_snapshot_exposes_only_granted_mcp_tool_and_skill_resource(self) -> None:
+        mcp_tool_grant = {
+            "tools": [
+                {"tool_name": "echo", "description": "Echo input", "input_schema": {"type": "object"}},
+                {"tool_name": "hidden_tool", "description": "Not granted", "input_schema": {"type": "object"}},
+            ],
+            "granted_tool_names": ["echo"],
+            "health_status": "healthy",
+        }
+        skill_resource_grant = {
+            "resources": [
+                {"path": "notes/granted.md", "content": "granted-resource-content"},
+                {"path": "notes/withheld.md", "content": "withheld-resource-content"},
+            ],
+            "granted_paths": ["notes/granted.md"],
+        }
+        with fake_model_server("tool_call") as (base_url, handler):
+            with self.Session() as session:
+                task = self._build_harness_task(
+                    session,
+                    base_url=base_url,
+                    required_capabilities=["tool_calls"],
+                    enabled_tools=["echo"],
+                    mcp_tool_grant=mcp_tool_grant,
+                    skill_resource_grant=skill_resource_grant,
+                )
+                task_id = task.id
+
+            with self.Session() as session:
+                claimed = run_task_worker_once(session, "worker-harness-grant-tool")
+                session.commit()
+                self.assertEqual(claimed.status, "completed")
+
+        first_payload = handler.requests[0]["payload"]
+        tool_names = {item["function"]["name"] for item in first_payload["tools"]}
+        self.assertEqual(tool_names, {"echo"})
+        skill_message = first_payload["messages"][1]["content"]
+        self.assertIn("granted-resource-content", skill_message)
+        self.assertNotIn("withheld-resource-content", skill_message)
+
+        with self.Session() as session:
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "completed")
+
+    def test_harness_tool_dispatch_fails_closed_when_granted_tool_disabled(self) -> None:
+        mcp_tool_grant = {
+            "tools": [
+                {"tool_name": "echo", "description": "Echo input", "input_schema": {"type": "object"}},
+            ],
+            "granted_tool_names": ["echo"],
+            "health_status": "healthy",
+        }
+        with fake_model_server("tool_call") as (base_url, handler):
+            with self.Session() as session:
+                task = self._build_harness_task(
+                    session,
+                    base_url=base_url,
+                    required_capabilities=["tool_calls"],
+                    enabled_tools=["echo"],
+                    mcp_tool_grant=mcp_tool_grant,
+                )
+                task_id = task.id
+
+            with self.Session() as session:
+                task_row = session.get(Task, task_id)
+                tool_row = session.execute(
+                    select(McpServerTool)
+                    .join(
+                        AgentVersionMcpServer,
+                        AgentVersionMcpServer.mcp_server_version_id
+                        == McpServerTool.mcp_server_version_id,
+                    )
+                    .where(
+                        AgentVersionMcpServer.agent_version_id == task_row.assigned_agent_version_id,
+                        McpServerTool.tool_name == "echo",
+                    )
+                ).scalar_one()
+                tool_row.enabled = False
+                session.commit()
+
+            with self.Session() as session:
+                with self.assertRaises(TaskExecutionError):
+                    run_task_worker_once(session, "worker-harness-tool-disabled")
+                session.commit()
+
+        # The model's first turn is dispatched (it decides to call the tool),
+        # but the governed bridge must reject dispatch before any second turn.
+        self.assertEqual(len(handler.requests), 1)
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "failed")
+
+            rejection = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.task_id == task_id, AuditEvent.event_type == "tool.rejected"
+                )
+            ).scalar_one()
+            self.assertEqual(rejection.payload["reason_code"], "tool_disabled")
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertNotIn("tool.invoked", event_types)
+
+    def test_harness_tool_dispatch_fails_closed_when_mcp_health_degraded(self) -> None:
+        mcp_tool_grant = {
+            "tools": [
+                {"tool_name": "echo", "description": "Echo input", "input_schema": {"type": "object"}},
+            ],
+            "granted_tool_names": ["echo"],
+            "health_status": "degraded",
+        }
+        with fake_model_server("tool_call") as (base_url, handler):
+            with self.Session() as session:
+                task = self._build_harness_task(
+                    session,
+                    base_url=base_url,
+                    required_capabilities=["tool_calls"],
+                    enabled_tools=["echo"],
+                    mcp_tool_grant=mcp_tool_grant,
+                )
+                task_id = task.id
+
+            with self.Session() as session:
+                with self.assertRaises(TaskExecutionError):
+                    run_task_worker_once(session, "worker-harness-health-degraded")
+                session.commit()
+
+        self.assertEqual(len(handler.requests), 1)
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+
+            rejection = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.task_id == task_id, AuditEvent.event_type == "tool.rejected"
+                )
+            ).scalar_one()
+            self.assertEqual(rejection.payload["reason_code"], "mcp_health_degraded")
 
     def test_harness_truncates_tool_output_and_ignores_untrusted_schema_fields(self) -> None:
         descriptor = {
