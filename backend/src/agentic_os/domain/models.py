@@ -1282,6 +1282,9 @@ class ArtifactCitation(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
 
 class AuditEvent(Base, UUIDPrimaryKeyMixin):
     __tablename__ = "audit_events"
+    __table_args__ = (
+        Index("ix_audit_events_event_type_occurred_at", "event_type", "occurred_at"),
+    )
 
     sequence_number: Mapped[int] = mapped_column(
         BigInteger,

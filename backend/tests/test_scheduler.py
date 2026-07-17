@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -7,12 +8,14 @@ import threading
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
@@ -20,11 +23,13 @@ from agentic_os.domain.models import (
     AgentVersion,
     AgentVersionMcpServer,
     AgentVersionSkill,
+    AuditEvent,
     Budget,
     Goal,
     McpServer,
     McpServerVersion,
     Project,
+    Run,
     Skill,
     SkillVersion,
     Task,
@@ -34,6 +39,11 @@ from agentic_os.domain.models import (
 )
 from agentic_os.worker import claim_ready_task, run_scheduler_once
 from agentic_os.worker.leases import release_lease
+from agentic_os.worker.scheduler import (
+    WORKER_HEARTBEAT_EVENT_TYPE,
+    record_worker_heartbeat,
+    summarize_worker_heartbeats,
+)
 
 BACKEND_ROOT = Path(__file__).parents[1]
 
@@ -403,6 +413,136 @@ class SchedulerTestCase(unittest.TestCase):
             task = session.get(Task, task_id)
             self.assertEqual(task.status, "completed")
             self.assertIsNone(task.lease_owner)
+
+    def test_run_scheduler_once_records_worker_heartbeat(self) -> None:
+        with self.Session() as session:
+            goal, agent_version = self._build_environment(session)
+            self._make_task(session, goal, agent_version, title="Heartbeat Task")
+            session.commit()
+
+        result = run_scheduler_once(self.Session, "heartbeat-worker", worker_count=2)
+        self.assertEqual(result.errors, [])
+
+        with self.Session() as session:
+            events = (
+                session.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.event_type == WORKER_HEARTBEAT_EVENT_TYPE)
+                    .order_by(AuditEvent.occurred_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+        matching = [event for event in events if event.payload.get("worker_id_prefix") == "heartbeat-worker"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].payload["worker_count"], 2)
+        self.assertEqual(matching[0].payload["claimed"], 1)
+        self.assertEqual(matching[0].payload["error_count"], 0)
+
+    def test_summarize_worker_heartbeats_distinguishes_live_missing_and_forgotten(self) -> None:
+        # Other tests in this module also call ``run_scheduler_once`` and
+        # leave their own live-window heartbeats behind in the shared
+        # database, so capacity is asserted as a delta against a baseline
+        # rather than an absolute count.
+        now = datetime.now(timezone.utc)
+        with self.Session() as session:
+            baseline_capacity = summarize_worker_heartbeats(session, now=now).configured_capacity
+
+        with self.Session.begin() as session:
+            session.add(
+                AuditEvent(
+                    event_type=WORKER_HEARTBEAT_EVENT_TYPE,
+                    payload={"worker_id_prefix": "live-worker", "worker_count": 2, "claimed": 1, "error_count": 0},
+                    occurred_at=now - timedelta(seconds=5),
+                )
+            )
+            session.add(
+                AuditEvent(
+                    event_type=WORKER_HEARTBEAT_EVENT_TYPE,
+                    payload={"worker_id_prefix": "missing-worker", "worker_count": 1, "claimed": 0, "error_count": 0},
+                    occurred_at=now - timedelta(seconds=600),
+                )
+            )
+            session.add(
+                AuditEvent(
+                    event_type=WORKER_HEARTBEAT_EVENT_TYPE,
+                    payload={"worker_id_prefix": "forgotten-worker", "worker_count": 1, "claimed": 0, "error_count": 0},
+                    occurred_at=now - timedelta(seconds=3600),
+                )
+            )
+
+        with self.Session() as session:
+            summary = summarize_worker_heartbeats(session, now=now)
+
+        self.assertIn("live-worker", summary.live_worker_ids)
+        self.assertIn("missing-worker", summary.missing_worker_ids)
+        self.assertNotIn("forgotten-worker", summary.live_worker_ids)
+        self.assertNotIn("forgotten-worker", summary.missing_worker_ids)
+        self.assertEqual(summary.configured_capacity - baseline_capacity, 2)
+
+    def test_concurrent_worker_processes_claim_disjoint_tasks_without_duplication(self) -> None:
+        """Exit criterion for #64: two independently-started OS processes
+        (not just in-process threads) claiming from the same durable
+        database must never claim the same task twice or leave a task
+        stuck, proving the DB-level fencing/advisory-lock design generalizes
+        beyond the in-process thread pool ``run_scheduler_once`` already
+        covers.
+        """
+        with self.Session() as session:
+            goal, agent_version = self._build_environment(session)
+            task_ids = {
+                str(self._make_task(session, goal, agent_version, title=f"Process Task {index}").id)
+                for index in range(6)
+            }
+            session.commit()
+
+        env = dict(os.environ, AGENTIC_OS_DATABASE_URL=TEST_DATABASE_URL)
+
+        def run_worker_process(worker_id: str) -> list[dict]:
+            completed = subprocess.run(
+                ["agentic-os", "worker", "run-once", "--worker-id", worker_id],
+                cwd=BACKEND_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return [
+                json.loads(line)
+                for line in completed.stdout.splitlines()
+                if line.startswith("{")
+            ]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(run_worker_process, f"process-{index}") for index in range(2)
+            ]
+            claimed_by_process = [future.result() for future in futures]
+
+        claimed_task_ids = [entry["task_id"] for entries in claimed_by_process for entry in entries]
+        # No task claimed by more than one process, and none left behind.
+        self.assertEqual(len(claimed_task_ids), len(set(claimed_task_ids)))
+        self.assertEqual(set(claimed_task_ids), task_ids)
+        for entries in claimed_by_process:
+            for entry in entries:
+                self.assertEqual(entry["status"], "completed")
+
+        with self.Session() as session:
+            tasks = session.execute(select(Task).where(Task.id.in_(task_ids))).scalars().all()
+            self.assertEqual(len(tasks), len(task_ids))
+            for task in tasks:
+                self.assertEqual(task.status, "completed")
+                self.assertIsNone(task.lease_owner)
+
+            runs = session.execute(select(Run).where(Run.task_id.in_(task_ids))).scalars().all()
+            runs_by_task: dict[uuid.UUID, list[Run]] = {}
+            for run in runs:
+                runs_by_task.setdefault(run.task_id, []).append(run)
+            for task_id in task_ids:
+                task_runs = runs_by_task.get(uuid.UUID(task_id), [])
+                self.assertEqual(len(task_runs), 1, f"task {task_id} has duplicate runs: {task_runs}")
+                self.assertEqual(task_runs[0].status, "completed")
 
 
 if __name__ == "__main__":

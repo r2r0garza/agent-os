@@ -151,8 +151,14 @@ the team VM does not need a new role — it needs to allow more than one
 instance of the same role:
 
 - Each `worker` instance keeps its own `AGENTIC_OS_WORKER_ID` (as `compose.yaml`
-  already sets for the single local worker), so lease and heartbeat state
-  (`agentic_os.worker.leases`) can distinguish instances.
+  already sets for the single local worker), so lease state
+  (`agentic_os.worker.leases`) and heartbeat state
+  (`agentic_os.worker.scheduler.record_worker_heartbeat`) can distinguish
+  instances. Claim safety comes from PostgreSQL-level transaction-scoped
+  advisory locks and lease fencing tokens (`agentic_os.worker.scheduler.
+  claim_ready_task`), so it holds across independent OS processes on the
+  same VM exactly as it already does across in-process worker threads; no
+  process-local coordination is required.
 - All `worker` instances share the same `postgres` system of record, the same
   `artifacts` store, and the same `configuration` volume (master key), so
   scaling workers never creates a second source of truth.
@@ -161,9 +167,20 @@ instance of the same role:
   the controller-only access rule from `VISION.md` applies per worker
   instance, not just once for the VM.
 - Worker count is an operational scaling decision (how many `worker` processes
-  the VM or process supervisor runs), not a topology change; Sprint 10 issue
+  the VM or process supervisor runs), not a topology change. Sprint 10 issue
   #64 implements the recovery-health evidence that proves multiple workers
-  recover leased work correctly after restart.
+  recover leased work correctly after restart: each `run_scheduler_once`
+  invocation (one per `worker-loop.sh` poll cycle) durably records a
+  `worker.heartbeat` audit event carrying its worker id and configured
+  concurrency, reusing the existing audit trail rather than a separate
+  heartbeat store. `GET /api/v1/admin/observability/health` aggregates this
+  into `workers.capacity`, `workers.live_worker_ids`, and
+  `workers.missing_worker_ids`, and distinguishes `healthy`, `degraded` (a
+  known worker stopped heartbeating, or nobody has claimed a backlog yet
+  while a worker is still polling), `recovering` (a stale lease exists but a
+  live worker can reclaim it), `stale` (a stale lease exists and no worker is
+  live to reclaim it), and `unavailable` (backlog exists and no worker is
+  active or even polling) worker states.
 
 ## Security assumptions and secrets
 

@@ -8,7 +8,13 @@ from agentic_os.worker.leases import (
 from agentic_os.worker.policy import evaluate_policy
 from agentic_os.worker.runner import TaskExecutionError, run_task_worker_once
 from agentic_os.worker.sandbox_execution import SandboxUnavailableError, execute_task_sandbox
-from agentic_os.worker.scheduler import SchedulerResult, run_scheduler_once
+from agentic_os.worker.scheduler import (
+    SchedulerResult,
+    WorkerHeartbeatSummary,
+    record_worker_heartbeat,
+    run_scheduler_once,
+    summarize_worker_heartbeats,
+)
 from agentic_os.worker.tools import TOOL_REGISTRY, ToolNotFoundError, invoke_tool
 from agentic_os.worker.workspace import (
     InvalidResourceKeyError,
@@ -27,6 +33,7 @@ __all__ = [
     "SchedulerResult",
     "TaskExecutionError",
     "ToolNotFoundError",
+    "WorkerHeartbeatSummary",
     "WorkspaceConflictError",
     "WorkspaceLeaseLostError",
     "canonical_resource_key",
@@ -35,8 +42,10 @@ __all__ = [
     "execute_task_sandbox",
     "invoke_tool",
     "promote_workspace_changes",
+    "record_worker_heartbeat",
     "release_lease",
     "renew_lease",
     "run_scheduler_once",
     "run_task_worker_once",
+    "summarize_worker_heartbeats",
 ]

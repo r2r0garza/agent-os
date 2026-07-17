@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, delete, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
@@ -26,6 +26,7 @@ from agentic_os.domain.models import (
     TelemetryExportSetting,
     User,
 )
+from agentic_os.worker.scheduler import WORKER_HEARTBEAT_EVENT_TYPE
 
 BACKEND_ROOT = Path(__file__).parents[1]
 
@@ -148,6 +149,13 @@ class ObservabilityApiTests(unittest.TestCase):
             session.flush()
             self.run_id = run.id
             self.record_id = record.id
+
+    def tearDown(self) -> None:
+        # Worker heartbeats are fleet-wide liveness evidence with no
+        # per-test scoping key, so a heartbeat left behind by one test would
+        # otherwise leak into the next test's "is any worker live" check.
+        with SessionLocal.begin() as session:
+            session.execute(delete(AuditEvent).where(AuditEvent.event_type == WORKER_HEARTBEAT_EVENT_TYPE))
 
     def _regular_user(self, *, project_access: bool) -> User:
         with SessionLocal.begin() as session:
@@ -315,3 +323,73 @@ class ObservabilityApiTests(unittest.TestCase):
         self.assertEqual(health["event_stream"]["status"], "delayed")
         self.assertIsNotNone(health["event_stream"]["latest_correlation_id"])
         self.assertEqual(health["telemetry"]["status"], "degraded")
+
+    def test_admin_health_reports_recovering_when_a_live_worker_can_reclaim_a_stale_lease(
+        self,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with SessionLocal.begin() as session:
+            task = session.get(Task, uuid.UUID(self.task["id"]))
+            task.status = "running"
+            task.lease_owner = "crashed-worker-id"
+            task.lease_expires_at = now - timedelta(minutes=5)
+            session.add(
+                AuditEvent(
+                    event_type=WORKER_HEARTBEAT_EVENT_TYPE,
+                    payload={
+                        "worker_id_prefix": "surviving-worker-id",
+                        "worker_count": 1,
+                        "claimed": 0,
+                        "error_count": 0,
+                    },
+                    occurred_at=now,
+                )
+            )
+
+        response = client.get("/api/v1/admin/observability/health")
+        self.assertEqual(response.status_code, 200, response.text)
+        health = response.json()
+        self.assertEqual(health["workers"]["status"], "recovering")
+        self.assertIn("crashed-worker-id", health["workers"]["stale_worker_ids"])
+        self.assertIn("surviving-worker-id", health["workers"]["live_worker_ids"])
+
+    def test_admin_health_reports_degraded_when_a_known_worker_stops_heartbeating(self) -> None:
+        now = datetime.now(timezone.utc)
+        with SessionLocal.begin() as session:
+            # Take the setUp task out of the pending queue and off any lease
+            # so only the missing-heartbeat signal below can drive the
+            # workers status, isolating the "degraded" branch from the
+            # already-covered "unavailable"/"stale" branches.
+            task = session.get(Task, uuid.UUID(self.task["id"]))
+            task.status = "completed"
+            session.add(
+                AuditEvent(
+                    event_type=WORKER_HEARTBEAT_EVENT_TYPE,
+                    payload={
+                        "worker_id_prefix": "still-here-worker-id",
+                        "worker_count": 1,
+                        "claimed": 0,
+                        "error_count": 0,
+                    },
+                    occurred_at=now,
+                )
+            )
+            session.add(
+                AuditEvent(
+                    event_type=WORKER_HEARTBEAT_EVENT_TYPE,
+                    payload={
+                        "worker_id_prefix": "vanished-worker-id",
+                        "worker_count": 1,
+                        "claimed": 0,
+                        "error_count": 0,
+                    },
+                    occurred_at=now - timedelta(minutes=10),
+                )
+            )
+
+        response = client.get("/api/v1/admin/observability/health")
+        self.assertEqual(response.status_code, 200, response.text)
+        health = response.json()
+        self.assertEqual(health["workers"]["status"], "degraded")
+        self.assertIn("vanished-worker-id", health["workers"]["missing_worker_ids"])
+        self.assertIn("still-here-worker-id", health["workers"]["live_worker_ids"])

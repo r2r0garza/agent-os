@@ -3,10 +3,13 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Callable
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from agentic_os.domain.models import AuditEvent
 from agentic_os.observability import TelemetryExporter, deliver_pending_telemetry
 from agentic_os.worker.leases import DEFAULT_LEASE_SECONDS
 from agentic_os.worker.runner import run_task_worker_once
@@ -16,6 +19,100 @@ from agentic_os.worker.runner import run_task_worker_once
 # resource-key race becomes claimable again once the winning task completes,
 # so an idle worker must keep polling rather than exit early.
 _IDLE_POLL_SECONDS = 0.05
+
+WORKER_HEARTBEAT_EVENT_TYPE = "worker.heartbeat"
+
+# A worker process (or an operator-run `agentic-os worker run-once` loop) is
+# considered live if it heartbeated within this window. This is deliberately
+# generous relative to the local `worker-loop.sh` default 2-second poll
+# cadence so a single slow claim/execute cycle never flips a healthy worker
+# to "missing".
+_HEARTBEAT_LIVE_SECONDS = 90
+
+# A worker id observed in this longer window but not the live window above is
+# reported as "missing" (it existed recently and stopped heartbeating)
+# instead of being silently forgotten, which is what lets health evidence
+# distinguish "never had that many workers" from "lost a worker".
+_HEARTBEAT_HISTORY_SECONDS = 900
+
+
+def record_worker_heartbeat(
+    session: Session,
+    worker_id_prefix: str,
+    *,
+    worker_count: int,
+    claimed: int,
+    error_count: int,
+) -> None:
+    """Persist proof that a worker process polled for work.
+
+    Reuses the existing durable audit trail as the single source of
+    worker-liveness truth rather than introducing a separate heartbeat
+    table. Emitted once per ``run_scheduler_once`` invocation (i.e. once per
+    outer poll cycle a process or shell loop runs), not per idle sub-loop
+    iteration, so heartbeat volume tracks operator-configured poll cadence
+    rather than the in-process idle-retry rate.
+    """
+    session.add(
+        AuditEvent(
+            event_type=WORKER_HEARTBEAT_EVENT_TYPE,
+            payload={
+                "worker_id_prefix": worker_id_prefix,
+                "worker_count": worker_count,
+                "claimed": claimed,
+                "error_count": error_count,
+            },
+        )
+    )
+    session.flush()
+
+
+@dataclass(frozen=True)
+class WorkerHeartbeatSummary:
+    """Worker-fleet liveness evidence derived from recent heartbeat events."""
+
+    live_worker_ids: list[str]
+    missing_worker_ids: list[str]
+    configured_capacity: int
+
+
+def summarize_worker_heartbeats(session: Session, *, now: datetime) -> WorkerHeartbeatSummary:
+    """Summarize worker-process liveness from the last heartbeat each known
+    worker id reported, without assuming a fixed or externally-configured
+    worker count.
+    """
+    history_cutoff = now - timedelta(seconds=_HEARTBEAT_HISTORY_SECONDS)
+    live_cutoff = now - timedelta(seconds=_HEARTBEAT_LIVE_SECONDS)
+    rows = session.execute(
+        select(AuditEvent.payload, AuditEvent.occurred_at)
+        .where(
+            AuditEvent.event_type == WORKER_HEARTBEAT_EVENT_TYPE,
+            AuditEvent.occurred_at >= history_cutoff,
+        )
+        .order_by(AuditEvent.occurred_at.desc())
+    ).all()
+
+    latest_by_prefix: dict[str, tuple[dict, datetime]] = {}
+    for payload, occurred_at in rows:
+        prefix = payload.get("worker_id_prefix")
+        if not prefix or prefix in latest_by_prefix:
+            continue
+        latest_by_prefix[prefix] = (payload, occurred_at)
+
+    live_ids = sorted(
+        prefix for prefix, (_, occurred_at) in latest_by_prefix.items() if occurred_at >= live_cutoff
+    )
+    missing_ids = sorted(
+        prefix for prefix, (_, occurred_at) in latest_by_prefix.items() if occurred_at < live_cutoff
+    )
+    configured_capacity = sum(
+        int(payload.get("worker_count") or 1)
+        for prefix, (payload, occurred_at) in latest_by_prefix.items()
+        if occurred_at >= live_cutoff
+    )
+    return WorkerHeartbeatSummary(
+        live_worker_ids=live_ids, missing_worker_ids=missing_ids, configured_capacity=configured_capacity
+    )
 
 
 @dataclass
@@ -109,6 +206,15 @@ def run_scheduler_once(
         thread.start()
     for thread in threads:
         thread.join()
+    with session_maker() as session:
+        record_worker_heartbeat(
+            session,
+            worker_id_prefix,
+            worker_count=max(1, worker_count),
+            claimed=len(result.claimed),
+            error_count=len(result.errors),
+        )
+        session.commit()
     if telemetry_exporter is not None:
         with session_maker() as session:
             deliver_pending_telemetry(session, telemetry_exporter)

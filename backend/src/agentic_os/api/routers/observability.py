@@ -25,6 +25,7 @@ from agentic_os.domain.models import (
 )
 from agentic_os.health import deployment_health
 from agentic_os.sandbox.availability import runtime_available
+from agentic_os.worker.scheduler import summarize_worker_heartbeats
 
 router = APIRouter(tags=["observability"])
 
@@ -322,6 +323,7 @@ def observability_health(
         ).all()
     )
     stale_worker_ids = sorted({row.lease_owner for row in stale_worker_rows if row.lease_owner})
+    heartbeat_summary = summarize_worker_heartbeats(session, now=now)
     retry_count = session.execute(
         select(func.count(Run.id)).where(Run.attempt_number > 1)
     ).scalar_one()
@@ -379,11 +381,26 @@ def observability_health(
         if available_sandbox_count
         else "unavailable"
     )
+    live_heartbeat_present = bool(heartbeat_summary.live_worker_ids)
     workers_status = (
-        "stale"
+        # A worker that heartbeated recently is either reclaiming the stale
+        # lease itself (having outlived a crashed sibling) or will pick it up
+        # on its next claim attempt, so this is recovery-in-progress rather
+        # than a stuck fleet with nobody left to reconcile the expired lease.
+        "recovering"
+        if stale_worker_ids and live_heartbeat_present
+        else "stale"
         if stale_worker_ids
+        # No worker has claimed the backlog and none is even polling for
+        # work: nothing will process it without operator intervention.
         else "unavailable"
-        if queue_depth and not active_workers
+        if queue_depth and not active_workers and not live_heartbeat_present
+        # Either a known worker id fell out of the live window without
+        # releasing its leases cleanly, or a live worker is polling but
+        # hasn't claimed the current backlog yet: reduced/delayed capacity
+        # rather than a full outage in either case.
+        else "degraded"
+        if heartbeat_summary.missing_worker_ids or (queue_depth and not active_workers)
         else "healthy"
     )
     event_stream_status = (
@@ -418,7 +435,7 @@ def observability_health(
     overall_status = next(
         (
             status
-            for status in ("unavailable", "stale", "degraded", "delayed")
+            for status in ("unavailable", "stale", "recovering", "degraded", "delayed")
             if status in component_statuses
         ),
         "healthy",
@@ -460,6 +477,9 @@ def observability_health(
             "lease_count": active_lease_count + len(stale_worker_rows),
             "retry_count": retry_count,
             "failure_count": failure_count,
+            "capacity": heartbeat_summary.configured_capacity,
+            "live_worker_ids": heartbeat_summary.live_worker_ids,
+            "missing_worker_ids": heartbeat_summary.missing_worker_ids,
         },
         "sandbox": {"status": sandbox_status, "runtimes": sandbox},
         "event_stream": {
