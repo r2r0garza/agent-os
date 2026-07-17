@@ -119,6 +119,14 @@ resource-key pair is safely serialized, and a mid-run restart while
 several multi-agent tasks are in flight recovers without losing or
 duplicating acknowledged work.
 
+## Goal lifecycle and steering verification
+
+See
+[docs/goal-lifecycle-steering-verification.md](docs/goal-lifecycle-steering-verification.md)
+for the Sprint 9 automated verification and manual smoke workflow covering
+pause, steering revisions, resume, cooperative and forced cancellation,
+API/worker restart, backup/restore, and durable evidence inspection.
+
 ## Local operations verification
 
 See [docs/local-operations-verification.md](docs/local-operations-verification.md)

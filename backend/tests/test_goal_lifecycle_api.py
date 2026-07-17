@@ -481,6 +481,148 @@ class GoalLifecycleApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409, response.text)
         self.assertIn("base revision is stale", response.json()["detail"])
 
+    def test_lifecycle_and_steering_evidence_survives_api_restart(self) -> None:
+        with SessionLocal.begin() as session:
+            completed = Task(
+                goal_id=self.goal.id,
+                created_by=self.owner.id,
+                title="Preserve completed evidence",
+                status="completed",
+            )
+            remaining = Task(
+                goal_id=self.goal.id,
+                created_by=self.owner.id,
+                title="Revise remaining work",
+                status="ready",
+            )
+            session.add_all([completed, remaining])
+            session.flush()
+            completed_id = completed.id
+            remaining_id = remaining.id
+
+        pause = client.post(
+            f"/api/v1/goals/{self.goal.id}/pause",
+            json={"reason": "verify restart boundary"},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(pause.status_code, 201, pause.text)
+
+        steer = client.post(
+            f"/api/v1/goals/{self.goal.id}/steer",
+            json={"instruction": "Replace remaining work with a reviewed version"},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(steer.status_code, 201, steer.text)
+        apply = client.post(
+            (
+                f"/api/v1/goals/{self.goal.id}/steering-requests/"
+                f"{steer.json()['id']}/apply"
+            ),
+            json={
+                "change_summary": "Replace unfinished work after operator steering",
+                "changes": [
+                    {
+                        "change_type": "revised",
+                        "task_id": str(remaining_id),
+                        "task": {
+                            "client_id": "reviewed-work",
+                            "title": "Reviewed remaining work",
+                        },
+                    }
+                ],
+            },
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(apply.status_code, 201, apply.text)
+
+        resume = client.post(
+            f"/api/v1/goals/{self.goal.id}/resume",
+            json={},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(resume.status_code, 201, resume.text)
+        cancel = client.post(
+            f"/api/v1/goals/{self.goal.id}/cancel",
+            json={"reason": "verify durable cancellation"},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(cancel.status_code, 201, cancel.text)
+
+        # Clearing the process-wide engine cache and constructing a new app
+        # exercises the same committed PostgreSQL boundary used after an API
+        # process restart.
+        from agentic_os.api.app import create_app
+        from agentic_os.api.deps import _engine
+        from fastapi.testclient import TestClient
+
+        if _engine.cache_info().currsize:
+            _engine().dispose()
+            _engine.cache_clear()
+
+        with TestClient(create_app()) as restarted_client:
+            headers = self._headers(self.owner)
+            goal = restarted_client.get(
+                f"/api/v1/goals/{self.goal.id}", headers=headers
+            )
+            commands = restarted_client.get(
+                f"/api/v1/goals/{self.goal.id}/lifecycle-commands",
+                headers=headers,
+            )
+            steering = restarted_client.get(
+                f"/api/v1/goals/{self.goal.id}/steering-requests",
+                headers=headers,
+            )
+            revisions = restarted_client.get(
+                f"/api/v1/goals/{self.goal.id}/graph-revisions",
+                headers=headers,
+            )
+            events = restarted_client.get(
+                f"/api/v1/goals/{self.goal.id}/lifecycle-events",
+                headers=headers,
+            )
+
+        for response in (goal, commands, steering, revisions, events):
+            self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(goal.json()["status"], "cancelled")
+        self.assertEqual(goal.json()["control_version"], 3)
+        self.assertEqual(
+            [record["command_type"] for record in commands.json()],
+            ["pause", "resume", "cancel"],
+        )
+        self.assertEqual(steering.json()[0]["status"], "applied")
+        self.assertEqual(steering.json()[0]["applied_revision_number"], 1)
+        self.assertEqual(revisions.json()[0]["revision_number"], 1)
+
+        persisted_events = events.json()
+        self.assertEqual(
+            [event["event_type"] for event in persisted_events],
+            [
+                "goal.pause.applied",
+                "goal.steering.requested",
+                "goal.steering.applied",
+                "goal.resume.applied",
+                "goal.cancel.applied",
+            ],
+        )
+        self.assertEqual(
+            [event["sequence_number"] for event in persisted_events],
+            sorted(event["sequence_number"] for event in persisted_events),
+        )
+        self.assertTrue(
+            all(event["actor_id"] == str(self.owner.id) for event in persisted_events)
+        )
+
+        with SessionLocal() as session:
+            self.assertEqual(session.get(Task, completed_id).status, "completed")
+            self.assertEqual(session.get(Task, remaining_id).status, "cancelled")
+            replacement = session.execute(
+                select(Task).where(
+                    Task.goal_id == self.goal.id,
+                    Task.title == "Reviewed remaining work",
+                )
+            ).scalar_one()
+            self.assertEqual(replacement.status, "pending")
+
     def test_cross_team_and_admin_access(self) -> None:
         outsider_response = client.post(
             f"/api/v1/goals/{self.goal.id}/pause", json={}, headers=self._headers(self.outsider)
