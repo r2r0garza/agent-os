@@ -8,9 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
+from agentic_os.api.authorization import actor_team_ids, current_actor, primary_team_id, require_team_access
 from agentic_os.api.deps import get_session
-from agentic_os.api.ownership import owner_team_id, require_default_team_access
+from agentic_os.api.ownership import owner_team_id
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.domain.capabilities import CAPABILITY_CATALOG
 from agentic_os.domain.models import (
@@ -28,6 +28,7 @@ from agentic_os.domain.models import (
     PolicySetVersion,
     Skill,
     SkillVersion,
+    User,
 )
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -117,17 +118,17 @@ class AgentVersionRead(BaseModel):
     created_at: datetime
 
 
-def _get_agent(session: Session, agent_id: uuid.UUID) -> Agent:
+def _get_agent(session: Session, actor: User, agent_id: uuid.UUID) -> Agent:
     agent = session.get(Agent, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
-    return require_default_team_access(session, agent, "agent")
+    require_team_access(session, actor, agent.team_id, action="agent.read", resource_type="agent")
+    return agent
 
 
 def _require_same_team(session: Session, agent: Agent, resource: object, label: str) -> None:
-    require_default_team_access(session, resource, label)
     if owner_team_id(session, resource) != agent.team_id:
-        raise HTTPException(status_code=422, detail=f"{label} belongs to another team")
+        raise HTTPException(status_code=403, detail=f"{label} belongs to another team")
 
 
 def _resolve_model_version(session: Session, agent: Agent, payload: AgentVersionCreate) -> tuple[uuid.UUID | None, uuid.UUID | None]:
@@ -169,9 +170,17 @@ def _version_to_read(session: Session, version: AgentVersion) -> AgentVersionRea
 
 
 @router.post("", response_model=AgentRead, status_code=201)
-def create_agent(payload: AgentCreate, session: Session = Depends(get_session)) -> Agent:
-    team, user = ensure_default_team_membership(session)
-    agent = Agent(team_id=team.id, created_by=user.id, name=payload.name, visibility=payload.visibility)
+def create_agent(
+    payload: AgentCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Agent:
+    agent = Agent(
+        team_id=primary_team_id(session, actor),
+        created_by=actor.id,
+        name=payload.name,
+        visibility=payload.visibility,
+    )
     session.add(agent)
     session.flush()
     session.refresh(agent)
@@ -179,19 +188,32 @@ def create_agent(payload: AgentCreate, session: Session = Depends(get_session)) 
 
 
 @router.get("", response_model=list[AgentRead])
-def list_agents(session: Session = Depends(get_session)) -> list[Agent]:
-    team_id = ensure_default_team(session).id
-    return list(session.execute(select(Agent).where(Agent.team_id == team_id).order_by(Agent.created_at)).scalars())
+def list_agents(
+    session: Session = Depends(get_session), actor: User = Depends(current_actor)
+) -> list[Agent]:
+    stmt = select(Agent)
+    if actor.role != "admin":
+        stmt = stmt.where(Agent.team_id.in_(actor_team_ids(session, actor)))
+    return list(session.execute(stmt.order_by(Agent.created_at)).scalars())
 
 
 @router.get("/{agent_id}", response_model=AgentRead)
-def get_agent(agent_id: uuid.UUID, session: Session = Depends(get_session)) -> Agent:
-    return _get_agent(session, agent_id)
+def get_agent(
+    agent_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Agent:
+    return _get_agent(session, actor, agent_id)
 
 
 @router.patch("/{agent_id}", response_model=AgentRead)
-def update_agent(agent_id: uuid.UUID, payload: AgentUpdate, session: Session = Depends(get_session)) -> Agent:
-    agent = _get_agent(session, agent_id)
+def update_agent(
+    agent_id: uuid.UUID,
+    payload: AgentUpdate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Agent:
+    agent = _get_agent(session, actor, agent_id)
     for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(agent, key, value)
     session.flush()
@@ -200,8 +222,13 @@ def update_agent(agent_id: uuid.UUID, payload: AgentUpdate, session: Session = D
 
 
 @router.post("/{agent_id}/versions", response_model=AgentVersionRead, status_code=201)
-def create_agent_version(agent_id: uuid.UUID, payload: AgentVersionCreate, session: Session = Depends(get_session)) -> AgentVersionRead:
-    agent = _get_agent(session, agent_id)
+def create_agent_version(
+    agent_id: uuid.UUID,
+    payload: AgentVersionCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> AgentVersionRead:
+    agent = _get_agent(session, actor, agent_id)
     profile_id, profile_version_id = _resolve_model_version(session, agent, payload)
     if payload.default_budget_id is not None:
         budget = session.get(Budget, payload.default_budget_id)
@@ -247,15 +274,24 @@ def create_agent_version(agent_id: uuid.UUID, payload: AgentVersionCreate, sessi
 
 
 @router.get("/{agent_id}/versions", response_model=list[AgentVersionRead])
-def list_agent_versions(agent_id: uuid.UUID, session: Session = Depends(get_session)) -> list[AgentVersionRead]:
-    _get_agent(session, agent_id)
+def list_agent_versions(
+    agent_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[AgentVersionRead]:
+    _get_agent(session, actor, agent_id)
     versions = session.execute(select(AgentVersion).where(AgentVersion.agent_id == agent_id).order_by(AgentVersion.version_number)).scalars()
     return [_version_to_read(session, version) for version in versions]
 
 
 @router.get("/{agent_id}/versions/{version_number}", response_model=AgentVersionRead)
-def get_agent_version(agent_id: uuid.UUID, version_number: int, session: Session = Depends(get_session)) -> AgentVersionRead:
-    _get_agent(session, agent_id)
+def get_agent_version(
+    agent_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> AgentVersionRead:
+    _get_agent(session, actor, agent_id)
     version = session.execute(select(AgentVersion).where(AgentVersion.agent_id == agent_id, AgentVersion.version_number == version_number)).scalar_one_or_none()
     if version is None:
         raise HTTPException(status_code=404, detail="agent version not found")

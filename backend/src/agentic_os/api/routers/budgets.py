@@ -10,8 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
-from agentic_os.api.ownership import require_default_team_access
-from agentic_os.domain.models import Agent, Budget
+from agentic_os.api.authorization import current_actor, require_team_access
+from agentic_os.domain.models import Agent, Budget, User
 
 router = APIRouter(tags=["budgets"])
 
@@ -43,11 +43,16 @@ class BudgetRead(BaseModel):
 
 
 @router.post("/agents/{agent_id}/budgets", response_model=BudgetRead, status_code=201)
-def create_budget(agent_id: uuid.UUID, payload: BudgetCreate, session: Session = Depends(get_session)) -> Budget:
+def create_budget(
+    agent_id: uuid.UUID,
+    payload: BudgetCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Budget:
     agent = session.get(Agent, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
-    require_default_team_access(session, agent, "agent")
+    require_team_access(session, actor, agent.team_id, action="budget.create", resource_type="agent")
     budget = Budget(
         agent_id=agent_id,
         currency=payload.currency,
@@ -62,11 +67,15 @@ def create_budget(agent_id: uuid.UUID, payload: BudgetCreate, session: Session =
 
 
 @router.get("/agents/{agent_id}/budgets", response_model=list[BudgetRead])
-def list_budgets(agent_id: uuid.UUID, session: Session = Depends(get_session)) -> list[Budget]:
+def list_budgets(
+    agent_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[Budget]:
     agent = session.get(Agent, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
-    require_default_team_access(session, agent, "agent")
+    require_team_access(session, actor, agent.team_id, action="budget.list", resource_type="agent")
     return list(
         session.execute(
             select(Budget).where(Budget.agent_id == agent_id).order_by(Budget.created_at)
@@ -75,24 +84,31 @@ def list_budgets(agent_id: uuid.UUID, session: Session = Depends(get_session)) -
 
 
 @router.get("/budgets/{budget_id}", response_model=BudgetRead)
-def get_budget(budget_id: uuid.UUID, session: Session = Depends(get_session)) -> Budget:
-    budget = session.get(Budget, budget_id)
-    if budget is None:
-        raise HTTPException(status_code=404, detail="budget not found")
-    agent = session.get(Agent, budget.agent_id)
-    require_default_team_access(session, agent, "budget")
-    return budget
-
-
-@router.patch("/budgets/{budget_id}", response_model=BudgetRead)
-def update_budget(
-    budget_id: uuid.UUID, payload: BudgetUpdate, session: Session = Depends(get_session)
+def get_budget(
+    budget_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> Budget:
     budget = session.get(Budget, budget_id)
     if budget is None:
         raise HTTPException(status_code=404, detail="budget not found")
     agent = session.get(Agent, budget.agent_id)
-    require_default_team_access(session, agent, "budget")
+    require_team_access(session, actor, agent.team_id, action="budget.read", resource_type="budget")
+    return budget
+
+
+@router.patch("/budgets/{budget_id}", response_model=BudgetRead)
+def update_budget(
+    budget_id: uuid.UUID,
+    payload: BudgetUpdate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Budget:
+    budget = session.get(Budget, budget_id)
+    if budget is None:
+        raise HTTPException(status_code=404, detail="budget not found")
+    agent = session.get(Agent, budget.agent_id)
+    require_team_access(session, actor, agent.team_id, action="budget.update", resource_type="budget")
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(budget, field, value)
     session.flush()

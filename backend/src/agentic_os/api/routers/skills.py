@@ -8,11 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
+from agentic_os.api.authorization import actor_team_ids, current_actor, primary_team_id, require_team_access
 from agentic_os.api.deps import get_session
-from agentic_os.api.ownership import require_default_team_access
 from agentic_os.api.redaction import redact_mapping
-from agentic_os.domain.models import Skill, SkillVersion
+from agentic_os.domain.models import Skill, SkillVersion, User
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
@@ -60,9 +59,17 @@ def _version_to_read(version: SkillVersion) -> SkillVersionRead:
 
 
 @router.post("", response_model=SkillRead, status_code=201)
-def create_skill(payload: SkillCreate, session: Session = Depends(get_session)) -> Skill:
-    team, user = ensure_default_team_membership(session)
-    skill = Skill(team_id=team.id, created_by=user.id, name=payload.name, visibility=payload.visibility)
+def create_skill(
+    payload: SkillCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Skill:
+    skill = Skill(
+        team_id=primary_team_id(session, actor),
+        created_by=actor.id,
+        name=payload.name,
+        visibility=payload.visibility,
+    )
     session.add(skill)
     session.flush()
     session.refresh(skill)
@@ -70,27 +77,39 @@ def create_skill(payload: SkillCreate, session: Session = Depends(get_session)) 
 
 
 @router.get("", response_model=list[SkillRead])
-def list_skills(session: Session = Depends(get_session)) -> list[Skill]:
-    team_id = ensure_default_team(session).id
-    return list(session.execute(select(Skill).where(Skill.team_id == team_id).order_by(Skill.created_at)).scalars())
+def list_skills(
+    session: Session = Depends(get_session), actor: User = Depends(current_actor)
+) -> list[Skill]:
+    stmt = select(Skill)
+    if actor.role != "admin":
+        stmt = stmt.where(Skill.team_id.in_(actor_team_ids(session, actor)))
+    return list(session.execute(stmt.order_by(Skill.created_at)).scalars())
 
 
 @router.get("/{skill_id}", response_model=SkillRead)
-def get_skill(skill_id: uuid.UUID, session: Session = Depends(get_session)) -> Skill:
+def get_skill(
+    skill_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Skill:
     skill = session.get(Skill, skill_id)
     if skill is None:
         raise HTTPException(status_code=404, detail="skill not found")
-    return require_default_team_access(session, skill, "skill")
+    require_team_access(session, actor, skill.team_id, action="skill.read", resource_type="skill")
+    return skill
 
 
 @router.post("/{skill_id}/versions", response_model=SkillVersionRead, status_code=201)
 def create_skill_version(
-    skill_id: uuid.UUID, payload: SkillVersionCreate, session: Session = Depends(get_session)
+    skill_id: uuid.UUID,
+    payload: SkillVersionCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> SkillVersionRead:
     skill = session.get(Skill, skill_id)
     if skill is None:
         raise HTTPException(status_code=404, detail="skill not found")
-    require_default_team_access(session, skill, "skill")
+    require_team_access(session, actor, skill.team_id, action="skill.version.create", resource_type="skill")
     next_version = (
         session.execute(
             select(func.coalesce(func.max(SkillVersion.version_number), 0)).where(
@@ -112,11 +131,15 @@ def create_skill_version(
 
 
 @router.get("/{skill_id}/versions", response_model=list[SkillVersionRead])
-def list_skill_versions(skill_id: uuid.UUID, session: Session = Depends(get_session)) -> list[SkillVersionRead]:
+def list_skill_versions(
+    skill_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[SkillVersionRead]:
     skill = session.get(Skill, skill_id)
     if skill is None:
         raise HTTPException(status_code=404, detail="skill not found")
-    require_default_team_access(session, skill, "skill")
+    require_team_access(session, actor, skill.team_id, action="skill.version.list", resource_type="skill")
     versions = session.execute(
         select(SkillVersion).where(SkillVersion.skill_id == skill_id).order_by(SkillVersion.version_number)
     ).scalars()
@@ -125,12 +148,15 @@ def list_skill_versions(skill_id: uuid.UUID, session: Session = Depends(get_sess
 
 @router.get("/{skill_id}/versions/{version_number}", response_model=SkillVersionRead)
 def get_skill_version(
-    skill_id: uuid.UUID, version_number: int, session: Session = Depends(get_session)
+    skill_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> SkillVersionRead:
     skill = session.get(Skill, skill_id)
     if skill is None:
         raise HTTPException(status_code=404, detail="skill not found")
-    require_default_team_access(session, skill, "skill")
+    require_team_access(session, actor, skill.team_id, action="skill.version.read", resource_type="skill")
     version = session.execute(
         select(SkillVersion).where(
             SkillVersion.skill_id == skill_id, SkillVersion.version_number == version_number

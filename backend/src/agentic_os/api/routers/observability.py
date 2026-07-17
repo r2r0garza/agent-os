@@ -3,14 +3,13 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.authorization import current_actor, require_admin, require_project_access
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.domain.models import (
@@ -18,10 +17,8 @@ from agentic_os.domain.models import (
     Goal,
     ObservabilityRecord,
     Project,
-    ProjectMember,
     Run,
     Task,
-    TeamMembership,
     TelemetryExportAttempt,
     TelemetryExportSetting,
     User,
@@ -83,46 +80,12 @@ class ObservabilityRecordRead(BaseModel):
     telemetry_attempts: list[TelemetryAttemptRead]
 
 
-def current_actor(
-    session: Session = Depends(get_session),
-    x_agentic_user_id: Annotated[uuid.UUID | None, Header()] = None,
-) -> User:
-    if x_agentic_user_id is None:
-        return ensure_default_user(session)
-    actor = session.get(User, x_agentic_user_id)
-    if actor is None:
-        raise HTTPException(status_code=401, detail="unknown actor")
-    return actor
-
-
-def _require_admin(actor: User) -> None:
-    if actor.role != "admin":
-        raise HTTPException(status_code=403, detail="admin role required")
+def _require_admin(session: Session, actor: User) -> None:
+    require_admin(session, actor, action="observability.admin")
 
 
 def _require_project_access(session: Session, actor: User, project_id: uuid.UUID) -> Project:
-    project = session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    if project.team_id != ensure_default_team(session).id:
-        raise HTTPException(status_code=403, detail="project belongs to another team")
-    if actor.role == "admin" or project.created_by == actor.id:
-        return project
-    team_member = session.execute(
-        select(TeamMembership.id).where(
-            TeamMembership.team_id == project.team_id,
-            TeamMembership.user_id == actor.id,
-        )
-    ).scalar_one_or_none()
-    project_member = session.execute(
-        select(ProjectMember.id).where(
-            ProjectMember.project_id == project.id,
-            ProjectMember.user_id == actor.id,
-        )
-    ).scalar_one_or_none()
-    if team_member is None or project_member is None:
-        raise HTTPException(status_code=403, detail="project access required")
-    return project
+    return require_project_access(session, actor, project_id, action="observability.access")
 
 
 def _project_id_for_record(session: Session, record: ObservabilityRecord) -> uuid.UUID | None:
@@ -302,7 +265,7 @@ def get_observability_record(
         raise HTTPException(status_code=404, detail="observability record not found")
     project_id = _project_id_for_record(session, record)
     if project_id is None:
-        _require_admin(actor)
+        _require_admin(session, actor)
     else:
         _require_project_access(session, actor, project_id)
     return _safe_record(session, record)
@@ -315,7 +278,7 @@ def list_telemetry_attempts(
     session: Session = Depends(get_session),
     actor: User = Depends(current_actor),
 ) -> list[dict]:
-    _require_admin(actor)
+    _require_admin(session, actor)
     stmt = select(TelemetryExportAttempt)
     if status is not None:
         stmt = stmt.where(TelemetryExportAttempt.status == status)
@@ -330,7 +293,7 @@ def observability_health(
     session: Session = Depends(get_session),
     actor: User = Depends(current_actor),
 ) -> dict:
-    _require_admin(actor)
+    _require_admin(session, actor)
     deployment = deployment_health(session.get_bind())
     database_check_started = perf_counter()
     session.execute(text("SELECT 1"))
@@ -392,10 +355,7 @@ def observability_health(
         else None
     )
     exporters = session.execute(
-        select(TelemetryExportSetting).where(
-            (TelemetryExportSetting.team_id == ensure_default_team(session).id)
-            | TelemetryExportSetting.team_id.is_(None)
-        ).order_by(TelemetryExportSetting.created_at)
+        select(TelemetryExportSetting).order_by(TelemetryExportSetting.created_at)
     ).scalars()
     maintenance_events = list(
         session.execute(

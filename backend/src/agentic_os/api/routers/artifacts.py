@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_user
+from agentic_os.api.authorization import current_actor, require_project_access, require_resource_access
 from agentic_os.api.deps import get_session
 from agentic_os.artifacts import (
     ArtifactContentUnavailableError,
@@ -16,7 +16,7 @@ from agentic_os.artifacts import (
     create_artifact_version,
     ingest_source_artifact,
 )
-from agentic_os.domain.models import Artifact, ArtifactVersion, AuditEvent, Goal, Project, Run, Task
+from agentic_os.domain.models import Artifact, ArtifactVersion, AuditEvent, Goal, Run, Task, User
 
 router = APIRouter(tags=["artifacts"])
 
@@ -69,13 +69,6 @@ class ArtifactUploadRequest(BaseModel):
     goal_id: uuid.UUID | None = None
     task_id: uuid.UUID | None = None
     run_id: uuid.UUID | None = None
-
-
-def _project_or_404(session: Session, project_id: uuid.UUID) -> Project:
-    project = session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return project
 
 
 def _resolve_scope(
@@ -136,18 +129,20 @@ def _to_read(session: Session, artifact: Artifact) -> ArtifactRead:
 
 @router.post("/projects/{project_id}/artifacts", response_model=ArtifactRead, status_code=201)
 def upload_artifact(
-    project_id: uuid.UUID, payload: ArtifactUploadRequest, session: Session = Depends(get_session)
+    project_id: uuid.UUID,
+    payload: ArtifactUploadRequest,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> ArtifactRead:
-    _project_or_404(session, project_id)
+    require_project_access(session, actor, project_id, action="artifact.create")
     _resolve_scope(session, project_id, payload.goal_id, payload.task_id, payload.run_id)
-    user = ensure_default_user(session)
 
     artifact = Artifact(
         project_id=project_id,
         goal_id=payload.goal_id,
         task_id=payload.task_id,
         run_id=payload.run_id,
-        created_by=user.id,
+        created_by=actor.id,
         name=payload.name,
         kind="source",
         content_type=payload.content_type,
@@ -183,8 +178,9 @@ def list_artifacts(
     run_id: uuid.UUID | None = None,
     kind: str | None = None,
     session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> list[ArtifactRead]:
-    _project_or_404(session, project_id)
+    require_project_access(session, actor, project_id, action="artifact.list")
     stmt = select(Artifact).where(Artifact.project_id == project_id)
     if goal_id is not None:
         stmt = stmt.where(Artifact.goal_id == goal_id)
@@ -201,20 +197,28 @@ def list_artifacts(
 
 
 @router.get("/artifacts/{artifact_id}", response_model=ArtifactRead)
-def get_artifact(artifact_id: uuid.UUID, session: Session = Depends(get_session)) -> ArtifactRead:
+def get_artifact(
+    artifact_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> ArtifactRead:
     artifact = session.get(Artifact, artifact_id)
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact not found")
+    require_resource_access(session, actor, artifact, action="artifact.read", resource_type="artifact")
     return _to_read(session, artifact)
 
 
 @router.get("/artifacts/{artifact_id}/normalized", response_model=ArtifactRead)
 def get_normalized_artifact(
-    artifact_id: uuid.UUID, session: Session = Depends(get_session)
+    artifact_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> ArtifactRead:
     artifact = session.get(Artifact, artifact_id)
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact not found")
+    require_resource_access(session, actor, artifact, action="artifact.normalized.read", resource_type="artifact")
     normalized = session.execute(
         select(Artifact)
         .where(Artifact.parent_artifact_id == artifact_id, Artifact.kind == "normalized")
@@ -230,10 +234,15 @@ def get_normalized_artifact(
 
 
 @router.get("/artifacts/{artifact_id}/versions", response_model=list[ArtifactVersionRead])
-def list_artifact_versions(artifact_id: uuid.UUID, session: Session = Depends(get_session)) -> list[ArtifactVersion]:
+def list_artifact_versions(
+    artifact_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[ArtifactVersion]:
     artifact = session.get(Artifact, artifact_id)
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact not found")
+    require_resource_access(session, actor, artifact, action="artifact.versions.list", resource_type="artifact")
     return list(
         session.execute(
             select(ArtifactVersion)
@@ -244,10 +253,15 @@ def list_artifact_versions(artifact_id: uuid.UUID, session: Session = Depends(ge
 
 
 @router.get("/artifacts/{artifact_id}/lineage", response_model=ArtifactLineageRead)
-def get_artifact_lineage(artifact_id: uuid.UUID, session: Session = Depends(get_session)) -> ArtifactLineageRead:
+def get_artifact_lineage(
+    artifact_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> ArtifactLineageRead:
     artifact = session.get(Artifact, artifact_id)
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact not found")
+    require_resource_access(session, actor, artifact, action="artifact.lineage.read", resource_type="artifact")
     parent = None
     if artifact.parent_artifact_id is not None:
         parent_artifact = session.get(Artifact, artifact.parent_artifact_id)
@@ -264,11 +278,15 @@ def get_artifact_lineage(artifact_id: uuid.UUID, session: Session = Depends(get_
 
 @router.get("/artifacts/{artifact_id}/content")
 def get_artifact_content(
-    artifact_id: uuid.UUID, version: int | None = None, session: Session = Depends(get_session)
+    artifact_id: uuid.UUID,
+    version: int | None = None,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> Response:
     artifact = session.get(Artifact, artifact_id)
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact not found")
+    require_resource_access(session, actor, artifact, action="artifact.content.read", resource_type="artifact")
 
     if version is not None:
         artifact_version = session.execute(

@@ -29,6 +29,11 @@ BACKEND_ROOT = Path(__file__).parents[1]
 
 def setUpModule() -> None:
     global client, SessionLocal
+    from agentic_os.api.deps import _engine
+
+    if _engine.cache_info().currsize:
+        _engine().dispose()
+        _engine.cache_clear()
     db_url = os.environ.get("AGENTIC_OS_DATABASE_URL", database_url())
     probe = create_database_engine(db_url)
     try:
@@ -219,7 +224,7 @@ class GovernanceApiTests(unittest.TestCase):
         outsider_headers = {"X-Agentic-User-ID": str(outsider.id)}
         self.assertEqual(
             client.get(f"/api/v1/approval-requests/{approval['id']}", headers=outsider_headers).status_code,
-            403,
+            404,
         )
         override_payload = {
             "scope_type": "run", "scope_id": approval["run_id"], "reason": "Incident response",

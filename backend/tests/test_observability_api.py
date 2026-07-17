@@ -208,11 +208,11 @@ class ObservabilityApiTests(unittest.TestCase):
             f"/api/v1/projects/{self.project['id']}/observability-records",
             headers=outsider_headers,
         )
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 404)
         detail = client.get(
             f"/api/v1/observability-records/{self.record_id}", headers=outsider_headers
         )
-        self.assertEqual(detail.status_code, 403)
+        self.assertEqual(detail.status_code, 404)
 
         member = self._regular_user(project_access=True)
         member_headers = {"X-Agentic-User-ID": str(member.id)}

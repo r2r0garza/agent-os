@@ -8,12 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_team_membership
+from agentic_os.api.authorization import actor_team_ids, current_actor, primary_team_id, require_owned_scope
 from agentic_os.api.deps import get_session
-from agentic_os.api.ownership import require_default_team_access
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.api.secrets import encrypt_secret
-from agentic_os.domain.models import Credential, ModelProfile, ModelProfileVersion
+from agentic_os.domain.models import Credential, ModelProfile, ModelProfileVersion, User
 
 router = APIRouter(prefix="/model-profiles", tags=["model-profiles"])
 
@@ -70,20 +69,25 @@ class ModelProfileVersionRead(BaseModel):
     created_at: datetime
 
 
-def _get_profile(session: Session, profile_id: uuid.UUID) -> ModelProfile:
+def _get_profile(session: Session, actor: User, profile_id: uuid.UUID) -> ModelProfile:
     profile = session.get(ModelProfile, profile_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="model profile not found")
-    return require_default_team_access(session, profile, "model profile")
+    require_owned_scope(
+        session, actor, profile, action="model_profile.read", resource_type="model profile"
+    )
+    return profile
 
 
-def _credential_for_profile(session: Session, credential_id: uuid.UUID, team_id: uuid.UUID) -> Credential:
+def _credential_for_profile(
+    session: Session, actor: User, credential_id: uuid.UUID, team_id: uuid.UUID
+) -> Credential:
     credential = session.get(Credential, credential_id)
     if credential is None:
         raise HTTPException(status_code=422, detail="credential not found")
-    require_default_team_access(session, credential, "credential")
+    require_owned_scope(session, actor, credential, action="credential.use", resource_type="credential")
     if credential.team_id != team_id:
-        raise HTTPException(status_code=422, detail="model profile requires a credential owned by its team")
+        raise HTTPException(status_code=403, detail="credential is not accessible for this model profile")
     return credential
 
 
@@ -117,15 +121,19 @@ def _profile_to_read(profile: ModelProfile) -> ModelProfileRead:
 
 
 @router.post("", response_model=ModelProfileRead, status_code=201)
-def create_model_profile(payload: ModelProfileCreate, session: Session = Depends(get_session)) -> ModelProfileRead:
-    team, user = ensure_default_team_membership(session)
+def create_model_profile(
+    payload: ModelProfileCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> ModelProfileRead:
+    team_id = primary_team_id(session, actor)
     credential_id = payload.credential_id
     api_key_ciphertext = encrypt_secret("")
     if payload.api_key is not None:
         secret = payload.api_key.get_secret_value()
         credential = Credential(
-            team_id=team.id,
-            created_by=user.id,
+            team_id=team_id,
+            created_by=actor.id,
             name=f"{payload.name} API key",
             credential_type="api_key",
             encrypted_material=encrypt_secret(secret),
@@ -136,10 +144,10 @@ def create_model_profile(payload: ModelProfileCreate, session: Session = Depends
         credential_id = credential.id
         api_key_ciphertext = encrypt_secret(secret)
     else:
-        _credential_for_profile(session, credential_id, team.id)
+        _credential_for_profile(session, actor, credential_id, team_id)
     profile = ModelProfile(
-        team_id=team.id,
-        created_by=user.id,
+        team_id=team_id,
+        created_by=actor.id,
         name=payload.name,
         base_url=payload.base_url,
         model_identifier=payload.model_identifier,
@@ -165,23 +173,34 @@ def create_model_profile(payload: ModelProfileCreate, session: Session = Depends
 
 
 @router.get("", response_model=list[ModelProfileRead])
-def list_model_profiles(session: Session = Depends(get_session)) -> list[ModelProfileRead]:
-    team_id = ensure_default_team(session).id
-    profiles = session.execute(
-        select(ModelProfile).where(ModelProfile.team_id == team_id).order_by(ModelProfile.created_at)
-    ).scalars()
+def list_model_profiles(
+    session: Session = Depends(get_session), actor: User = Depends(current_actor)
+) -> list[ModelProfileRead]:
+    stmt = select(ModelProfile)
+    if actor.role != "admin":
+        stmt = stmt.where(ModelProfile.team_id.in_(actor_team_ids(session, actor)))
+    profiles = session.execute(stmt.order_by(ModelProfile.created_at)).scalars()
     return [_profile_to_read(profile) for profile in profiles]
 
 
 @router.get("/{model_profile_id}", response_model=ModelProfileRead)
-def get_model_profile(model_profile_id: uuid.UUID, session: Session = Depends(get_session)) -> ModelProfileRead:
-    return _profile_to_read(_get_profile(session, model_profile_id))
+def get_model_profile(
+    model_profile_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> ModelProfileRead:
+    return _profile_to_read(_get_profile(session, actor, model_profile_id))
 
 
 @router.post("/{model_profile_id}/versions", response_model=ModelProfileVersionRead, status_code=201)
-def create_model_profile_version(model_profile_id: uuid.UUID, payload: ModelProfileVersionCreate, session: Session = Depends(get_session)) -> ModelProfileVersionRead:
-    profile = _get_profile(session, model_profile_id)
-    _credential_for_profile(session, payload.credential_id, profile.team_id)
+def create_model_profile_version(
+    model_profile_id: uuid.UUID,
+    payload: ModelProfileVersionCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> ModelProfileVersionRead:
+    profile = _get_profile(session, actor, model_profile_id)
+    _credential_for_profile(session, actor, payload.credential_id, profile.team_id)
     number = session.execute(select(func.coalesce(func.max(ModelProfileVersion.version_number), 0)).where(ModelProfileVersion.model_profile_id == model_profile_id)).scalar_one() + 1
     version = ModelProfileVersion(model_profile_id=model_profile_id, version_number=number, **payload.model_dump())
     session.add(version)
@@ -191,15 +210,24 @@ def create_model_profile_version(model_profile_id: uuid.UUID, payload: ModelProf
 
 
 @router.get("/{model_profile_id}/versions", response_model=list[ModelProfileVersionRead])
-def list_model_profile_versions(model_profile_id: uuid.UUID, session: Session = Depends(get_session)) -> list[ModelProfileVersionRead]:
-    _get_profile(session, model_profile_id)
+def list_model_profile_versions(
+    model_profile_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[ModelProfileVersionRead]:
+    _get_profile(session, actor, model_profile_id)
     versions = session.execute(select(ModelProfileVersion).where(ModelProfileVersion.model_profile_id == model_profile_id).order_by(ModelProfileVersion.version_number)).scalars()
     return [_version_to_read(version) for version in versions]
 
 
 @router.get("/{model_profile_id}/versions/{version_number}", response_model=ModelProfileVersionRead)
-def get_model_profile_version(model_profile_id: uuid.UUID, version_number: int, session: Session = Depends(get_session)) -> ModelProfileVersionRead:
-    _get_profile(session, model_profile_id)
+def get_model_profile_version(
+    model_profile_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> ModelProfileVersionRead:
+    _get_profile(session, actor, model_profile_id)
     version = session.execute(select(ModelProfileVersion).where(ModelProfileVersion.model_profile_id == model_profile_id, ModelProfileVersion.version_number == version_number)).scalar_one_or_none()
     if version is None:
         raise HTTPException(status_code=404, detail="model profile version not found")

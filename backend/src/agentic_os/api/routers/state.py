@@ -9,7 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
-from agentic_os.domain.models import AuditEvent, CostLedgerEntry, Goal, Run, Task
+from agentic_os.api.authorization import current_actor, require_project_access, require_resource_access
+from agentic_os.domain.models import AuditEvent, CostLedgerEntry, Goal, Run, Task, User
 
 router = APIRouter(tags=["state"])
 
@@ -87,36 +88,56 @@ class CostLedgerEntryRead(BaseModel):
 
 
 @router.get("/goals/{goal_id}/tasks", response_model=list[TaskRead])
-def list_tasks(goal_id: uuid.UUID, session: Session = Depends(get_session)) -> list[Task]:
+def list_tasks(
+    goal_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[Task]:
     goal = session.get(Goal, goal_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not found")
+    require_resource_access(session, actor, goal, action="task.list", resource_type="goal")
     return list(session.execute(select(Task).where(Task.goal_id == goal_id).order_by(Task.created_at)).scalars())
 
 
 @router.get("/tasks/{task_id}", response_model=TaskRead)
-def get_task(task_id: uuid.UUID, session: Session = Depends(get_session)) -> Task:
+def get_task(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Task:
     task = session.get(Task, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    require_resource_access(session, actor, task, action="task.read", resource_type="task")
     return task
 
 
 @router.get("/tasks/{task_id}/runs", response_model=list[RunRead])
-def list_runs(task_id: uuid.UUID, session: Session = Depends(get_session)) -> list[Run]:
+def list_runs(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[Run]:
     task = session.get(Task, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    require_resource_access(session, actor, task, action="run.list", resource_type="task")
     return list(
         session.execute(select(Run).where(Run.task_id == task_id).order_by(Run.attempt_number)).scalars()
     )
 
 
 @router.get("/runs/{run_id}", response_model=RunRead)
-def get_run(run_id: uuid.UUID, session: Session = Depends(get_session)) -> Run:
+def get_run(
+    run_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Run:
     run = session.get(Run, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="run not found")
+    require_resource_access(session, actor, run, action="run.read", resource_type="run")
     return run
 
 
@@ -128,10 +149,42 @@ def list_audit_events(
     run_id: uuid.UUID | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
     session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> list[AuditEvent]:
+    resolved_project_id = project_id
+    if run_id is not None:
+        run = session.get(Run, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        resolved_project_id = require_resource_access(
+            session, actor, run, action="audit.list", resource_type="run"
+        ).id
+    elif task_id is not None:
+        task = session.get(Task, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        resolved_project_id = require_resource_access(
+            session, actor, task, action="audit.list", resource_type="task"
+        ).id
+    elif goal_id is not None:
+        goal = session.get(Goal, goal_id)
+        if goal is None:
+            raise HTTPException(status_code=404, detail="goal not found")
+        resolved_project_id = require_resource_access(
+            session, actor, goal, action="audit.list", resource_type="goal"
+        ).id
+    elif project_id is not None:
+        require_project_access(session, actor, project_id, action="audit.list")
+    elif actor.role != "admin":
+        raise HTTPException(
+            status_code=422,
+            detail="a project, goal, task, or run scope is required for regular users",
+        )
+    if project_id is not None and resolved_project_id != project_id:
+        raise HTTPException(status_code=404, detail="resource not found in project")
     stmt = select(AuditEvent)
-    if project_id is not None:
-        stmt = stmt.where(AuditEvent.project_id == project_id)
+    if resolved_project_id is not None:
+        stmt = stmt.where(AuditEvent.project_id == resolved_project_id)
     if goal_id is not None:
         stmt = stmt.where(AuditEvent.goal_id == goal_id)
     if task_id is not None:
@@ -148,7 +201,15 @@ def list_cost_ledger_entries(
     budget_id: uuid.UUID | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
     session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> list[CostLedgerEntry]:
+    if run_id is not None:
+        run = session.get(Run, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        require_resource_access(session, actor, run, action="cost_ledger.list", resource_type="run")
+    elif actor.role != "admin":
+        raise HTTPException(status_code=422, detail="run_id is required for regular users")
     stmt = select(CostLedgerEntry)
     if run_id is not None:
         stmt = stmt.where(CostLedgerEntry.run_id == run_id)

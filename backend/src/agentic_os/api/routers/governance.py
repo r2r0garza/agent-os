@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.authorization import current_actor, require_admin, require_project_access
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.domain.models import (
@@ -22,54 +22,20 @@ from agentic_os.domain.models import (
     CostLedgerEntry,
     Goal,
     Project,
-    ProjectMember,
     Run,
     Task,
-    TeamMembership,
     User,
 )
 
 router = APIRouter(tags=["governance"])
 
 
-def current_actor(
-    session: Session = Depends(get_session),
-    x_agentic_user_id: Annotated[uuid.UUID | None, Header()] = None,
-) -> User:
-    if x_agentic_user_id is None:
-        return ensure_default_user(session)
-    actor = session.get(User, x_agentic_user_id)
-    if actor is None:
-        raise HTTPException(status_code=401, detail="unknown actor")
-    return actor
-
-
 def _require_project_access(session: Session, actor: User, project_id: uuid.UUID) -> Project:
-    project = session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    if project.team_id != ensure_default_team(session).id:
-        raise HTTPException(status_code=403, detail="project belongs to another team")
-    if actor.role == "admin" or project.created_by == actor.id:
-        return project
-    team_member = session.execute(
-        select(TeamMembership.id).where(
-            TeamMembership.team_id == project.team_id, TeamMembership.user_id == actor.id
-        )
-    ).scalar_one_or_none()
-    project_member = session.execute(
-        select(ProjectMember.id).where(
-            ProjectMember.project_id == project.id, ProjectMember.user_id == actor.id
-        )
-    ).scalar_one_or_none()
-    if team_member is None or project_member is None:
-        raise HTTPException(status_code=403, detail="project access required")
-    return project
+    return require_project_access(session, actor, project_id, action="governance.access")
 
 
-def _require_admin(actor: User) -> None:
-    if actor.role != "admin":
-        raise HTTPException(status_code=403, detail="admin role required")
+def _require_admin(session: Session, actor: User) -> None:
+    require_admin(session, actor, action="governance.admin")
 
 
 class ApprovalModeWrite(BaseModel):
@@ -238,7 +204,7 @@ def get_approval_mode(
     if configuration is None:
         raise HTTPException(status_code=404, detail="approval mode configuration not found")
     if configuration.project_id is None:
-        _require_admin(actor)
+        _require_admin(session, actor)
     else:
         _require_project_access(session, actor, configuration.project_id)
     return _redacted_mode(configuration)
@@ -303,8 +269,6 @@ def list_approval_requests(
     if project_id is not None:
         _require_project_access(session, actor, project_id)
         stmt = stmt.where(ApprovalRequest.project_id == project_id)
-    else:
-        stmt = stmt.where(ApprovalRequest.team_id == ensure_default_team(session).id)
     if status is not None:
         stmt = stmt.where(ApprovalRequest.status == status)
     requests = session.execute(stmt.order_by(ApprovalRequest.created_at).limit(limit)).scalars()
@@ -478,7 +442,7 @@ def create_admin_override(
     session: Session = Depends(get_session),
     actor: User = Depends(current_actor),
 ) -> OverrideRead:
-    _require_admin(actor)
+    _require_admin(session, actor)
     project, scope = _override_scope(session, payload)
     _require_project_access(session, actor, project.id)
     starts_at = payload.starts_at or datetime.now(timezone.utc)
@@ -516,8 +480,8 @@ def list_admin_overrides(
     session: Session = Depends(get_session),
     actor: User = Depends(current_actor),
 ) -> list[OverrideRead]:
-    _require_admin(actor)
-    stmt = select(AdminOverride).where(AdminOverride.team_id == ensure_default_team(session).id)
+    _require_admin(session, actor)
+    stmt = select(AdminOverride)
     if project_id is not None:
         _require_project_access(session, actor, project_id)
         stmt = stmt.where(AdminOverride.project_id == project_id)
@@ -531,7 +495,7 @@ def get_admin_override(
     session: Session = Depends(get_session),
     actor: User = Depends(current_actor),
 ) -> OverrideRead:
-    _require_admin(actor)
+    _require_admin(session, actor)
     value = session.get(AdminOverride, override_id)
     if value is None:
         raise HTTPException(status_code=404, detail="admin override not found")

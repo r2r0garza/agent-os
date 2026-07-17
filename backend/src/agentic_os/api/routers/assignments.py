@@ -8,8 +8,9 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
+from agentic_os.api.authorization import current_actor, require_resource_access
 from agentic_os.domain.assignment import assign_task
-from agentic_os.domain.models import Task
+from agentic_os.domain.models import Task, User
 
 router = APIRouter(prefix="/tasks", tags=["assignments"])
 
@@ -37,16 +38,26 @@ def _read(task: Task) -> AssignmentRead:
 
 
 @router.post("/{task_id}/assignment", response_model=AssignmentRead)
-def create_assignment(task_id: uuid.UUID, session: Session = Depends(get_session)) -> AssignmentRead:
+def create_assignment(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> AssignmentRead:
     task = session.get(Task, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    require_resource_access(session, actor, task, action="assignment.create", resource_type="task")
     return _read(assign_task(session, task))
 
 
 @router.get("/{task_id}/assignment", response_model=AssignmentRead)
-def get_assignment(task_id: uuid.UUID, session: Session = Depends(get_session)) -> AssignmentRead:
+def get_assignment(
+    task_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> AssignmentRead:
     task = session.get(Task, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
+    require_resource_access(session, actor, task, action="assignment.read", resource_type="task")
     return _read(task)

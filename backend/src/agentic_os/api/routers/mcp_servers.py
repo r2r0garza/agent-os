@@ -6,15 +6,21 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_team, ensure_default_user
+from agentic_os.api.authorization import (
+    can_access_project,
+    current_actor,
+    has_team_access,
+    primary_team_id,
+    require_project_access,
+    require_team_access,
+)
 from agentic_os.api.deps import get_session
-from agentic_os.api.ownership import require_default_team_access, require_project_access
 from agentic_os.api.redaction import redact_mapping
 from agentic_os.api.secrets import encrypt_secret
-from agentic_os.domain.models import Credential, McpServer, McpServerVersion, Project
+from agentic_os.domain.models import Credential, McpServer, McpServerVersion, Project, User
 
 router = APIRouter(prefix="/mcp-servers", tags=["mcp-servers"])
 
@@ -64,23 +70,38 @@ def _version_to_read(version: McpServerVersion) -> McpServerVersionRead:
     )
 
 
+def _require_server_access(session: Session, actor: User, server: McpServer, *, action: str) -> None:
+    if server.project_id is not None:
+        require_project_access(session, actor, server.project_id, action=action)
+    elif server.team_id is not None:
+        require_team_access(
+            session, actor, server.team_id, action=action, resource_type="mcp server"
+        )
+    else:
+        raise HTTPException(status_code=404, detail="mcp server not found")
+
+
 @router.post("", response_model=McpServerRead, status_code=201)
-def create_mcp_server(payload: McpServerCreate, session: Session = Depends(get_session)) -> McpServer:
-    user = ensure_default_user(session)
+def create_mcp_server(
+    payload: McpServerCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServer:
     team_id = payload.team_id
     project_id = payload.project_id
     if project_id is not None and session.get(Project, project_id) is None:
         raise HTTPException(status_code=422, detail="project not found")
     if team_id is not None and project_id is not None:
         raise HTTPException(status_code=422, detail="MCP server must have exactly one owner scope")
-    default_team = ensure_default_team(session)
-    if team_id is not None and team_id != default_team.id:
-        raise HTTPException(status_code=403, detail="cannot create MCP server for another team")
+    if team_id is not None:
+        require_team_access(
+            session, actor, team_id, action="mcp_server.create", resource_type="team"
+        )
     if project_id is not None:
-        require_project_access(session, project_id)
+        require_project_access(session, actor, project_id, action="mcp_server.create")
     if team_id is None and project_id is None:
-        team_id = default_team.id
-    server = McpServer(team_id=team_id, project_id=project_id, created_by=user.id, name=payload.name)
+        team_id = primary_team_id(session, actor)
+    server = McpServer(team_id=team_id, project_id=project_id, created_by=actor.id, name=payload.name)
     session.add(server)
     session.flush()
     session.refresh(server)
@@ -88,34 +109,59 @@ def create_mcp_server(payload: McpServerCreate, session: Session = Depends(get_s
 
 
 @router.get("", response_model=list[McpServerRead])
-def list_mcp_servers(session: Session = Depends(get_session)) -> list[McpServer]:
-    team_id = ensure_default_team(session).id
-    return list(session.execute(select(McpServer).outerjoin(Project, McpServer.project_id == Project.id).where(or_(McpServer.team_id == team_id, Project.team_id == team_id)).order_by(McpServer.created_at)).scalars())
+def list_mcp_servers(
+    session: Session = Depends(get_session), actor: User = Depends(current_actor)
+) -> list[McpServer]:
+    servers = session.execute(select(McpServer).order_by(McpServer.created_at)).scalars()
+    if actor.role == "admin":
+        return list(servers)
+    result = []
+    for server in servers:
+        if server.team_id is not None and has_team_access(session, actor, server.team_id):
+            result.append(server)
+        elif server.project_id is not None:
+            project = session.get(Project, server.project_id)
+            if project is not None and can_access_project(session, actor, project):
+                result.append(server)
+    return result
 
 
 @router.get("/{mcp_server_id}", response_model=McpServerRead)
-def get_mcp_server(mcp_server_id: uuid.UUID, session: Session = Depends(get_session)) -> McpServer:
+def get_mcp_server(
+    mcp_server_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> McpServer:
     server = session.get(McpServer, mcp_server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="mcp server not found")
-    return require_default_team_access(session, server, "MCP server")
+    _require_server_access(session, actor, server, action="mcp_server.read")
+    return server
 
 
 @router.post("/{mcp_server_id}/versions", response_model=McpServerVersionRead, status_code=201)
 def create_mcp_server_version(
-    mcp_server_id: uuid.UUID, payload: McpServerVersionCreate, session: Session = Depends(get_session)
+    mcp_server_id: uuid.UUID,
+    payload: McpServerVersionCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> McpServerVersionRead:
     server = session.get(McpServer, mcp_server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="mcp server not found")
-    require_default_team_access(session, server, "MCP server")
+    _require_server_access(session, actor, server, action="mcp_server.version.create")
     if payload.credential is not None and payload.credential_id is not None:
         raise HTTPException(status_code=422, detail="provide credential or credential_id, not both")
     if payload.credential_id is not None:
         credential = session.get(Credential, payload.credential_id)
         if credential is None:
             raise HTTPException(status_code=422, detail="credential not found")
-        require_default_team_access(session, credential, "credential")
+        if credential.project_id is not None:
+            require_project_access(session, actor, credential.project_id, action="credential.attach")
+        elif credential.team_id is not None:
+            require_team_access(
+                session, actor, credential.team_id, action="credential.attach", resource_type="credential"
+            )
         if server.project_id is not None and credential.project_id not in (None, server.project_id):
             raise HTTPException(status_code=422, detail="credential belongs to another project")
         if server.team_id is not None and credential.team_id != server.team_id:
@@ -143,12 +189,14 @@ def create_mcp_server_version(
 
 @router.get("/{mcp_server_id}/versions", response_model=list[McpServerVersionRead])
 def list_mcp_server_versions(
-    mcp_server_id: uuid.UUID, session: Session = Depends(get_session)
+    mcp_server_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> list[McpServerVersionRead]:
     server = session.get(McpServer, mcp_server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="mcp server not found")
-    require_default_team_access(session, server, "MCP server")
+    _require_server_access(session, actor, server, action="mcp_server.version.list")
     versions = session.execute(
         select(McpServerVersion)
         .where(McpServerVersion.mcp_server_id == mcp_server_id)
@@ -159,12 +207,15 @@ def list_mcp_server_versions(
 
 @router.get("/{mcp_server_id}/versions/{version_number}", response_model=McpServerVersionRead)
 def get_mcp_server_version(
-    mcp_server_id: uuid.UUID, version_number: int, session: Session = Depends(get_session)
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> McpServerVersionRead:
     server = session.get(McpServer, mcp_server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="mcp server not found")
-    require_default_team_access(session, server, "MCP server")
+    _require_server_access(session, actor, server, action="mcp_server.version.read")
     version = session.execute(
         select(McpServerVersion).where(
             McpServerVersion.mcp_server_id == mcp_server_id,
@@ -178,12 +229,15 @@ def get_mcp_server_version(
 
 @router.get("/{mcp_server_id}/versions/{version_number}/tools", response_model=list[dict[str, Any]])
 def get_mcp_server_tools(
-    mcp_server_id: uuid.UUID, version_number: int, session: Session = Depends(get_session)
+    mcp_server_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> list[dict[str, Any]]:
     server = session.get(McpServer, mcp_server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="mcp server not found")
-    require_default_team_access(session, server, "MCP server")
+    _require_server_access(session, actor, server, action="mcp_server.tools.read")
     version = session.execute(
         select(McpServerVersion).where(
             McpServerVersion.mcp_server_id == mcp_server_id,

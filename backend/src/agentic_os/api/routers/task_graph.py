@@ -10,8 +10,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.deps import get_session
+from agentic_os.api.authorization import current_actor, require_resource_access
 from agentic_os.domain.decomposition import TaskBlueprint, UnknownCapabilityError, UnsupportedWorkflowError, decompose_goal
-from agentic_os.domain.models import Budget, Goal, Policy, Task, TaskDependency
+from agentic_os.domain.models import Budget, Goal, Policy, Task, TaskDependency, User
 from agentic_os.worker.workspace import InvalidResourceKeyError, canonical_resource_key
 
 router = APIRouter(tags=["task-graph"])
@@ -279,19 +280,33 @@ def _persist_task_graph(session: Session, goal_id: uuid.UUID, payload: TaskGraph
 
 @router.post("/goals/{goal_id}/task-graph", response_model=TaskGraphRead, status_code=201)
 def create_task_graph(
-    goal_id: uuid.UUID, payload: TaskGraphCreate, session: Session = Depends(get_session)
+    goal_id: uuid.UUID,
+    payload: TaskGraphCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> TaskGraphRead:
     goal = session.get(Goal, goal_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not found")
-    return _persist_task_graph(session, goal_id, payload)
+    require_resource_access(session, actor, goal, action="task_graph.create", resource_type="goal")
+    graph = _persist_task_graph(session, goal_id, payload)
+    for task in graph.tasks:
+        persisted = session.get(Task, task.id)
+        if persisted is not None:
+            persisted.created_by = actor.id
+    return graph
 
 
 @router.get("/goals/{goal_id}/task-graph", response_model=TaskGraphRead)
-def get_task_graph(goal_id: uuid.UUID, session: Session = Depends(get_session)) -> TaskGraphRead:
+def get_task_graph(
+    goal_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> TaskGraphRead:
     goal = session.get(Goal, goal_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not found")
+    require_resource_access(session, actor, goal, action="task_graph.read", resource_type="goal")
     return _load_graph(session, goal_id)
 
 
@@ -326,10 +341,12 @@ def decompose_goal_task_graph(
     goal_id: uuid.UUID,
     payload: DecomposeGoalRequest = DecomposeGoalRequest(),
     session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
 ) -> TaskGraphRead:
     goal = session.get(Goal, goal_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not found")
+    require_resource_access(session, actor, goal, action="task_graph.decompose", resource_type="goal")
     if session.execute(select(Task.id).where(Task.goal_id == goal_id)).first() is not None:
         raise HTTPException(status_code=409, detail="goal already has a persisted task graph")
 
@@ -341,4 +358,9 @@ def decompose_goal_task_graph(
         raise HTTPException(status_code=422, detail=str(error)) from error
 
     graph_create = TaskGraphCreate(tasks=[_blueprint_to_node(blueprint) for blueprint in blueprints])
-    return _persist_task_graph(session, goal_id, graph_create)
+    graph = _persist_task_graph(session, goal_id, graph_create)
+    for task in graph.tasks:
+        persisted = session.get(Task, task.id)
+        if persisted is not None:
+            persisted.created_by = actor.id
+    return graph

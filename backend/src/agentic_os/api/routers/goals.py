@@ -9,9 +9,9 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from agentic_os.api.bootstrap import ensure_default_user
+from agentic_os.api.authorization import current_actor, require_project_access, require_resource_access
 from agentic_os.api.deps import get_session
-from agentic_os.domain.models import Goal, Project
+from agentic_os.domain.models import Goal, User
 from agentic_os.observability import current_request_context, record_observability
 
 router = APIRouter(tags=["goals"])
@@ -36,14 +36,16 @@ class GoalRead(BaseModel):
 
 
 @router.post("/projects/{project_id}/goals", response_model=GoalRead, status_code=201)
-def create_goal(project_id: uuid.UUID, payload: GoalCreate, session: Session = Depends(get_session)) -> Goal:
-    project = session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    user = ensure_default_user(session)
+def create_goal(
+    project_id: uuid.UUID,
+    payload: GoalCreate,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Goal:
+    project = require_project_access(session, actor, project_id, action="goal.create")
     goal = Goal(
         project_id=project.id,
-        created_by=user.id,
+        created_by=actor.id,
         title=payload.title,
         description=payload.description,
         status="draft",
@@ -57,7 +59,7 @@ def create_goal(project_id: uuid.UUID, payload: GoalCreate, session: Session = D
             replace(
                 context,
                 team_id=project.team_id,
-                user_id=user.id,
+                user_id=actor.id,
                 project_id=project.id,
                 goal_id=goal.id,
             ),
@@ -71,16 +73,23 @@ def create_goal(project_id: uuid.UUID, payload: GoalCreate, session: Session = D
 
 
 @router.get("/projects/{project_id}/goals", response_model=list[GoalRead])
-def list_goals(project_id: uuid.UUID, session: Session = Depends(get_session)) -> list[Goal]:
-    project = session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
+def list_goals(
+    project_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[Goal]:
+    require_project_access(session, actor, project_id, action="goal.list")
     return list(session.execute(select(Goal).where(Goal.project_id == project_id).order_by(Goal.created_at)).scalars())
 
 
 @router.get("/goals/{goal_id}", response_model=GoalRead)
-def get_goal(goal_id: uuid.UUID, session: Session = Depends(get_session)) -> Goal:
+def get_goal(
+    goal_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> Goal:
     goal = session.get(Goal, goal_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not found")
+    require_resource_access(session, actor, goal, action="goal.read", resource_type="goal")
     return goal
