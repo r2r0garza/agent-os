@@ -96,7 +96,7 @@ TelemetryDeliveryStatus = Enum(
 class Team(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "teams"
 
-    name: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
 
 
 class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
