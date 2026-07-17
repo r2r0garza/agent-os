@@ -145,6 +145,16 @@ shared team VM, the TLS/proxy edge, ports, durable volume/secret boundaries,
 restart ordering, and independently scaled workers that subsequent Sprint 10
 issues implement against.
 
+## Team VM deployment verification
+
+See [docs/team-vm-verification.md](docs/team-vm-verification.md) for the
+Sprint 10 consolidated verification: the automated suite covering team-mode
+configuration/TLS-origin preflight, backup/restore/upgrade operations,
+independently scaled worker recovery, and the admin console's deployment
+health view, plus the manual VM-like smoke sequence (preflight → migrate →
+governed goal → multiple workers → service restart → backup → restore →
+upgrade preflight) tied back to each Sprint 10 exit criterion.
+
 ## Deterministic code index
 
 The committed `.code-index/` covers tracked Python backend and TypeScript/TSX or

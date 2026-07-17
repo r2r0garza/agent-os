@@ -411,4 +411,6 @@ Stopping services (`systemctl stop agentic-os-worker agentic-os-api` or
   worker capacity in the frontend/admin surface, backed by real APIs rather
   than mock state.
 - **#66** verifies the full team VM deployment, backup/restore, upgrade,
-  scaling, and restart recovery end to end against this topology.
+  scaling, and restart recovery end to end against this topology; see
+  [docs/team-vm-verification.md](team-vm-verification.md) for the
+  consolidated automated and manual evidence.
