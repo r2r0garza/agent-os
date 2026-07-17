@@ -599,6 +599,38 @@ class ModelProfileVersion(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     pricing_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
 
 
+class ModelProfileProbe(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
+    __tablename__ = "model_profile_probes"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('completed', 'degraded', 'failed')",
+            name="valid_status",
+        ),
+    )
+
+    model_profile_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("model_profile_versions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    capability_evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    pricing_evidence: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    request_metadata: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    diagnostics: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]"
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Agent(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "agents"
 

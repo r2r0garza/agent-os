@@ -11,8 +11,15 @@ from sqlalchemy.orm import Session
 from agentic_os.api.authorization import actor_team_ids, current_actor, primary_team_id, require_owned_scope
 from agentic_os.api.deps import get_session
 from agentic_os.api.redaction import redact_mapping
-from agentic_os.api.secrets import encrypt_secret
-from agentic_os.domain.models import Credential, ModelProfile, ModelProfileVersion, User
+from agentic_os.api.secrets import decrypt_secret, encrypt_secret
+from agentic_os.domain.models import (
+    Credential,
+    ModelProfile,
+    ModelProfileProbe,
+    ModelProfileVersion,
+    User,
+)
+from agentic_os.model_profiles import ProbeSettings, probe_model_profile
 
 router = APIRouter(prefix="/model-profiles", tags=["model-profiles"])
 
@@ -69,6 +76,24 @@ class ModelProfileVersionRead(BaseModel):
     created_at: datetime
 
 
+class ModelProfileProbeRequest(BaseModel):
+    timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    max_attempts: int = Field(default=2, ge=1, le=3)
+
+
+class ModelProfileProbeRead(BaseModel):
+    id: uuid.UUID
+    model_profile_version_id: uuid.UUID
+    status: str
+    capability_evidence: dict
+    pricing_evidence: dict
+    request_metadata: dict
+    diagnostics: list[dict]
+    started_at: datetime
+    completed_at: datetime
+    created_at: datetime
+
+
 def _get_profile(session: Session, actor: User, profile_id: uuid.UUID) -> ModelProfile:
     profile = session.get(ModelProfile, profile_id)
     if profile is None:
@@ -118,6 +143,37 @@ def _profile_to_read(profile: ModelProfile) -> ModelProfileRead:
         created_at=profile.created_at,
         updated_at=profile.updated_at,
     )
+
+
+def _probe_to_read(probe: ModelProfileProbe) -> ModelProfileProbeRead:
+    return ModelProfileProbeRead(
+        id=probe.id,
+        model_profile_version_id=probe.model_profile_version_id,
+        status=probe.status,
+        capability_evidence=redact_mapping(probe.capability_evidence),
+        pricing_evidence=redact_mapping(probe.pricing_evidence),
+        request_metadata=redact_mapping(probe.request_metadata),
+        diagnostics=redact_mapping(probe.diagnostics),
+        started_at=probe.started_at,
+        completed_at=probe.completed_at,
+        created_at=probe.created_at,
+    )
+
+
+def _get_version(
+    session: Session,
+    model_profile_id: uuid.UUID,
+    version_number: int,
+) -> ModelProfileVersion:
+    version = session.execute(
+        select(ModelProfileVersion).where(
+            ModelProfileVersion.model_profile_id == model_profile_id,
+            ModelProfileVersion.version_number == version_number,
+        )
+    ).scalar_one_or_none()
+    if version is None:
+        raise HTTPException(status_code=404, detail="model profile version not found")
+    return version
 
 
 @router.post("", response_model=ModelProfileRead, status_code=201)
@@ -228,7 +284,64 @@ def get_model_profile_version(
     actor: User = Depends(current_actor),
 ) -> ModelProfileVersionRead:
     _get_profile(session, actor, model_profile_id)
-    version = session.execute(select(ModelProfileVersion).where(ModelProfileVersion.model_profile_id == model_profile_id, ModelProfileVersion.version_number == version_number)).scalar_one_or_none()
-    if version is None:
-        raise HTTPException(status_code=404, detail="model profile version not found")
-    return _version_to_read(version)
+    return _version_to_read(_get_version(session, model_profile_id, version_number))
+
+
+@router.post(
+    "/{model_profile_id}/versions/{version_number}/probe",
+    response_model=ModelProfileProbeRead,
+    status_code=201,
+)
+def probe_model_profile_version(
+    model_profile_id: uuid.UUID,
+    version_number: int,
+    payload: ModelProfileProbeRequest,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> ModelProfileProbeRead:
+    profile = _get_profile(session, actor, model_profile_id)
+    version = _get_version(session, model_profile_id, version_number)
+    if version.credential_id is None:
+        raise HTTPException(status_code=422, detail="model profile version has no credential")
+    credential = _credential_for_profile(
+        session, actor, version.credential_id, profile.team_id
+    )
+    result = probe_model_profile(
+        base_url=version.base_url,
+        model_identifier=version.model_identifier,
+        api_key=decrypt_secret(credential.encrypted_material),
+        configured_headers=version.headers,
+        pricing_metadata=version.pricing_metadata,
+        settings=ProbeSettings(
+            timeout_seconds=payload.timeout_seconds,
+            max_attempts=payload.max_attempts,
+        ),
+    )
+    probe = ModelProfileProbe(
+        model_profile_version_id=version.id,
+        **result,
+    )
+    session.add(probe)
+    session.flush()
+    session.refresh(probe)
+    return _probe_to_read(probe)
+
+
+@router.get(
+    "/{model_profile_id}/versions/{version_number}/probes",
+    response_model=list[ModelProfileProbeRead],
+)
+def list_model_profile_probes(
+    model_profile_id: uuid.UUID,
+    version_number: int,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> list[ModelProfileProbeRead]:
+    _get_profile(session, actor, model_profile_id)
+    version = _get_version(session, model_profile_id, version_number)
+    probes = session.execute(
+        select(ModelProfileProbe)
+        .where(ModelProfileProbe.model_profile_version_id == version.id)
+        .order_by(ModelProfileProbe.created_at.desc())
+    ).scalars()
+    return [_probe_to_read(probe) for probe in probes]

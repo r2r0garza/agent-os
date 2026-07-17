@@ -131,6 +131,7 @@ class DomainMigrationTests(unittest.TestCase):
             "mcp_servers",
             "mcp_server_versions",
             "model_profiles",
+            "model_profile_probes",
             "policies",
             "budgets",
             "cost_ledger_entries",

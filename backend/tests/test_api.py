@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -84,6 +85,86 @@ class ApiWorkflowTests(unittest.TestCase):
     def test_model_profile_validation_failure(self) -> None:
         response = client.post("/api/v1/model-profiles", json={"name": "incomplete"})
         self.assertEqual(response.status_code, 422)
+
+    def test_model_profile_probe_persists_redacted_evidence_and_enforces_access(self) -> None:
+        profile_response = client.post(
+            "/api/v1/model-profiles",
+            json={
+                "name": f"Probe profile {uuid.uuid4()}",
+                "base_url": "https://models.example.test/v1?access_token=url-secret",
+                "model_identifier": "probe-model",
+                "api_key": "probe-api-secret",
+                "headers": {"X-API-Key": "probe-header-secret"},
+                "pricing_metadata": {
+                    "currency": "USD",
+                    "input_cost_per_million_tokens": 1,
+                    "output_cost_per_million_tokens": 2,
+                },
+            },
+        )
+        self.assertEqual(profile_response.status_code, 201, profile_response.text)
+        profile = profile_response.json()
+        probe_result = {
+            "status": "completed",
+            "started_at": datetime.now(UTC),
+            "completed_at": datetime.now(UTC),
+            "capability_evidence": {
+                "streaming": {"status": "supported", "diagnostic": "SSE returned"}
+            },
+            "pricing_evidence": {
+                "status": "valid",
+                "metered": True,
+                "warnings": [],
+                "failures": [],
+            },
+            "request_metadata": {
+                "endpoint": "https://models.example.test/v1",
+                "header_names": ["Authorization", "X-API-Key"],
+            },
+            "diagnostics": [],
+        }
+        with mock.patch(
+            "agentic_os.api.routers.model_profiles.probe_model_profile",
+            return_value=probe_result,
+        ) as probe:
+            response = client.post(
+                f"/api/v1/model-profiles/{profile['id']}/versions/1/probe",
+                json={"timeout_seconds": 1, "max_attempts": 2},
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "completed")
+        self.assertNotIn("probe-api-secret", response.text)
+        self.assertNotIn("probe-header-secret", response.text)
+        self.assertNotIn("url-secret", response.text)
+        self.assertEqual(
+            client.get(
+                f"/api/v1/model-profiles/{profile['id']}/versions/1/probes"
+            ).json(),
+            [body],
+        )
+        call = probe.call_args.kwargs
+        self.assertEqual(call["api_key"], "probe-api-secret")
+        self.assertEqual(call["configured_headers"]["X-API-Key"], "probe-header-secret")
+
+        engine = create_database_engine(TEST_DATABASE_URL)
+        with session_factory(engine)() as session:
+            from agentic_os.domain.models import User
+
+            outsider = User(
+                email=f"probe-outsider-{uuid.uuid4()}@example.test",
+                display_name="Probe outsider",
+            )
+            session.add(outsider)
+            session.commit()
+            outsider_id = outsider.id
+        engine.dispose()
+        denied = client.post(
+            f"/api/v1/model-profiles/{profile['id']}/versions/1/probe",
+            headers={"x-agentic-user-id": str(outsider_id)},
+            json={},
+        )
+        self.assertEqual(denied.status_code, 404, denied.text)
 
     def test_not_found_returns_404(self) -> None:
         response = client.get(f"/api/v1/projects/{uuid.uuid4()}")
