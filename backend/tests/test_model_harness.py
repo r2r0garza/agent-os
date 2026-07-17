@@ -26,6 +26,7 @@ from agentic_os.domain.models import (
     AgentVersionMcpServer,
     AgentVersionSkill,
     AuditEvent,
+    Budget,
     CostLedgerEntry,
     Credential,
     Goal,
@@ -34,6 +35,7 @@ from agentic_os.domain.models import (
     ModelProfile,
     ModelProfileProbe,
     ModelProfileVersion,
+    Policy,
     Project,
     Run,
     RunConfigurationSnapshot,
@@ -190,6 +192,8 @@ class ModelHarnessTestCase(unittest.TestCase):
         required_capabilities: list[str] | None = None,
         enabled_tools: list[str] | None = None,
         mcp_tool_descriptor: dict | None = None,
+        budget_amount_minor_units: int | None = None,
+        budget_enforcement_mode: str = "hard_stop",
     ) -> Task:
         team = make_team(session)
         user = make_user(session)
@@ -232,6 +236,18 @@ class ModelHarnessTestCase(unittest.TestCase):
         session.add(agent)
         session.flush()
 
+        budget_id = None
+        if budget_amount_minor_units is not None:
+            budget = Budget(
+                agent_id=agent.id,
+                currency="USD",
+                amount_minor_units=budget_amount_minor_units,
+                enforcement_mode=budget_enforcement_mode,
+            )
+            session.add(budget)
+            session.flush()
+            budget_id = budget.id
+
         agent_version = AgentVersion(
             agent_id=agent.id,
             version_number=1,
@@ -242,6 +258,7 @@ class ModelHarnessTestCase(unittest.TestCase):
             },
             model_profile_id=model_profile.id,
             model_profile_version_id=model_profile_version.id,
+            default_budget_id=budget_id,
         )
         session.add(agent_version)
         session.flush()
@@ -400,6 +417,111 @@ class ModelHarnessTestCase(unittest.TestCase):
                 ).scalars()
             )
             self.assertIn("tool.output_truncated", event_types)
+
+    def test_harness_tool_call_denied_by_policy_fails_before_dispatch(self) -> None:
+        descriptor = {"name": "echo", "description": "Echo input"}
+        with fake_model_server("tool_call") as (base_url, handler):
+            with self.Session() as session:
+                task = self._build_harness_task(
+                    session,
+                    base_url=base_url,
+                    required_capabilities=["tool_calls"],
+                    enabled_tools=["echo"],
+                    mcp_tool_descriptor=descriptor,
+                )
+                task_id = task.id
+                mcp_server_version_id = session.execute(
+                    select(AgentVersionMcpServer.mcp_server_version_id).where(
+                        AgentVersionMcpServer.agent_version_id == task.assigned_agent_version_id
+                    )
+                ).scalar_one()
+                mcp_server_id = session.execute(
+                    select(McpServerVersion.mcp_server_id).where(
+                        McpServerVersion.id == mcp_server_version_id
+                    )
+                ).scalar_one()
+                session.add(
+                    Policy(scope_type="mcp_server", scope_id=mcp_server_id, decision="deny", rule={})
+                )
+                session.commit()
+
+            with self.Session() as session:
+                with self.assertRaises(TaskExecutionError):
+                    run_task_worker_once(session, "worker-harness-policy-deny")
+                session.commit()
+
+            # A denied policy must fail the run before any model call is made,
+            # matching the deterministic tool path's fail-closed guarantee.
+            self.assertEqual(handler.requests, [])
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "failed")
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertIn("policy.decision", event_types)
+            self.assertNotIn("harness.invocation_started", event_types)
+            self.assertNotIn("tool.invoked", event_types)
+
+    def test_harness_tool_call_budget_hard_stop_blocks_before_dispatch(self) -> None:
+        descriptor = {
+            "name": "echo",
+            "description": "Echo input",
+            "pricing": {"chargeable": True, "amount_minor_units": 5_00, "currency": "USD"},
+        }
+        with fake_model_server("tool_call") as (base_url, handler):
+            with self.Session() as session:
+                task = self._build_harness_task(
+                    session,
+                    base_url=base_url,
+                    required_capabilities=["tool_calls"],
+                    enabled_tools=["echo"],
+                    mcp_tool_descriptor=descriptor,
+                    budget_amount_minor_units=3_00,
+                )
+                task_id = task.id
+
+            with self.Session() as session:
+                with self.assertRaises(TaskExecutionError):
+                    run_task_worker_once(session, "worker-harness-budget-hard-stop")
+                session.commit()
+
+        # The model's tool-call turn is dispatched, but the governed bridge
+        # must reserve budget before invoking the tool and reject once the
+        # hard-stop cap would be exceeded -- no second turn is ever sent.
+        self.assertEqual(len(handler.requests), 1)
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+            run = session.execute(select(Run).where(Run.task_id == task_id)).scalar_one()
+            self.assertEqual(run.status, "failed")
+
+            event_types = {
+                row.event_type
+                for row in session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
+            }
+            self.assertIn("tool.rejected", event_types)
+            self.assertNotIn("tool.invoked", event_types)
+
+            rejection = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.task_id == task_id, AuditEvent.event_type == "tool.rejected"
+                )
+            ).scalar_one()
+            self.assertEqual(rejection.payload["reason_code"], "budget_exhausted")
+
+            ledger_entries = list(
+                session.execute(select(CostLedgerEntry).where(CostLedgerEntry.run_id == run.id)).scalars()
+            )
+            self.assertEqual(len(ledger_entries), 1)
+            self.assertEqual(ledger_entries[0].status, "void")
+            self.assertEqual(ledger_entries[0].reserved_amount_minor_units, 500)
 
     def test_worker_completes_task_through_harness_with_fake_endpoint(self) -> None:
         with fake_model_server("success") as (base_url, handler):

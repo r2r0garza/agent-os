@@ -155,6 +155,17 @@ health view, plus the manual VM-like smoke sequence (preflight → migrate →
 governed goal → multiple workers → service restart → backup → restore →
 upgrade preflight) tied back to each Sprint 10 exit criterion.
 
+## Model-backed harness verification
+
+See [docs/model-harness-verification.md](docs/model-harness-verification.md)
+for the Sprint 12 consolidated verification: the automated suite covering
+model profile capability probing, pinned Deep Agents/LangGraph-style harness
+execution against fake OpenAI-compatible endpoints, the governed tool bridge's
+policy/budget enforcement, evidence redaction, restart recovery, and the
+frontend probe/run-evidence workflows, plus the manual smoke sequence (create
+profile → probe → assign to agent → submit task → observe evidence → restart
+worker → inspect recovered state).
+
 ## Deterministic code index
 
 The committed `.code-index/` covers tracked Python backend and TypeScript/TSX or
