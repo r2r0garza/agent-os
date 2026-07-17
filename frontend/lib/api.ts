@@ -376,6 +376,36 @@ export interface WorkspaceConflict {
   resources: WorkspaceConflictResource[]
 }
 
+export interface WorkspaceLease {
+  project_id: Identifier
+  task_id: Identifier | null
+  run_id: Identifier | null
+  resource_key: string
+  owner: string
+  fencing_token: number
+  fencing_status: "current" | "superseded"
+  expected_revision: number
+  current_revision: number
+  expires_at: string
+  state: "active" | "stale" | "fenced"
+}
+
+export interface WorkspacePromotionDelta {
+  resource_key: string
+  previous_revision: number
+  resulting_revision: number | null
+  revision_increment: number | null
+}
+
+export interface WorkspacePromotion {
+  project_id: Identifier
+  task_id: Identifier
+  run_id: Identifier
+  status: string
+  occurred_at: string
+  resource_deltas: WorkspacePromotionDelta[]
+}
+
 export interface RunSnapshot {
   configuration_snapshot_id?: Identifier
   agent_id?: Identifier
