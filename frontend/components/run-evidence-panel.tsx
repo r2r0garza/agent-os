@@ -2,6 +2,8 @@
 
 import { useState } from "react"
 import {
+  AlertTriangle,
+  Bot,
   ChevronDown,
   ChevronUp,
   CircleDollarSign,
@@ -11,7 +13,7 @@ import {
   Wrench,
 } from "lucide-react"
 
-import { Agent, GovernanceEvidence, Run, api } from "@/lib/api"
+import { Agent, AuditEvent, GovernanceEvidence, Run, api } from "@/lib/api"
 import { GovernanceLookups } from "@/components/governance-workspace"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -34,6 +36,99 @@ const EVIDENCE_EVENT_TYPES = new Set([
   "tool.invoked",
   "skill.invoked",
 ])
+const HARNESS_EVENT_TYPES = new Set([
+  "harness.capability_check_failed",
+  "harness.invocation_started",
+  "harness.invocation_completed",
+  "harness.invocation_failed",
+  "harness.output_recorded",
+])
+
+function HarnessEvidenceRow({ event }: { event: AuditEvent }) {
+  const payload = event.payload
+  switch (event.event_type) {
+    case "harness.invocation_started":
+      return (
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex items-center gap-1">
+            <Bot className="size-3 text-muted-foreground" /> model call started ·{" "}
+            {String(payload.model_identifier ?? "unknown model")}
+          </span>
+          <Badge variant="outline">{String(payload.endpoint ?? "endpoint redacted")}</Badge>
+        </div>
+      )
+    case "harness.invocation_completed": {
+      const usage = (payload.usage ?? {}) as Record<string, unknown>
+      const usageText = Object.entries(usage)
+        .map(([key, value]) => `${key.replaceAll("_", " ")}: ${value}`)
+        .join(" · ")
+      return (
+        <div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1">
+              <ShieldCheck className="size-3 text-emerald-600" /> model call completed ·{" "}
+              {String(payload.attempts ?? 1)} attempt(s) ·{" "}
+              {String(payload.tool_rounds ?? 0)} tool round(s)
+            </span>
+            <Badge variant="outline">
+              {String(payload.finish_reason ?? "finish reason unavailable")}
+            </Badge>
+          </div>
+          {usageText ? (
+            <p className="mt-0.5 text-muted-foreground">{usageText}</p>
+          ) : null}
+        </div>
+      )
+    }
+    case "harness.invocation_failed":
+      return (
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex items-center gap-1 text-destructive">
+            <AlertTriangle className="size-3" /> model call failed ·{" "}
+            {String(payload.diagnostic ?? "unknown failure")}
+          </span>
+          <Badge variant="destructive">
+            {String(payload.attempts ?? 0)} attempt(s)
+          </Badge>
+        </div>
+      )
+    case "harness.capability_check_failed": {
+      const failures = Array.isArray(payload.failures)
+        ? (payload.failures as { capability: string; status: string; diagnostic: string }[])
+        : []
+      return (
+        <div>
+          <span className="flex items-center gap-1 text-destructive">
+            <AlertTriangle className="size-3" /> blocked before invocation: missing required
+            capability evidence
+          </span>
+          <div className="mt-1 flex flex-wrap gap-1">
+            {failures.map((failure) => (
+              <Badge
+                key={failure.capability}
+                variant="destructive"
+                title={failure.diagnostic}
+              >
+                {failure.capability}: {failure.status}
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )
+    }
+    case "harness.output_recorded":
+      return (
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex items-center gap-1">
+            <Bot className="size-3 text-muted-foreground" /> model output recorded to run
+          </span>
+          <span className="text-muted-foreground">{displayDate(event.occurred_at)}</span>
+        </div>
+      )
+    default:
+      return null
+  }
+}
 
 function displayDate(value: string) {
   return new Intl.DateTimeFormat(undefined, {
@@ -86,6 +181,9 @@ export function RunEvidencePanel({
   const agent = agents.find((entry) => entry.id === snapshot.agent_id)
   const evidenceEvents = (evidence?.audit_events ?? []).filter((event) =>
     EVIDENCE_EVENT_TYPES.has(event.event_type)
+  )
+  const harnessEvents = (evidence?.audit_events ?? []).filter((event) =>
+    HARNESS_EVENT_TYPES.has(event.event_type)
   )
   const ledger = evidence?.cost_ledger_entries ?? []
 
@@ -166,6 +264,25 @@ export function RunEvidencePanel({
                 ) : null}
               </div>
             </div>
+
+            {snapshot.model_profile_version_id ? (
+              <div>
+                <p className="font-medium text-muted-foreground">
+                  Model invocation evidence
+                </p>
+                <div className="mt-1 grid gap-1.5">
+                  {harnessEvents.length ? (
+                    harnessEvents.map((event) => (
+                      <HarnessEvidenceRow key={event.id} event={event} />
+                    ))
+                  ) : (
+                    <p className="text-muted-foreground">
+                      No model invocation evidence recorded for this run yet.
+                    </p>
+                  )}
+                </div>
+              </div>
+            ) : null}
 
             {evidence?.approval_requests.length ? (
               <div>

@@ -24,6 +24,27 @@ export interface ModelProfileVersion {
   created_at: string
 }
 
+export interface ModelProfileProbe {
+  id: Identifier
+  model_profile_version_id: Identifier
+  status: string
+  // A capability's evidence can arrive as a bare redacted string (e.g.
+  // "[REDACTED]") instead of the usual {status, diagnostic} shape when its
+  // key name matches the backend's generic secret-redaction heuristic.
+  capability_evidence: Record<string, { status: string; diagnostic: string } | string>
+  pricing_evidence: {
+    status: string
+    metered: boolean
+    warnings: { code: string; message: string }[]
+    failures: { code: string; message: string }[]
+  }
+  request_metadata: Record<string, unknown>
+  diagnostics: Record<string, unknown>[]
+  started_at: string
+  completed_at: string
+  created_at: string
+}
+
 export interface Credential {
   id: Identifier
   team_id: Identifier | null

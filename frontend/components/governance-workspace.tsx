@@ -9,6 +9,7 @@ import {
   McpServer,
   McpServerVersion,
   ModelProfile,
+  ModelProfileProbe,
   ModelProfileVersion,
   PolicySet,
   PolicySetVersion,
@@ -35,10 +36,40 @@ import {
   KeyRound,
   LoaderCircle,
   Puzzle,
+  Radar,
   ServerCog,
   ShieldCheck,
   Wrench,
 } from "lucide-react"
+
+const CAPABILITY_LABELS: Record<string, string> = {
+  streaming: "Streaming",
+  tool_calls: "Tool calls",
+  structured_output: "Structured output",
+  token_usage: "Token usage",
+  reasoning: "Reasoning fields",
+  retry_timeout: "Retry/timeout",
+}
+
+const PROBE_STALE_MS = 24 * 60 * 60 * 1000
+
+function capabilityBadgeVariant(
+  status: string
+): "outline" | "destructive" | "secondary" {
+  if (status === "supported") return "outline"
+  if (status === "unsupported") return "destructive"
+  return "secondary"
+}
+
+function probeStatusVariant(status: string): "outline" | "destructive" | "secondary" {
+  if (status === "completed") return "outline"
+  if (status === "failed") return "destructive"
+  return "secondary"
+}
+
+function isProbeStale(probe: ModelProfileProbe): boolean {
+  return Date.now() - new Date(probe.created_at).getTime() > PROBE_STALE_MS
+}
 
 function displayDate(value: string) {
   return new Intl.DateTimeFormat(undefined, {
@@ -69,6 +100,99 @@ function EmptyState({ children }: { children: React.ReactNode }) {
   return (
     <div className="rounded-xl border border-dashed bg-muted/20 px-4 py-6 text-center text-xs text-muted-foreground">
       {children}
+    </div>
+  )
+}
+
+function ModelProbeEvidence({
+  probes,
+  probing,
+  error,
+  onProbe,
+}: {
+  probes: ModelProfileProbe[]
+  probing: boolean
+  error: string
+  onProbe: () => void
+}) {
+  const latest = probes[0] ?? null
+  const stale = latest ? isProbeStale(latest) : false
+  return (
+    <div className="mt-2 border-t pt-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {latest ? (
+            <>
+              <Badge variant={probeStatusVariant(latest.status)}>
+                probe {latest.status}
+              </Badge>
+              {stale ? (
+                <Badge variant="secondary">stale · re-probe recommended</Badge>
+              ) : null}
+            </>
+          ) : (
+            <Badge variant="secondary">unprobed</Badge>
+          )}
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-7 gap-1 text-xs"
+          disabled={probing}
+          onClick={onProbe}
+        >
+          {probing ? (
+            <LoaderCircle className="size-3 animate-spin" />
+          ) : (
+            <Radar className="size-3" />
+          )}
+          {latest ? "Re-probe" : "Probe"}
+        </Button>
+      </div>
+      {error ? <p className="mt-1 text-destructive">{error}</p> : null}
+      {latest ? (
+        <div className="mt-1.5 flex flex-wrap gap-1">
+          {Object.entries(latest.capability_evidence).map(([name, item]) => {
+            const redacted = typeof item === "string"
+            return (
+              <Badge
+                key={name}
+                variant={redacted ? "secondary" : capabilityBadgeVariant(item.status)}
+                title={redacted ? item : item.diagnostic}
+              >
+                {CAPABILITY_LABELS[name] ?? name}: {redacted ? "redacted" : item.status}
+              </Badge>
+            )
+          })}
+          <Badge
+            variant={
+              latest.pricing_evidence.status === "valid"
+                ? "outline"
+                : latest.pricing_evidence.status === "error"
+                  ? "destructive"
+                  : "secondary"
+            }
+            title={
+              [...latest.pricing_evidence.warnings, ...latest.pricing_evidence.failures]
+                .map((item) => item.message)
+                .join("; ") || undefined
+            }
+          >
+            pricing: {latest.pricing_evidence.status}
+          </Badge>
+        </div>
+      ) : (
+        <p className="mt-1.5 text-muted-foreground">
+          No probe evidence yet. Model-backed runs fail closed until this
+          version is probed for required capabilities.
+        </p>
+      )}
+      {latest?.diagnostics.length ? (
+        <p className="mt-1 text-destructive">
+          {latest.diagnostics.map((diagnostic) => JSON.stringify(diagnostic)).join("; ")}
+        </p>
+      ) : null}
     </div>
   )
 }
@@ -135,6 +259,11 @@ export function GovernanceWorkspace({
   const [modelVersions, setModelVersions] = useState<
     Record<string, ModelProfileVersion[]>
   >({})
+  const [modelProbes, setModelProbes] = useState<
+    Record<string, ModelProfileProbe[]>
+  >({})
+  const [probingVersionId, setProbingVersionId] = useState("")
+  const [probeError, setProbeError] = useState<Record<string, string>>({})
   const [agentVersions, setAgentVersions] = useState<
     Record<string, AgentVersion[]>
   >({})
@@ -202,6 +331,21 @@ export function GovernanceWorkspace({
         )
       )
       setModelVersions(Object.fromEntries(modelVersionEntries))
+
+      const modelProbeEntries = await Promise.all(
+        modelVersionEntries.flatMap(([, versions]) =>
+          versions.map(
+            async (version) =>
+              [
+                version.id,
+                await api<ModelProfileProbe[]>(
+                  `/model-profiles/${version.model_profile_id}/versions/${version.version_number}/probes`
+                ),
+              ] as const
+          )
+        )
+      )
+      setModelProbes(Object.fromEntries(modelProbeEntries))
 
       const agentVersionEntries = await Promise.all(
         agents.map(
@@ -409,6 +553,29 @@ export function GovernanceWorkspace({
       setNotice("Model profile version pinned.")
       formElement.reset()
     })
+  }
+
+  async function probeModelProfileVersion(version: ModelProfileVersion) {
+    setProbingVersionId(version.id)
+    setProbeError((current) => ({ ...current, [version.id]: "" }))
+    try {
+      await api<ModelProfileProbe>(
+        `/model-profiles/${version.model_profile_id}/versions/${version.version_number}/probe`,
+        jsonBody({})
+      )
+      const probes = await api<ModelProfileProbe[]>(
+        `/model-profiles/${version.model_profile_id}/versions/${version.version_number}/probes`
+      )
+      setModelProbes((current) => ({ ...current, [version.id]: probes }))
+    } catch (reason) {
+      setProbeError((current) => ({
+        ...current,
+        [version.id]:
+          reason instanceof Error ? reason.message : "Probe request failed",
+      }))
+    } finally {
+      setProbingVersionId("")
+    }
   }
 
   async function createSkillVersion(event: FormEvent<HTMLFormElement>) {
@@ -815,6 +982,12 @@ export function GovernanceWorkspace({
                         {version.model_identifier} · {version.base_url} ·{" "}
                         {displayDate(version.created_at)}
                       </p>
+                      <ModelProbeEvidence
+                        probes={modelProbes[version.id] ?? []}
+                        probing={probingVersionId === version.id}
+                        error={probeError[version.id] ?? ""}
+                        onProbe={() => void probeModelProfileVersion(version)}
+                      />
                     </div>
                   ))
                 )
