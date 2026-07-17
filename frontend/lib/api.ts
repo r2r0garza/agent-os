@@ -66,7 +66,45 @@ export interface Budget {
 
 export interface Project {
   id: Identifier
+  team_id: Identifier
+  created_by: Identifier
   name: string
+  created_at: string
+  updated_at?: string
+}
+
+export interface ProjectMember {
+  id: Identifier
+  project_id: Identifier
+  user_id: Identifier
+  granted_by: Identifier | null
+  created_at: string
+  user_email: string
+  user_display_name: string
+}
+
+export interface Team {
+  id: Identifier
+  name: string
+  created_at: string
+  updated_at: string
+}
+
+export interface TeamMembership {
+  id: Identifier
+  team_id: Identifier
+  user_id: Identifier
+  role: "owner" | "member"
+  created_at: string
+  user_email: string
+  user_display_name: string
+}
+
+export interface UserAccount {
+  id: Identifier
+  email: string
+  display_name: string
+  role: "admin" | "regular_user"
   created_at: string
 }
 
@@ -82,8 +120,19 @@ export interface Goal {
 
 export interface Agent {
   id: Identifier
+  team_id: Identifier
+  created_by: Identifier
   name: string
-  visibility: string
+  visibility: "private" | "team" | "public"
+  created_at: string
+  updated_at?: string
+}
+
+export interface AgentInstallation {
+  id: Identifier
+  installed_agent_id: Identifier
+  source_agent_version_id: Identifier
+  installed_by: Identifier
   created_at: string
 }
 
@@ -109,8 +158,19 @@ export interface AgentVersion {
 
 export interface Skill {
   id: Identifier
+  team_id: Identifier
+  created_by: Identifier
   name: string
-  visibility: string
+  visibility: "private" | "team" | "public"
+  created_at: string
+  updated_at?: string
+}
+
+export interface SkillInstallation {
+  id: Identifier
+  installed_skill_id: Identifier
+  source_skill_version_id: Identifier
+  installed_by: Identifier
   created_at: string
 }
 
@@ -125,9 +185,12 @@ export interface SkillVersion {
 
 export interface McpServer {
   id: Identifier
-  name: string
+  team_id: Identifier | null
   project_id: Identifier | null
+  name: string
+  visibility: "private" | "team" | "public"
   created_at: string
+  updated_at?: string
 }
 
 export interface McpServerVersion {
@@ -137,6 +200,17 @@ export interface McpServerVersion {
   connection_config: Record<string, unknown>
   credential_configured: boolean
   credential_id: Identifier | null
+  created_at: string
+}
+
+export interface McpServerAttachment {
+  id: Identifier
+  mcp_server_version_id: Identifier
+  team_id: Identifier | null
+  project_id: Identifier | null
+  agent_id: Identifier | null
+  credential_configured: boolean
+  revoked: boolean
   created_at: string
 }
 
@@ -515,6 +589,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(message, response.status)
   }
 
+  if (response.status === 204) {
+    return undefined as T
+  }
+
   return (await response.json()) as T
 }
 
@@ -543,4 +621,12 @@ export async function apiText(path: string): Promise<string> {
 
 export function jsonBody(value: unknown): RequestInit {
   return { method: "POST", body: JSON.stringify(value) }
+}
+
+export function patchBody(value: unknown): RequestInit {
+  return { method: "PATCH", body: JSON.stringify(value) }
+}
+
+export function deleteInit(): RequestInit {
+  return { method: "DELETE" }
 }

@@ -28,6 +28,7 @@ from agentic_os.api.routers import (
     skills,
     state,
     task_graph,
+    teams,
 )
 
 API_V1_PREFIX = "/api/v1"
@@ -66,6 +67,7 @@ def create_app() -> FastAPI:
     app.include_router(credentials.router, prefix=API_V1_PREFIX)
     app.include_router(policy_sets.router, prefix=API_V1_PREFIX)
     app.include_router(projects.router, prefix=API_V1_PREFIX)
+    app.include_router(teams.router, prefix=API_V1_PREFIX)
     app.include_router(goals.router, prefix=API_V1_PREFIX)
     app.include_router(governance.router, prefix=API_V1_PREFIX)
     app.include_router(agents.router, prefix=API_V1_PREFIX)

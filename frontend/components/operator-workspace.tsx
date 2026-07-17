@@ -38,6 +38,7 @@ import {
   api,
   jsonBody,
 } from "@/lib/api"
+import { AccessWorkspace } from "@/components/access-workspace"
 import { ArtifactWorkspace } from "@/components/artifact-workspace"
 import { GovernanceOperations } from "@/components/governance-operations"
 import {
@@ -722,6 +723,15 @@ export function OperatorWorkspace() {
             await loadProjectState(selectedProjectId)
             if (selectedGoalId) await loadGoalState(selectedGoalId)
           }}
+        />
+
+        <AccessWorkspace
+          projectId={selectedProjectId}
+          projects={inventory.projects}
+          agents={inventory.agents}
+          skills={inventory.skills}
+          servers={inventory.servers}
+          onRefresh={loadInventory}
         />
 
         <ArtifactWorkspace
