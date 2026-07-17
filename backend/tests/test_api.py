@@ -109,7 +109,12 @@ class ApiWorkflowTests(unittest.TestCase):
             "started_at": datetime.now(UTC),
             "completed_at": datetime.now(UTC),
             "capability_evidence": {
-                "streaming": {"status": "supported", "diagnostic": "SSE returned"}
+                "streaming": {"status": "supported", "diagnostic": "SSE returned"},
+                "token_usage": {
+                    "status": "supported",
+                    "diagnostic": "usage returned",
+                },
+                "access_token": "must-not-return",
             },
             "pricing_evidence": {
                 "status": "valid",
@@ -134,14 +139,24 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         body = response.json()
         self.assertEqual(body["status"], "completed")
+        self.assertEqual(
+            body["capability_evidence"]["token_usage"],
+            {"status": "supported", "diagnostic": "usage returned"},
+        )
+        self.assertEqual(
+            body["capability_evidence"]["access_token"],
+            "[REDACTED]",
+        )
         self.assertNotIn("probe-api-secret", response.text)
         self.assertNotIn("probe-header-secret", response.text)
         self.assertNotIn("url-secret", response.text)
+        listed = client.get(
+            f"/api/v1/model-profiles/{profile['id']}/versions/1/probes"
+        ).json()
+        self.assertEqual(listed, [body])
         self.assertEqual(
-            client.get(
-                f"/api/v1/model-profiles/{profile['id']}/versions/1/probes"
-            ).json(),
-            [body],
+            listed[0]["capability_evidence"]["token_usage"],
+            {"status": "supported", "diagnostic": "usage returned"},
         )
         call = probe.call_args.kwargs
         self.assertEqual(call["api_key"], "probe-api-secret")

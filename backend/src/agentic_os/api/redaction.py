@@ -13,13 +13,37 @@ SENSITIVE_FRAGMENTS = (
     "token",
 )
 
+NON_SENSITIVE_TOKEN_KEYS = frozenset(
+    {
+        "completion_tokens",
+        "input_cost_per_million_tokens",
+        "input_price_per_million_tokens",
+        "input_tokens",
+        "max_tokens",
+        "maximum_tokens",
+        "output_cost_per_million_tokens",
+        "output_price_per_million_tokens",
+        "output_tokens",
+        "prompt_tokens",
+        "token_usage",
+        "total_tokens",
+    }
+)
+
+
+def _is_sensitive_key(key: object) -> bool:
+    normalized = str(key).lower()
+    if normalized in NON_SENSITIVE_TOKEN_KEYS:
+        return False
+    return any(fragment in normalized for fragment in SENSITIVE_FRAGMENTS)
+
 
 def redact_mapping(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: (
                 "[REDACTED]"
-                if any(fragment in str(key).lower() for fragment in SENSITIVE_FRAGMENTS)
+                if _is_sensitive_key(key)
                 else redact_mapping(item)
             )
             for key, item in value.items()
