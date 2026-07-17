@@ -111,11 +111,113 @@ export interface UserAccount {
 export interface Goal {
   id: Identifier
   project_id: Identifier
+  created_by: Identifier
   title: string
   description: string | null
   status: string
+  control_version: number
+  pending_control: string | null
+  control_requested_by: Identifier | null
+  control_requested_at: string | null
+  cancellation_grace_expires_at: string | null
+  forced_termination_requested_at: string | null
+  forced_termination_completed_at: string | null
+  active_graph_revision_number: number
   created_at: string
   updated_at: string
+}
+
+export interface GoalLifecycleCommand {
+  id: Identifier
+  goal_id: Identifier
+  requested_by: Identifier | null
+  command_type: string
+  status: string
+  idempotency_key: string
+  reason: string | null
+  prior_goal_status: string | null
+  target_goal_status: string | null
+  cancellation_grace_expires_at: string | null
+  forced_termination_requested_at: string | null
+  forced_termination_completed_at: string | null
+  applied_at: string | null
+  evidence: Record<string, unknown>
+  created_at: string
+}
+
+export interface GoalSteeringRequest {
+  id: Identifier
+  goal_id: Identifier
+  requested_by: Identifier | null
+  status: string
+  idempotency_key: string
+  instruction: string
+  base_revision_number: number
+  applied_revision_number: number | null
+  resolved_at: string | null
+  evidence: Record<string, unknown>
+  created_at: string
+}
+
+export interface TaskGraphRevisionTaskEntry {
+  revision_id: Identifier
+  task_id: Identifier
+  change_type: "unchanged" | "added" | "revised" | "superseded"
+  supersedes_task_id: Identifier | null
+  task_snapshot: Record<string, unknown>
+}
+
+export interface TaskGraphRevision {
+  id: Identifier
+  goal_id: Identifier
+  created_by: Identifier | null
+  steering_request_id: Identifier | null
+  revision_number: number
+  parent_revision_number: number | null
+  change_summary: string | null
+  graph_snapshot: Record<string, unknown>
+  assignment_evidence: Record<string, unknown>
+  policy_context: Record<string, unknown>
+  budget_context: Record<string, unknown>
+  created_at: string
+}
+
+export interface TaskGraphRevisionDetail extends TaskGraphRevision {
+  tasks: TaskGraphRevisionTaskEntry[]
+}
+
+export interface GoalLifecycleEvent {
+  id: Identifier
+  sequence_number: number
+  goal_id: Identifier
+  actor_id: Identifier | null
+  lifecycle_command_id: Identifier | null
+  steering_request_id: Identifier | null
+  graph_revision_id: Identifier | null
+  event_type: string
+  prior_goal_status: string | null
+  resulting_goal_status: string | null
+  payload: Record<string, unknown>
+  occurred_at: string
+}
+
+export interface SteeringTaskSpecInput {
+  client_id: string
+  title: string
+  description?: string | null
+  required_capabilities?: Record<string, unknown>
+  capability_rationale?: Record<string, unknown>
+  expected_outputs?: unknown[]
+  resource_intent?: unknown[]
+  policy_ids?: string[] | null
+  budget_id?: string | null
+  depends_on?: string[] | null
+}
+
+export interface SteeringTaskChangeInput {
+  change_type: "added" | "revised" | "superseded"
+  task_id?: string | null
+  task?: SteeringTaskSpecInput | null
 }
 
 export interface Agent {

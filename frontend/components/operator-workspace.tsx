@@ -40,6 +40,7 @@ import {
 } from "@/lib/api"
 import { AccessWorkspace } from "@/components/access-workspace"
 import { ArtifactWorkspace } from "@/components/artifact-workspace"
+import { GoalLifecyclePanel } from "@/components/goal-lifecycle-panel"
 import { GovernanceOperations } from "@/components/governance-operations"
 import {
   GovernanceLookups,
@@ -704,6 +705,15 @@ export function OperatorWorkspace() {
             )}
           </CardContent>
         </Card>
+
+        <GoalLifecyclePanel
+          goalId={selectedGoalId}
+          goal={selectedGoal}
+          onRefresh={async () => {
+            await loadProjectState(selectedProjectId)
+            if (selectedGoalId) await loadGoalState(selectedGoalId)
+          }}
+        />
 
         <ObservabilityWorkspace goalId={selectedGoalId} runs={runs} />
 
