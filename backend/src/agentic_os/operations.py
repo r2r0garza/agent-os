@@ -28,11 +28,11 @@ from agentic_os.config import (
     TELEMETRY_DISABLED_ENV,
     format_report,
     run_preflight,
+    validate_postgres_tools,
 )
 from agentic_os.domain.database import create_database_engine, database_url, session_factory
 
 BACKUP_FORMAT_VERSION = 1
-REQUIRED_POSTGRES_TOOLS = ("pg_dump", "pg_restore", "pg_isready")
 
 
 class OperationError(RuntimeError):
@@ -140,13 +140,10 @@ def _record_maintenance_event(event_type: str, payload: dict[str, Any]) -> None:
 
 def setup_check() -> str:
     results = run_preflight()
-    missing = [tool for tool in REQUIRED_POSTGRES_TOOLS if shutil.which(tool) is None]
+    if not any(result.name == "postgres_tools" for result in results):
+        results = results + [validate_postgres_tools()]
     report = format_report(results)
-    if missing:
-        report += "\n[FAIL] postgres_tools: unavailable: " + ", ".join(missing)
-    else:
-        report += "\n[OK] postgres_tools: pg_dump, pg_restore, and pg_isready are available"
-    if not all(result.ok for result in results) or missing:
+    if not all(result.ok for result in results):
         _record_maintenance_event("operations.setup_check", {"ok": False, "report": report.splitlines()})
         raise OperationError(report)
     try:

@@ -32,7 +32,14 @@ def parser() -> argparse.ArgumentParser:
         "config", help="validate and manage local configuration and master-key material"
     )
     config_actions = config.add_subparsers(dest="config_command", required=True)
-    config_actions.add_parser("check", help="validate local configuration and master-key material")
+    check_parser = config_actions.add_parser(
+        "check", help="validate local or team-deployment configuration and master-key material"
+    )
+    check_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print structured evidence instead of the human-readable report",
+    )
     generate_key_parser = config_actions.add_parser(
         "generate-master-key", help="generate and persist a local master key"
     )
@@ -143,12 +150,16 @@ def _run_config_command(args: argparse.Namespace) -> int:
         ConfigurationError,
         format_report,
         generate_master_key,
+        preflight_evidence,
         run_preflight,
     )
 
     if args.config_command == "check":
         results = run_preflight()
-        print(format_report(results))
+        if args.json:
+            print(json.dumps(preflight_evidence(results), sort_keys=True))
+        else:
+            print(format_report(results))
         return 0 if all(result.ok for result in results) else 1
     if args.config_command == "generate-master-key":
         target_path = args.path or os.environ.get("AGENTIC_OS_MASTER_KEY_FILE", DEFAULT_MASTER_KEY_FILE)

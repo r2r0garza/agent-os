@@ -217,6 +217,39 @@ by this topology:
   `VISION.md`'s requirement that moving from local to team deployment "must
   not require changing domain models or abandoning stored work."
 
+## Remote configuration and secret-key validation (#62)
+
+`backend/src/agentic_os/config.py` extends the local preflight (`agentic-os
+config check`) with team-mode checks so an unsafe team VM deployment fails
+closed before startup or upgrade, matching the local deployment's existing
+fail-closed pattern:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGENTIC_OS_DEPLOYMENT_MODE` | `local` | `local` or `team`; `team` enables the checks below and forces the master key to be required (no ephemeral in-process fallback) |
+| `AGENTIC_OS_PUBLIC_ORIGIN` | unset | The proxy's TLS-terminated public origin (for example `https://team.example.com`); required and must be `https://` with a hostname in `team` mode |
+| `AGENTIC_OS_BACKUP_ROOT` | unset | Optional durable local/mounted directory operators point `operations backup --output` at; validated for writability and rejected if it looks like a remote/object-storage URI |
+
+Additional fail-closed behavior added for team mode:
+
+- `AGENTIC_OS_MASTER_KEY_FILE` and `AGENTIC_OS_ARTIFACT_ROOT` are rejected
+  outright if they contain a `scheme://` marker (for example `s3://...`),
+  since the master key must live on a POSIX-permissioned durable volume and
+  artifact object-storage backends are not implemented yet — this matches the
+  "configuration volume can never be object storage" rule above.
+- `agentic-os config check` in `team` mode also validates PostgreSQL
+  client-tool availability (`pg_dump`, `pg_restore`, `pg_isready`) as part of
+  preflight, not only during `operations setup-check`.
+- `agentic-os config check --json` prints the same evidence as structured
+  JSON (`[{"name", "ok", "detail"}, ...]`) for operations commands and the
+  future admin frontend view (#65) to consume; it never includes raw key or
+  credential material, matching the existing text report's redaction
+  guarantee.
+
+Existing local deployment defaults are unaffected: `AGENTIC_OS_DEPLOYMENT_MODE`
+unset (or `local`) skips every team-only check and preserves prior `config
+check` behavior exactly.
+
 ## What subsequent issues build on this
 
 - **#62** validates remote configuration, TLS/proxy settings, and secret-key
