@@ -11,6 +11,10 @@ from sqlalchemy.orm import Session
 
 from agentic_os.api.authorization import current_actor, require_resource_access
 from agentic_os.api.deps import get_session
+from agentic_os.domain.plan_execution import (
+    create_plan_execution,
+    get_plan_execution_record,
+)
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
@@ -164,10 +168,43 @@ class GoalPlanningSessionRead(BaseModel):
     overrides: list[PlanningOverrideRead]
 
 
+class PlanExecutionProgressRead(BaseModel):
+    total: int
+    pending: int
+    running: int
+    completed: int
+    failed: int
+    cancelled: int
+
+
+class PlanTaskContextPackageRead(BaseModel):
+    id: uuid.UUID
+    planning_assignment_id: uuid.UUID
+    task_id: uuid.UUID
+    run_id: uuid.UUID | None
+    agent_id: uuid.UUID
+    agent_version_id: uuid.UUID
+    context: dict[str, Any]
+
+
+class PlanExecutionRead(BaseModel):
+    id: uuid.UUID
+    planning_session_id: uuid.UUID
+    goal_id: uuid.UUID
+    graph_revision_id: uuid.UUID
+    created_by: uuid.UUID | None
+    status: str
+    progress: PlanExecutionProgressRead
+    started_at: datetime | None
+    completed_at: datetime | None
+    task_context_packages: list[PlanTaskContextPackageRead]
+
+
 class GoalPlanningAcceptRead(GoalPlanningSessionRead):
     materialized_tasks: list[dict[str, str]] = Field(default_factory=list)
     graph_revision_id: uuid.UUID | None = None
     graph_revision_number: int | None = None
+    plan_execution: PlanExecutionRead | None = None
 
 
 def _load_goal(session: Session, goal_id: uuid.UUID) -> Goal:
@@ -737,6 +774,7 @@ def accept_goal_plan(
         record["graph_revision_number"] = (
             existing_revision.revision_number if existing_revision else None
         )
+        record["plan_execution"] = get_plan_execution_record(session, planning.id)
         return record
     if planning.status in TERMINAL_PLANNING_STATUSES:
         raise HTTPException(
@@ -823,9 +861,42 @@ def accept_goal_plan(
         actor_id=actor.id,
         materialized_task_ids=[uuid.UUID(item["task_id"]) for item in materialized],
     )
+    create_plan_execution(
+        session,
+        planning_session_id=planning.id,
+        graph_revision_id=revision.id,
+        actor_id=actor.id,
+        task_ids=[uuid.UUID(item["task_id"]) for item in materialized],
+    )
     record = get_planning_record(session, planning.id)
     assert record is not None
     record["materialized_tasks"] = materialized
     record["graph_revision_id"] = revision.id
     record["graph_revision_number"] = revision.revision_number
+    record["plan_execution"] = get_plan_execution_record(session, planning.id)
+    return record
+
+
+@router.get(
+    "/goals/{goal_id}/planning-sessions/{planning_session_id}/execution",
+    response_model=PlanExecutionRead,
+)
+def read_goal_plan_execution(
+    goal_id: uuid.UUID,
+    planning_session_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    actor: User = Depends(current_actor),
+) -> dict[str, Any]:
+    goal = _load_goal(session, goal_id)
+    require_resource_access(
+        session,
+        actor,
+        goal,
+        action="goal.planning.execution.read",
+        resource_type="goal",
+    )
+    planning = _load_planning_session(session, goal_id, planning_session_id)
+    record = get_plan_execution_record(session, planning.id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="plan execution not found")
     return record

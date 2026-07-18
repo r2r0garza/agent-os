@@ -6,11 +6,12 @@ import sys
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
@@ -19,6 +20,9 @@ from agentic_os.domain.models import (
     AgentVersionMcpServer,
     AgentVersionSkill,
     Budget,
+    AuditEvent,
+    GoalPlanExecution,
+    GoalPlanningSession,
     McpServer,
     McpServerHealthCheck,
     McpServerTool,
@@ -26,6 +30,7 @@ from agentic_os.domain.models import (
     ModelProfile,
     ModelProfileVersion,
     Policy,
+    PlanTaskContextPackage,
     Skill,
     SkillVersion,
     Task,
@@ -104,7 +109,10 @@ class GoalPlanningApiTests(unittest.TestCase):
             self.eligible_version = AgentVersion(
                 agent_id=self.eligible_agent.id,
                 version_number=1,
-                capability_manifest={"capabilities": ["research"]},
+                capability_manifest={
+                    "capabilities": ["research"],
+                    "secret_token": "must-not-persist",
+                },
             )
             self.ineligible_version = AgentVersion(
                 agent_id=self.ineligible_agent.id,
@@ -347,6 +355,31 @@ class GoalPlanningApiTests(unittest.TestCase):
 
         self.assertIsNotNone(accepted_body["graph_revision_id"])
         self.assertEqual(accepted_body["graph_revision_number"], 1)
+        execution_body = accepted_body["plan_execution"]
+        self.assertEqual(execution_body["planning_session_id"], preview["id"])
+        self.assertEqual(execution_body["status"], "pending")
+        self.assertEqual(
+            execution_body["progress"],
+            {
+                "total": 1,
+                "pending": 1,
+                "running": 0,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+            },
+        )
+        self.assertEqual(len(execution_body["task_context_packages"]), 1)
+        package_body = execution_body["task_context_packages"][0]
+        self.assertEqual(package_body["task_id"], str(self.task.id))
+        self.assertEqual(
+            package_body["agent_version_id"], str(self.eligible_version.id)
+        )
+        self.assertEqual(
+            package_body["context"]["agent_context"]["agent_manifest"]["secret_token"],
+            "[REDACTED]",
+        )
+        self.assertNotIn("must-not-persist", str(execution_body))
 
         with SessionLocal() as session:
             task = session.get(Task, self.task.id)
@@ -379,6 +412,25 @@ class GoalPlanningApiTests(unittest.TestCase):
                 revision.assignment_evidence[str(self.task.id)]["planning_session_id"],
                 preview["id"],
             )
+            execution = session.execute(
+                select(GoalPlanExecution).where(
+                    GoalPlanExecution.planning_session_id == uuid.UUID(preview["id"])
+                )
+            ).scalar_one()
+            package = session.execute(
+                select(PlanTaskContextPackage).where(
+                    PlanTaskContextPackage.plan_execution_id == execution.id
+                )
+            ).scalar_one()
+            self.assertEqual(package.task_id, self.task.id)
+            self.assertEqual(package.planning_assignment_id, task.planning_assignment_id)
+            audit = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.event_type == "goal.plan_execution_created",
+                    AuditEvent.goal_id == self.goal.id,
+                )
+            ).scalar_one()
+            self.assertEqual(audit.payload["actor_id"], str(self.owner.id))
 
         second_accept = client.post(
             f"/api/v1/goals/{self.goal.id}/planning-sessions/{preview['id']}/accept",
@@ -390,6 +442,95 @@ class GoalPlanningApiTests(unittest.TestCase):
         self.assertEqual(
             second_accept.json()["graph_revision_id"], accepted_body["graph_revision_id"]
         )
+        self.assertEqual(
+            second_accept.json()["plan_execution"]["id"], execution_body["id"]
+        )
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.execute(
+                    select(func.count()).select_from(GoalPlanExecution).where(
+                        GoalPlanExecution.planning_session_id
+                        == uuid.UUID(preview["id"])
+                    )
+                ).scalar_one(),
+                1,
+            )
+
+    def test_execution_read_recomputes_progress_and_enforces_access(self) -> None:
+        preview = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json=self._preview_payload(
+                assignment_agent_version_id=self.eligible_version.id
+            ),
+            headers=self._headers(self.owner),
+        ).json()
+        client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions/{preview['id']}/accept",
+            headers=self._headers(self.owner),
+        )
+        with SessionLocal.begin() as session:
+            task = session.get(Task, self.task.id)
+            task.status = "completed"
+
+        response = client.get(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions/{preview['id']}/execution",
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertEqual(response.json()["progress"]["completed"], 1)
+
+        outsider = client.get(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions/{preview['id']}/execution",
+            headers=self._headers(self.outsider),
+        )
+        self.assertEqual(outsider.status_code, 404)
+
+    def test_acceptance_rolls_back_lifecycle_and_task_changes_on_failure(self) -> None:
+        preview = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json=self._preview_payload(
+                assignment_agent_version_id=self.eligible_version.id
+            ),
+            headers=self._headers(self.owner),
+        ).json()
+
+        with patch(
+            "agentic_os.api.routers.goal_planning.create_plan_execution",
+            side_effect=RuntimeError("simulated lifecycle persistence failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated lifecycle persistence failure"
+            ):
+                client.post(
+                    f"/api/v1/goals/{self.goal.id}/planning-sessions/{preview['id']}/accept",
+                    headers=self._headers(self.owner),
+                )
+
+        with SessionLocal() as session:
+            planning = session.get(
+                GoalPlanningSession, uuid.UUID(preview["id"])
+            )
+            task = session.get(Task, self.task.id)
+            self.assertEqual(planning.status, "previewed")
+            self.assertEqual(task.assignment_status, "unassigned")
+            self.assertIsNone(task.planning_session_id)
+            self.assertIsNone(
+                session.execute(
+                    select(TaskGraphRevision).where(
+                        TaskGraphRevision.planning_session_id
+                        == uuid.UUID(preview["id"])
+                    )
+                ).scalar_one_or_none()
+            )
+            self.assertIsNone(
+                session.execute(
+                    select(GoalPlanExecution).where(
+                        GoalPlanExecution.planning_session_id
+                        == uuid.UUID(preview["id"])
+                    )
+                ).scalar_one_or_none()
+            )
 
     def test_accept_rejects_unresolved_assignment(self) -> None:
         payload = self._preview_payload()
@@ -408,6 +549,13 @@ class GoalPlanningApiTests(unittest.TestCase):
             headers=self._headers(self.owner),
         )
         self.assertEqual(response.status_code, 422)
+        with SessionLocal() as session:
+            count = session.execute(
+                select(func.count()).select_from(GoalPlanExecution).where(
+                    GoalPlanExecution.planning_session_id == uuid.UUID(preview["id"])
+                )
+            ).scalar_one()
+            self.assertEqual(count, 0)
 
     def test_preview_uses_enabled_skill_capabilities(self) -> None:
         with SessionLocal.begin() as session:

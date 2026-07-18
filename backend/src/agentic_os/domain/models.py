@@ -385,6 +385,109 @@ class PlanningOverride(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     )
 
 
+class GoalPlanExecution(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "goal_plan_executions"
+    __table_args__ = (
+        UniqueConstraint(
+            "planning_session_id",
+            name="uq_goal_plan_executions_planning_session",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed', 'cancelled')",
+            name="goal_plan_execution_status_valid",
+        ),
+        CheckConstraint(
+            "total_tasks >= 0 AND pending_tasks >= 0 AND running_tasks >= 0 "
+            "AND completed_tasks >= 0 AND failed_tasks >= 0 AND cancelled_tasks >= 0",
+            name="goal_plan_execution_counts_non_negative",
+        ),
+        CheckConstraint(
+            "pending_tasks + running_tasks + completed_tasks + failed_tasks "
+            "+ cancelled_tasks = total_tasks",
+            name="goal_plan_execution_counts_total",
+        ),
+        Index(
+            "ix_goal_plan_executions_goal_status",
+            "goal_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    planning_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    goal_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("goals.id", ondelete="CASCADE"), nullable=False
+    )
+    graph_revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("task_graph_revisions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    total_tasks: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    pending_tasks: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    running_tasks: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    completed_tasks: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    failed_tasks: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cancelled_tasks: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PlanTaskContextPackage(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    __tablename__ = "plan_task_context_packages"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_execution_id",
+            "task_id",
+            name="uq_plan_task_context_packages_execution_task",
+        ),
+        Index(
+            "ix_plan_task_context_packages_planning_session",
+            "planning_session_id",
+            "created_at",
+        ),
+    )
+
+    plan_execution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_plan_executions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    planning_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    planning_assignment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("planning_assignments.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="RESTRICT"), nullable=False
+    )
+    agent_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    context: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+
 class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "tasks"
 
