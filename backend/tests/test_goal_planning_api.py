@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 
 from agentic_os.domain import create_database_engine, database_url, session_factory
 from agentic_os.domain.models import (
@@ -29,6 +29,8 @@ from agentic_os.domain.models import (
     Skill,
     SkillVersion,
     Task,
+    TaskGraphRevision,
+    TaskGraphRevisionTask,
 )
 from factories import (
     make_goal,
@@ -343,10 +345,40 @@ class GoalPlanningApiTests(unittest.TestCase):
         self.assertEqual(len(accepted_body["materialized_tasks"]), 1)
         self.assertEqual(accepted_body["materialized_tasks"][0]["task_id"], str(self.task.id))
 
+        self.assertIsNotNone(accepted_body["graph_revision_id"])
+        self.assertEqual(accepted_body["graph_revision_number"], 1)
+
         with SessionLocal() as session:
             task = session.get(Task, self.task.id)
             self.assertEqual(task.assigned_agent_version_id, self.eligible_version.id)
             self.assertEqual(task.assignment_status, "assigned")
+            self.assertEqual(str(task.planning_session_id), preview["id"])
+            self.assertIsNotNone(task.planning_assignment_id)
+
+            revision = session.execute(
+                select(TaskGraphRevision).where(
+                    TaskGraphRevision.planning_session_id == uuid.UUID(preview["id"])
+                )
+            ).scalar_one()
+            self.assertEqual(str(revision.id), accepted_body["graph_revision_id"])
+            self.assertEqual(revision.goal_id, self.goal.id)
+            task_snapshot_ids = {
+                str(item.task_id)
+                for item in session.execute(
+                    select(TaskGraphRevisionTask).where(
+                        TaskGraphRevisionTask.revision_id == revision.id
+                    )
+                ).scalars()
+            }
+            self.assertIn(str(self.task.id), task_snapshot_ids)
+            self.assertEqual(
+                revision.assignment_evidence[str(self.task.id)]["assigned_agent_version_id"],
+                str(self.eligible_version.id),
+            )
+            self.assertEqual(
+                revision.assignment_evidence[str(self.task.id)]["planning_session_id"],
+                preview["id"],
+            )
 
         second_accept = client.post(
             f"/api/v1/goals/{self.goal.id}/planning-sessions/{preview['id']}/accept",
@@ -355,6 +387,9 @@ class GoalPlanningApiTests(unittest.TestCase):
         self.assertEqual(second_accept.status_code, 200)
         self.assertEqual(second_accept.json()["status"], "accepted")
         self.assertEqual(second_accept.json()["materialized_tasks"], [])
+        self.assertEqual(
+            second_accept.json()["graph_revision_id"], accepted_body["graph_revision_id"]
+        )
 
     def test_accept_rejects_unresolved_assignment(self) -> None:
         payload = self._preview_payload()

@@ -42,10 +42,13 @@ from agentic_os.domain.models import (
     CostLedgerEntry,
     Credential,
     Goal,
+    GoalPlanningSession,
     McpServer,
     McpServerAttachment,
     McpServerVersion,
     ObservabilityRecord,
+    PlanningAssignment,
+    PlanningCandidate,
     Policy,
     Project,
     Run,
@@ -964,6 +967,157 @@ class WorkerTestCase(unittest.TestCase):
                 session.execute(select(AuditEvent).where(AuditEvent.task_id == task_id)).scalars()
             )
             self.assertNotIn("tool.invoked", {event.event_type for event in events})
+
+    def _attach_planning_assignment(self, session, task: Task) -> PlanningAssignment:
+        """Simulate a materialized accepted plan pinning ``task`` to its agent version."""
+        goal = session.get(Goal, task.goal_id)
+        agent_version = session.get(AgentVersion, task.assigned_agent_version_id)
+        agent = session.get(Agent, agent_version.agent_id)
+        planning = GoalPlanningSession(
+            goal_id=goal.id,
+            created_by=goal.created_by,
+            revision_number=1,
+            status="accepted",
+            validation_status="valid",
+            accepted_at=datetime.now(timezone.utc),
+        )
+        session.add(planning)
+        session.flush()
+        candidate = PlanningCandidate(
+            planning_session_id=planning.id,
+            agent_id=agent.id,
+            agent_version_id=agent_version.id,
+            eligible=True,
+            matched_capabilities=[],
+            missing_capabilities=[],
+            rejection_reasons=[],
+        )
+        session.add(candidate)
+        session.flush()
+        assignment = PlanningAssignment(
+            planning_session_id=planning.id,
+            assignment_key=str(task.id),
+            candidate_id=candidate.id,
+            validation_status="valid",
+        )
+        session.add(assignment)
+        session.flush()
+        task.planning_session_id = planning.id
+        task.planning_assignment_id = assignment.id
+        session.add(task)
+        session.flush()
+        return assignment
+
+    def test_run_snapshot_preserves_planning_identifiers(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            assignment = self._attach_planning_assignment(session, task)
+            session.commit()
+            task_id = task.id
+            planning_session_id = assignment.planning_session_id
+            planning_assignment_id = assignment.id
+
+        with self.Session() as session:
+            run_task_worker_once(session, "worker-planning-evidence")
+            session.commit()
+
+        with self.Session() as session:
+            run = session.execute(
+                select(Run).where(Run.task_id == task_id).order_by(Run.attempt_number.desc())
+            ).scalars().first()
+            self.assertEqual(run.status, "completed")
+            self.assertEqual(run.snapshot["planning_session_id"], str(planning_session_id))
+            self.assertEqual(run.snapshot["planning_assignment_id"], str(planning_assignment_id))
+            started_event = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.task_id == task_id, AuditEvent.event_type == "run.started"
+                )
+            ).scalar_one()
+            self.assertEqual(started_event.payload["planning_session_id"], str(planning_session_id))
+
+    def test_planning_assignment_drift_fails_closed_before_execution(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            assignment = self._attach_planning_assignment(session, task)
+            # Simulate an operator override recorded against the planning
+            # session after acceptance: the live assignment now points at a
+            # different agent version than the one this task was
+            # materialized and pinned to.
+            goal = session.get(Goal, task.goal_id)
+            project = session.get(Project, goal.project_id)
+            other_agent = Agent(
+                team_id=project.team_id,
+                created_by=goal.created_by,
+                name="Drifted Agent",
+            )
+            session.add(other_agent)
+            session.flush()
+            other_version = AgentVersion(
+                agent_id=other_agent.id, version_number=1, capability_manifest={}
+            )
+            session.add(other_version)
+            session.flush()
+            other_candidate = PlanningCandidate(
+                planning_session_id=assignment.planning_session_id,
+                agent_id=other_agent.id,
+                agent_version_id=other_version.id,
+                eligible=True,
+            )
+            session.add(other_candidate)
+            session.flush()
+            assignment = session.get(PlanningAssignment, assignment.id)
+            assignment.candidate_id = other_candidate.id
+            session.commit()
+            task_id = task.id
+
+        with self.Session() as session, mock.patch(
+            "agentic_os.worker.runner.invoke_tool"
+        ) as invoke_tool:
+            with self.assertRaisesRegex(TaskExecutionError, "no longer selects"):
+                run_task_worker_once(session, "worker-planning-drift")
+            session.commit()
+            invoke_tool.assert_not_called()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+            failed_event = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.task_id == task_id, AuditEvent.event_type == "task.failed"
+                )
+            ).scalar_one()
+            self.assertEqual(
+                failed_event.payload["reason_code"], "planning_assignment_drifted"
+            )
+
+    def test_planning_assignment_invalidated_fails_closed_before_execution(self) -> None:
+        with self.Session() as session:
+            task = self._build_ready_task(session)
+            assignment = self._attach_planning_assignment(session, task)
+            assignment = session.get(PlanningAssignment, assignment.id)
+            assignment.validation_status = "invalid"
+            session.commit()
+            task_id = task.id
+
+        with self.Session() as session, mock.patch(
+            "agentic_os.worker.runner.invoke_tool"
+        ) as invoke_tool:
+            with self.assertRaisesRegex(TaskExecutionError, "no longer valid"):
+                run_task_worker_once(session, "worker-planning-invalidated")
+            session.commit()
+            invoke_tool.assert_not_called()
+
+        with self.Session() as session:
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "failed")
+            failed_event = session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.task_id == task_id, AuditEvent.event_type == "task.failed"
+                )
+            ).scalar_one()
+            self.assertEqual(
+                failed_event.payload["reason_code"], "planning_assignment_invalidated"
+            )
 
     def test_policy_approval_required_blocks_task_in_safe_state(self) -> None:
         with self.Session() as session:

@@ -30,6 +30,10 @@ from agentic_os.domain.models import (
     PolicySetVersion,
     Project,
     SkillVersion,
+    Task,
+    TaskDependency,
+    TaskGraphRevision,
+    TaskGraphRevisionTask,
     User,
 )
 from agentic_os.redaction import redact_mapping
@@ -397,6 +401,158 @@ def get_planning_record(
             ],
         }
     )
+
+
+def materialize_planning_graph_revision(
+    session: Session,
+    *,
+    planning_session_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    materialized_task_ids: Iterable[uuid.UUID],
+) -> TaskGraphRevision:
+    """Snapshot the goal's task DAG as an inspectable, plan-linked revision.
+
+    Called once, immediately after a planning session transitions to
+    ``accepted``. The resulting ``TaskGraphRevision`` durably records the
+    dependency structure and the capability/assignment rationale the
+    operator reviewed, independent of any later mutation to the live task
+    rows (e.g. a post-acceptance override), so the accepted decision remains
+    inspectable even if execution later fails closed on drift.
+    """
+    planning = session.get(GoalPlanningSession, planning_session_id)
+    if planning is None:
+        raise ValueError(f"planning session {planning_session_id} does not exist")
+    goal, _project = _goal_project(session, planning.goal_id)
+
+    tasks = list(
+        session.execute(
+            select(Task).where(Task.goal_id == goal.id).order_by(Task.created_at, Task.id)
+        ).scalars()
+    )
+    task_ids = [task.id for task in tasks]
+    dependencies = (
+        list(
+            session.execute(
+                select(TaskDependency).where(TaskDependency.task_id.in_(task_ids))
+            ).scalars()
+        )
+        if task_ids
+        else []
+    )
+    materialized_ids = {uuid.UUID(str(item)) for item in materialized_task_ids}
+
+    graph_snapshot = {
+        "tasks": [_planning_task_snapshot(task, materialized_ids) for task in tasks],
+        "dependencies": [
+            {
+                "task_id": str(dependency.task_id),
+                "depends_on_task_id": str(dependency.depends_on_task_id),
+            }
+            for dependency in dependencies
+        ],
+    }
+    assignment_evidence = {
+        str(task.id): {
+            "assigned_agent_version_id": (
+                str(task.assigned_agent_version_id) if task.assigned_agent_version_id else None
+            ),
+            "assignment_status": task.assignment_status,
+            "assignment_candidates": task.assignment_candidates,
+            "assignment_rationale": task.assignment_rationale,
+            "required_capabilities": task.required_capabilities,
+            "capability_rationale": task.capability_rationale,
+            "planning_session_id": (
+                str(task.planning_session_id) if task.planning_session_id else None
+            ),
+            "planning_assignment_id": (
+                str(task.planning_assignment_id) if task.planning_assignment_id else None
+            ),
+            "materialized_by_this_revision": task.id in materialized_ids,
+        }
+        for task in tasks
+    }
+    policy_context = {
+        str(task.id): {"policy_ids": task.policy_ids} for task in tasks
+    }
+    budget_context = {
+        str(task.id): {"budget_id": str(task.budget_id) if task.budget_id else None}
+        for task in tasks
+    }
+
+    revision = TaskGraphRevision(
+        goal_id=goal.id,
+        created_by=actor_id,
+        planning_session_id=planning.id,
+        revision_number=goal.active_graph_revision_number + 1,
+        parent_revision_number=goal.active_graph_revision_number,
+        change_summary=(
+            f"Materialized goal planning session {planning.id} "
+            f"(revision {planning.revision_number}) into the task graph"
+        ),
+        graph_snapshot=graph_snapshot,
+        assignment_evidence=assignment_evidence,
+        policy_context=policy_context,
+        budget_context=budget_context,
+    )
+    session.add(revision)
+    session.flush()
+
+    for task in tasks:
+        session.add(
+            TaskGraphRevisionTask(
+                revision_id=revision.id,
+                task_id=task.id,
+                change_type="unchanged",
+                supersedes_task_id=None,
+                task_snapshot=_planning_task_snapshot(task, materialized_ids),
+            )
+        )
+    goal.active_graph_revision_number = revision.revision_number
+    session.add(
+        AuditEvent(
+            project_id=goal.project_id,
+            goal_id=goal.id,
+            event_type="goal.planning_materialized_task_graph",
+            payload={
+                "planning_session_id": str(planning.id),
+                "graph_revision_id": str(revision.id),
+                "graph_revision_number": revision.revision_number,
+                "materialized_task_ids": [str(task_id) for task_id in materialized_ids],
+                "task_count": len(tasks),
+            },
+        )
+    )
+    session.flush()
+    return revision
+
+
+def _planning_task_snapshot(task: Task, materialized_ids: set[uuid.UUID]) -> dict[str, Any]:
+    return {
+        "id": str(task.id),
+        "title": task.title,
+        "description": task.description,
+        "status": task.status,
+        "required_capabilities": task.required_capabilities,
+        "capability_rationale": task.capability_rationale,
+        "expected_outputs": task.expected_outputs,
+        "resource_intent": task.resource_intent,
+        "policy_ids": task.policy_ids,
+        "knowledge_artifact_ids": task.knowledge_artifact_ids,
+        "budget_id": str(task.budget_id) if task.budget_id else None,
+        "assigned_agent_version_id": (
+            str(task.assigned_agent_version_id) if task.assigned_agent_version_id else None
+        ),
+        "assignment_status": task.assignment_status,
+        "assignment_candidates": task.assignment_candidates,
+        "assignment_rationale": task.assignment_rationale,
+        "planning_session_id": (
+            str(task.planning_session_id) if task.planning_session_id else None
+        ),
+        "planning_assignment_id": (
+            str(task.planning_assignment_id) if task.planning_assignment_id else None
+        ),
+        "materialized_by_this_revision": task.id in materialized_ids,
+    }
 
 
 def _candidate_constraints(

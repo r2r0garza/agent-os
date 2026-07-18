@@ -416,6 +416,16 @@ class Task(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_token: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    planning_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    planning_assignment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("planning_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
 
 class WorkspaceResource(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -607,6 +617,9 @@ class TaskGraphRevision(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
         UniqueConstraint(
             "steering_request_id", name="uq_task_graph_revisions_steering_request"
         ),
+        UniqueConstraint(
+            "planning_session_id", name="uq_task_graph_revisions_planning_session"
+        ),
         CheckConstraint(
             "revision_number > 0", name="task_graph_revision_number_positive"
         ),
@@ -631,6 +644,11 @@ class TaskGraphRevision(Base, UUIDPrimaryKeyMixin, CreatedAtMixin):
     steering_request_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("goal_steering_requests.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    planning_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("goal_planning_sessions.id", ondelete="SET NULL"),
         nullable=True,
     )
     revision_number: Mapped[int] = mapped_column(BigInteger, nullable=False)

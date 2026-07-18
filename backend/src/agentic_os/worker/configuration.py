@@ -23,6 +23,8 @@ from agentic_os.domain.models import (
     McpServerTool,
     McpServerVersion,
     ModelProfileVersion,
+    PlanningAssignment,
+    PlanningCandidate,
     Policy,
     PolicySetVersion,
     Project,
@@ -51,6 +53,18 @@ class McpHealthDegradedError(ConfigurationSnapshotError):
     """Raised when a granted MCP server has no healthy health-check evidence on record."""
 
     reason_code = "mcp_health_degraded"
+
+
+class PlanningAssignmentInvalidError(ConfigurationSnapshotError):
+    """Raised when the task's originating planning assignment is no longer valid."""
+
+    reason_code = "planning_assignment_invalidated"
+
+
+class PlanningAssignmentDriftError(ConfigurationSnapshotError):
+    """Raised when the live planning assignment no longer matches the pinned task."""
+
+    reason_code = "planning_assignment_drifted"
 
 
 @dataclass(frozen=True)
@@ -189,6 +203,41 @@ class ResolvedRunConfiguration:
         )
 
 
+def _validate_planning_assignment(session: Session, task: Task) -> None:
+    """Re-check that an accepted plan's live assignment still matches the task.
+
+    A planning assignment can be overridden after its planning session was
+    accepted (overrides are not blocked by acceptance status). That leaves a
+    window where the task this run is executing was pinned to one agent
+    version while the plan's live assignment record now points elsewhere, or
+    has been invalidated outright. This runs on every attempt, including
+    retries that reuse a cached snapshot, since it validates mutable
+    planning-authority state rather than the immutable snapshot payload.
+    """
+    if task.planning_assignment_id is None:
+        return
+    assignment = session.get(PlanningAssignment, task.planning_assignment_id)
+    if assignment is None:
+        raise PlanningAssignmentInvalidError(
+            f"planning assignment {task.planning_assignment_id} for task {task.id} no longer exists"
+        )
+    if assignment.validation_status != "valid":
+        raise PlanningAssignmentInvalidError(
+            f"planning assignment {assignment.id} for task {task.id} is no longer valid "
+            f"(validation_status={assignment.validation_status!r})"
+        )
+    candidate = (
+        session.get(PlanningCandidate, assignment.candidate_id)
+        if assignment.candidate_id
+        else None
+    )
+    if candidate is None or candidate.agent_version_id != task.assigned_agent_version_id:
+        raise PlanningAssignmentDriftError(
+            f"planning assignment {assignment.id} for task {task.id} no longer selects the "
+            f"agent version this task was materialized with"
+        )
+
+
 def resolve_run_configuration(
     session: Session,
     *,
@@ -202,6 +251,7 @@ def resolve_run_configuration(
     the configuration. Later attempts retain the same snapshot identity in
     ``Run.snapshot`` and execute exclusively from its copied JSON payload.
     """
+    _validate_planning_assignment(session, task)
     previous_snapshot = session.execute(
         select(RunConfigurationSnapshot)
         .join(Run, RunConfigurationSnapshot.run_id == Run.id)
@@ -531,6 +581,19 @@ def resolve_run_configuration(
         "budget": _budget_payload(budget),
         "enabled_tools": list(enabled_tools),
         "assignment_rationale": copy.deepcopy(task.assignment_rationale or {}),
+        "task": {
+            "id": str(task.id),
+            "required_capabilities": copy.deepcopy(task.required_capabilities or {}),
+            "capability_rationale": copy.deepcopy(task.capability_rationale or {}),
+        },
+        "planning": {
+            "planning_session_id": (
+                str(task.planning_session_id) if task.planning_session_id else None
+            ),
+            "planning_assignment_id": (
+                str(task.planning_assignment_id) if task.planning_assignment_id else None
+            ),
+        },
     }
     row = RunConfigurationSnapshot(
         id=snapshot_id,

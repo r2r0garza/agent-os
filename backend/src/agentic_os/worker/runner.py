@@ -134,13 +134,16 @@ def run_task_worker_once(
         # Reconcile a run created earlier in this same failed attempt so it
         # never lingers as "running" once the attempt has already failed.
         _fail_interrupted_previous_attempt(session, task, project_id=project_id)
+        reason_code = getattr(error, "reason_code", None) or getattr(
+            error.__cause__, "reason_code", None
+        )
         session.add(
             AuditEvent(
                 project_id=project_id,
                 goal_id=task.goal_id,
                 task_id=task.id,
                 event_type="task.failed",
-                payload={"error": str(error)},
+                payload={"error": str(error), "reason_code": reason_code},
             )
         )
         release_lease(session, task, worker_id, status="failed")
@@ -288,6 +291,10 @@ def _execute_claimed_task(
         "approval_configuration": resolved.approval_configuration,
         "assignment_rationale": configuration["assignment_rationale"],
         "capability_manifest": capability_manifest,
+        "planning_session_id": configuration["planning"]["planning_session_id"],
+        "planning_assignment_id": configuration["planning"]["planning_assignment_id"],
+        "required_capabilities": configuration["task"]["required_capabilities"],
+        "capability_rationale": configuration["task"]["capability_rationale"],
     }
     run.snapshot = snapshot
     session.flush()
@@ -306,6 +313,8 @@ def _execute_claimed_task(
             "configuration_snapshot_id": str(resolved.snapshot_id),
             "agent_version_id": agent["version_id"],
             "model_profile_version_id": snapshot["model_profile_version_id"],
+            "planning_session_id": snapshot["planning_session_id"],
+            "planning_assignment_id": snapshot["planning_assignment_id"],
         },
     )
     session.add(started_audit)

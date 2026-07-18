@@ -21,11 +21,13 @@ from agentic_os.domain.models import (
     PlanningCapabilityRequirement,
     Project,
     Task,
+    TaskGraphRevision,
     User,
 )
 from agentic_os.domain.planning import (
     create_planning_session,
     get_planning_record,
+    materialize_planning_graph_revision,
     record_planning_override,
     update_planning_session,
 )
@@ -164,6 +166,8 @@ class GoalPlanningSessionRead(BaseModel):
 
 class GoalPlanningAcceptRead(GoalPlanningSessionRead):
     materialized_tasks: list[dict[str, str]] = Field(default_factory=list)
+    graph_revision_id: uuid.UUID | None = None
+    graph_revision_number: int | None = None
 
 
 def _load_goal(session: Session, goal_id: uuid.UUID) -> Goal:
@@ -724,6 +728,15 @@ def accept_goal_plan(
         record = get_planning_record(session, planning.id)
         assert record is not None
         record["materialized_tasks"] = []
+        existing_revision = session.execute(
+            select(TaskGraphRevision).where(
+                TaskGraphRevision.planning_session_id == planning.id
+            )
+        ).scalar_one_or_none()
+        record["graph_revision_id"] = existing_revision.id if existing_revision else None
+        record["graph_revision_number"] = (
+            existing_revision.revision_number if existing_revision else None
+        )
         return record
     if planning.status in TERMINAL_PLANNING_STATUSES:
         raise HTTPException(
@@ -792,6 +805,8 @@ def accept_goal_plan(
             "rationale": assignment.rationale,
         }
         task.assignment_updated_at = now
+        task.planning_session_id = planning.id
+        task.planning_assignment_id = assignment.id
         materialized.append({"task_id": str(task.id), "assignment_key": assignment.assignment_key})
 
     update_planning_session(
@@ -802,7 +817,15 @@ def accept_goal_plan(
         validation_status="valid",
     )
     session.flush()
+    revision = materialize_planning_graph_revision(
+        session,
+        planning_session_id=planning.id,
+        actor_id=actor.id,
+        materialized_task_ids=[uuid.UUID(item["task_id"]) for item in materialized],
+    )
     record = get_planning_record(session, planning.id)
     assert record is not None
     record["materialized_tasks"] = materialized
+    record["graph_revision_id"] = revision.id
+    record["graph_revision_number"] = revision.revision_number
     return record
