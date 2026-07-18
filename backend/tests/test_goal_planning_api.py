@@ -16,7 +16,18 @@ from agentic_os.domain import create_database_engine, database_url, session_fact
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
+    AgentVersionMcpServer,
+    AgentVersionSkill,
     Budget,
+    McpServer,
+    McpServerHealthCheck,
+    McpServerTool,
+    McpServerVersion,
+    ModelProfile,
+    ModelProfileVersion,
+    Policy,
+    Skill,
+    SkillVersion,
     Task,
 )
 from factories import (
@@ -175,6 +186,68 @@ class GoalPlanningApiTests(unittest.TestCase):
         self.assertEqual(fetched.status_code, 200)
         self.assertEqual(fetched.json(), body)
 
+    def test_preview_derives_requirements_discovers_candidates_and_assigns(self) -> None:
+        response = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json={},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(body["validation_status"], "valid")
+        self.assertEqual(
+            [item["capability_key"] for item in body["requirements"]],
+            ["research"],
+        )
+        self.assertEqual(len(body["assignments"]), 1)
+        self.assertEqual(body["assignments"][0]["assignment_key"], str(self.task.id))
+        selected = next(item for item in body["candidates"] if item["eligible"])
+        selected_rank = selected["evidence"]["selection_rank"]
+        self.assertEqual(selected_rank, 1)
+        self.assertEqual(
+            body["assignments"][0]["candidate_id"],
+            selected["id"],
+        )
+
+    def test_preview_forms_team_across_task_specific_capabilities(self) -> None:
+        with SessionLocal.begin() as session:
+            writing_task = Task(
+                goal_id=self.goal.id,
+                created_by=self.owner.id,
+                title="Write the findings",
+                required_capabilities={"writing": True},
+            )
+            session.add(writing_task)
+            session.flush()
+            writing_task_id = writing_task.id
+
+        response = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json={},
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        body = response.json()
+        self.assertEqual(
+            {item["capability_key"] for item in body["requirements"]},
+            {"research", "writing"},
+        )
+        candidates = {
+            item["id"]: item["agent_version_id"] for item in body["candidates"]
+        }
+        assignments = {
+            item["assignment_key"]: candidates[item["candidate_id"]]
+            for item in body["assignments"]
+        }
+        self.assertEqual(
+            assignments[str(self.task.id)],
+            str(self.eligible_version.id),
+        )
+        self.assertEqual(
+            assignments[str(writing_task_id)],
+            str(self.ineligible_version.id),
+        )
+
     def test_preview_rejects_assignment_to_ineligible_candidate(self) -> None:
         response = client.post(
             f"/api/v1/goals/{self.goal.id}/planning-sessions",
@@ -284,17 +357,208 @@ class GoalPlanningApiTests(unittest.TestCase):
         self.assertEqual(second_accept.json()["materialized_tasks"], [])
 
     def test_accept_rejects_unresolved_assignment(self) -> None:
+        payload = self._preview_payload()
+        payload["constraints"] = {
+            "required_model_capabilities": ["tool_calling"],
+        }
         preview = client.post(
             f"/api/v1/goals/{self.goal.id}/planning-sessions",
-            json=self._preview_payload(),
+            json=payload,
             headers=self._headers(self.owner),
         ).json()
+        self.assertEqual(preview["validation_status"], "pending")
 
         response = client.post(
             f"/api/v1/goals/{self.goal.id}/planning-sessions/{preview['id']}/accept",
             headers=self._headers(self.owner),
         )
         self.assertEqual(response.status_code, 422)
+
+    def test_preview_uses_enabled_skill_capabilities(self) -> None:
+        with SessionLocal.begin() as session:
+            skill = Skill(
+                team_id=self.team.id,
+                created_by=self.owner.id,
+                name=f"Research skill {uuid.uuid4()}",
+            )
+            session.add(skill)
+            session.flush()
+            skill_version = SkillVersion(
+                skill_id=skill.id,
+                version_number=1,
+                content_ref="skills/research/v1",
+                declared_capabilities=["research"],
+            )
+            session.add(skill_version)
+            session.flush()
+            session.add(
+                AgentVersionSkill(
+                    agent_version_id=self.ineligible_version.id,
+                    skill_version_id=skill_version.id,
+                    attachment_config={"enabled": True},
+                    granted_by=self.owner.id,
+                )
+            )
+
+        response = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json=self._preview_payload(),
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        by_version = {
+            item["agent_version_id"]: item for item in response.json()["candidates"]
+        }
+        skill_candidate = by_version[str(self.ineligible_version.id)]
+        self.assertTrue(skill_candidate["eligible"])
+        self.assertIn("research", skill_candidate["matched_capabilities"])
+        self.assertEqual(
+            skill_candidate["evidence"]["skill_grants"][0][
+                "declared_capabilities"
+            ],
+            ["research"],
+        )
+
+    def test_preview_requires_healthy_enabled_mcp_and_compatible_model(self) -> None:
+        with SessionLocal.begin() as session:
+            model = ModelProfile(
+                team_id=self.team.id,
+                created_by=self.owner.id,
+                name=f"Planning model {uuid.uuid4()}",
+                base_url="https://models.example.test/v1",
+                model_identifier="planner",
+                api_key_ciphertext="encrypted",
+            )
+            session.add(model)
+            session.flush()
+            model_version = ModelProfileVersion(
+                model_profile_id=model.id,
+                version_number=1,
+                base_url=model.base_url,
+                model_identifier=model.model_identifier,
+                capability_metadata={"tool_calling": True},
+            )
+            session.add(model_version)
+            mcp = McpServer(
+                project_id=self.project.id,
+                created_by=self.owner.id,
+                name=f"Search MCP {uuid.uuid4()}",
+            )
+            session.add(mcp)
+            session.flush()
+            mcp_version = McpServerVersion(
+                mcp_server_id=mcp.id,
+                version_number=1,
+                connection_config={},
+            )
+            session.add(mcp_version)
+            session.flush()
+            session.add_all(
+                [
+                    AgentVersionMcpServer(
+                        agent_version_id=self.eligible_version.id,
+                        mcp_server_version_id=mcp_version.id,
+                        attachment_config={"enabled": True},
+                        granted_by=self.owner.id,
+                    ),
+                    McpServerTool(
+                        mcp_server_version_id=mcp_version.id,
+                        tool_name="search",
+                        schema_valid=True,
+                        descriptor_hash="search-v1",
+                        enabled=True,
+                    ),
+                    McpServerHealthCheck(
+                        mcp_server_version_id=mcp_version.id,
+                        status="degraded",
+                        triggered_by=self.owner.id,
+                    ),
+                ]
+            )
+            version = session.get(AgentVersion, self.eligible_version.id)
+            version.model_profile_version_id = model_version.id
+            session.flush()
+            mcp_version_id = mcp_version.id
+
+        payload = self._preview_payload()
+        payload["constraints"] = {
+            "required_tools": ["search"],
+            "required_model_capabilities": ["tool_calling"],
+        }
+        degraded = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json=payload,
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(degraded.status_code, 201, degraded.text)
+        by_version = {
+            item["agent_version_id"]: item
+            for item in degraded.json()["candidates"]
+        }
+        self.assertIn(
+            "mcp_health_degraded:search",
+            by_version[str(self.eligible_version.id)]["rejection_reasons"],
+        )
+
+        with SessionLocal.begin() as session:
+            session.add(
+                McpServerHealthCheck(
+                    mcp_server_version_id=mcp_version_id,
+                    status="healthy",
+                    triggered_by=self.owner.id,
+                )
+            )
+        healthy = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json=payload,
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(healthy.status_code, 201, healthy.text)
+        by_version = {
+            item["agent_version_id"]: item for item in healthy.json()["candidates"]
+        }
+        self.assertTrue(by_version[str(self.eligible_version.id)]["eligible"])
+
+    def test_preview_rejects_policy_denial_and_exhausted_default_budget(self) -> None:
+        with SessionLocal.begin() as session:
+            budget = Budget(
+                agent_id=self.eligible_agent.id,
+                currency="USD",
+                amount_minor_units=0,
+                enforcement_mode="hard_stop",
+            )
+            session.add(budget)
+            session.flush()
+            version = session.get(AgentVersion, self.eligible_version.id)
+            version.default_budget_id = budget.id
+            session.add(
+                Policy(
+                    scope_type="agent",
+                    scope_id=self.ineligible_agent.id,
+                    decision="deny",
+                    rule={},
+                )
+            )
+            session.flush()
+            budget_id = budget.id
+
+        response = client.post(
+            f"/api/v1/goals/{self.goal.id}/planning-sessions",
+            json=self._preview_payload(),
+            headers=self._headers(self.owner),
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        by_version = {
+            item["agent_version_id"]: item for item in response.json()["candidates"]
+        }
+        self.assertIn(
+            f"budget_exhausted:{budget_id}",
+            by_version[str(self.eligible_version.id)]["rejection_reasons"],
+        )
+        self.assertIn(
+            f"agent_policy_deny:{self.ineligible_agent.id}",
+            by_version[str(self.ineligible_version.id)]["rejection_reasons"],
+        )
 
     def test_preview_evaluates_budget_and_tool_constraints(self) -> None:
         with SessionLocal.begin() as session:

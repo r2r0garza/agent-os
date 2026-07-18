@@ -6,23 +6,16 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agentic_os.api.authorization import current_actor, require_resource_access
 from agentic_os.api.deps import get_session
-from agentic_os.domain.assignment import match_capabilities
 from agentic_os.domain.models import (
     Agent,
     AgentVersion,
-    AgentVersionMcpServer,
-    Budget,
-    CostLedgerEntry,
     Goal,
     GoalPlanningSession,
-    McpServerTool,
-    ModelProfile,
-    ModelProfileVersion,
     PlanningAssignment,
     PlanningCandidate,
     PlanningCapabilityRequirement,
@@ -36,7 +29,11 @@ from agentic_os.domain.planning import (
     record_planning_override,
     update_planning_session,
 )
-from agentic_os.worker.policy import evaluate_policy
+from agentic_os.domain.team_selection import (
+    evaluate_planning_candidate,
+    latest_team_agent_versions,
+    rank_candidate_evaluations,
+)
 
 router = APIRouter(tags=["goal-planning"])
 
@@ -75,16 +72,14 @@ class AssignmentIn(BaseModel):
 
 
 class PlanningPreviewRequest(BaseModel):
-    requirements: list[RequirementIn]
-    candidates: list[CandidateIn]
+    requirements: list[RequirementIn] = Field(default_factory=list)
+    candidates: list[CandidateIn] = Field(default_factory=list)
     assignments: list[AssignmentIn] = Field(default_factory=list)
     constraints: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("requirements")
     @classmethod
     def _validate_requirements(cls, value: list[RequirementIn]) -> list[RequirementIn]:
-        if not value:
-            raise ValueError("requirements must not be empty")
         keys = [item.capability_key for item in value]
         if len(set(keys)) != len(keys):
             raise ValueError("duplicate requirement capability_key values")
@@ -93,8 +88,6 @@ class PlanningPreviewRequest(BaseModel):
     @field_validator("candidates")
     @classmethod
     def _validate_candidates(cls, value: list[CandidateIn]) -> list[CandidateIn]:
-        if not value:
-            raise ValueError("candidates must not be empty")
         ids = [item.agent_version_id for item in value]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate candidate agent_version_id values")
@@ -189,99 +182,126 @@ def _load_planning_session(
     return planning
 
 
-def _enabled_tool_names(session: Session, version: AgentVersion) -> set[str]:
-    rows = session.execute(
-        select(McpServerTool.tool_name)
-        .join(
-            AgentVersionMcpServer,
-            AgentVersionMcpServer.mcp_server_version_id == McpServerTool.mcp_server_version_id,
-        )
-        .where(
-            AgentVersionMcpServer.agent_version_id == version.id,
-            McpServerTool.enabled.is_(True),
-        )
-    ).scalars()
-    return set(rows)
-
-
-def _model_capability_metadata(session: Session, version: AgentVersion) -> dict[str, Any]:
-    if version.model_profile_version_id:
-        model_version = session.get(ModelProfileVersion, version.model_profile_version_id)
-        return dict(model_version.capability_metadata or {}) if model_version else {}
-    if version.model_profile_id:
-        model = session.get(ModelProfile, version.model_profile_id)
-        return dict(model.capability_metadata or {}) if model else {}
-    return {}
-
-
 def _evaluate_candidate(
     session: Session,
     *,
+    project: Project,
+    goal: Goal,
     agent: Agent,
     version: AgentVersion,
     required_capabilities: dict[str, bool],
     constraints: dict[str, Any],
 ) -> dict[str, Any]:
-    matched, missing = match_capabilities(required_capabilities, version.capability_manifest or {})
-    rejection_reasons = [f"missing_capability:{name}" for name in missing]
+    return evaluate_planning_candidate(
+        session,
+        project=project,
+        goal=goal,
+        agent=agent,
+        version=version,
+        required_capabilities=required_capabilities,
+        constraints=constraints,
+    )
 
-    agent_policy = evaluate_policy(session, scope_type="agent", scope_id=agent.id)
-    if agent_policy in {"deny", "approval_required"}:
-        rejection_reasons.append(f"agent_policy_{agent_policy}:{agent.id}")
 
-    budget = None
-    raw_budget_id = constraints.get("budget_id")
-    if raw_budget_id:
-        try:
-            budget = session.get(Budget, uuid.UUID(str(raw_budget_id)))
-        except (TypeError, ValueError):
-            budget = None
-        if budget is None:
-            rejection_reasons.append(f"budget_not_found:{raw_budget_id}")
-        elif budget.agent_id != agent.id:
-            rejection_reasons.append(f"budget_belongs_to_other_agent:{budget.id}")
-        elif budget.enforcement_mode == "hard_stop":
-            consumed = session.execute(
-                select(
-                    func.coalesce(
-                        func.sum(
-                            func.coalesce(
-                                CostLedgerEntry.actual_amount_minor_units,
-                                CostLedgerEntry.reserved_amount_minor_units,
-                            )
-                        ),
-                        0,
-                    )
-                ).where(CostLedgerEntry.budget_id == budget.id, CostLedgerEntry.status != "void")
-            ).scalar_one()
-            if consumed >= budget.amount_minor_units:
-                rejection_reasons.append(f"budget_exhausted:{budget.id}")
+def _planning_requirements(
+    session: Session,
+    *,
+    goal: Goal,
+    explicit: list[RequirementIn],
+) -> list[dict[str, Any]]:
+    if explicit:
+        return [item.model_dump() for item in explicit]
 
-    required_tools = set(constraints.get("required_tools") or [])
-    if required_tools:
-        enabled_tool_names = _enabled_tool_names(session, version)
-        for tool_name in sorted(required_tools):
-            if tool_name not in enabled_tool_names:
-                rejection_reasons.append(f"mcp_tool_disabled_or_missing:{tool_name}")
+    tasks = list(
+        session.execute(
+            select(Task)
+            .where(Task.goal_id == goal.id)
+            .order_by(Task.created_at, Task.id)
+        ).scalars()
+    )
+    task_ids_by_capability: dict[str, list[str]] = {}
+    for task in tasks:
+        for capability_key, required in sorted(
+            (task.required_capabilities or {}).items()
+        ):
+            if required:
+                task_ids_by_capability.setdefault(capability_key, []).append(
+                    str(task.id)
+                )
+    return [
+        {
+            "capability_key": capability_key,
+            "required": True,
+            "rationale": "Derived from persisted goal task requirements",
+            "source_evidence": {
+                "source": "goal_tasks",
+                "task_ids": task_ids,
+            },
+        }
+        for capability_key, task_ids in sorted(task_ids_by_capability.items())
+    ]
 
-    required_model_capabilities = set(constraints.get("required_model_capabilities") or [])
-    if required_model_capabilities:
-        model_capability_metadata = _model_capability_metadata(session, version)
-        for capability_name in sorted(required_model_capabilities):
-            if not model_capability_metadata.get(capability_name):
-                rejection_reasons.append(f"model_incompatible:{capability_name}")
 
-    return {
-        "agent_version_id": version.id,
-        "eligible": not rejection_reasons,
-        "matched_capabilities": matched,
-        "missing_capabilities": missing,
-        "rejection_reasons": rejection_reasons,
-        "evidence": {
-            "policy_decision": agent_policy,
-            "budget_id": str(budget.id) if budget else None,
-        },
-    }
+def _planning_assignments(
+    session: Session,
+    *,
+    goal: Goal,
+    explicit: list[AssignmentIn],
+) -> list[AssignmentIn]:
+    if explicit:
+        return explicit
+    tasks = list(
+        session.execute(
+            select(Task)
+            .where(Task.goal_id == goal.id)
+            .order_by(Task.created_at, Task.id)
+        ).scalars()
+    )
+    assignments: list[AssignmentIn] = []
+    for task in tasks:
+        required = sorted(
+            name
+            for name, value in (task.required_capabilities or {}).items()
+            if value
+        )
+        if not required:
+            continue
+        assignments.append(
+            AssignmentIn(
+                assignment_key=str(task.id),
+                capability_key=required[0],
+                rationale=(
+                    "Automatically formed from persisted task requirements; "
+                    f"requires {', '.join(required)}"
+                ),
+            )
+        )
+    return assignments
+
+
+def _assignment_requirements(
+    session: Session,
+    *,
+    goal: Goal,
+    assignment: AssignmentIn,
+    planning_requirements: dict[str, bool],
+) -> dict[str, bool]:
+    try:
+        task_id = uuid.UUID(assignment.assignment_key)
+    except ValueError:
+        task_id = None
+    task = session.get(Task, task_id) if task_id else None
+    if task is not None and task.goal_id == goal.id:
+        task_requirements = {
+            name: bool(value)
+            for name, value in (task.required_capabilities or {}).items()
+            if value
+        }
+        if task_requirements:
+            return task_requirements
+    if assignment.capability_key:
+        return {assignment.capability_key: True}
+    return planning_requirements
 
 
 @router.post(
@@ -296,38 +316,127 @@ def preview_goal_plan(
     actor: User = Depends(current_actor),
 ) -> dict[str, Any]:
     goal = _load_goal(session, goal_id)
-    project = require_resource_access(session, actor, goal, action="goal.planning.preview", resource_type="goal")
+    project = require_resource_access(
+        session,
+        actor,
+        goal,
+        action="goal.planning.preview",
+        resource_type="goal",
+    )
 
-    required_capabilities = {item.capability_key: item.required for item in payload.requirements}
+    requirements_payload = _planning_requirements(
+        session,
+        goal=goal,
+        explicit=payload.requirements,
+    )
+    if not requirements_payload:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "planning requires explicit capability requirements or persisted "
+                "goal tasks with required capabilities"
+            ),
+        )
+    required_capabilities = {
+        item["capability_key"]: item.get("required", True)
+        for item in requirements_payload
+    }
     requirement_keys = set(required_capabilities)
-
-    candidates_payload: list[dict[str, Any]] = []
-    candidate_eligibility: dict[uuid.UUID, dict[str, Any]] = {}
-    for candidate_in in payload.candidates:
-        version = session.get(AgentVersion, candidate_in.agent_version_id)
-        agent = session.get(Agent, version.agent_id) if version is not None else None
-        if version is None or agent is None:
-            raise HTTPException(
-                status_code=422,
-                detail=f"agent version {candidate_in.agent_version_id} does not exist",
-            )
-        if agent.team_id != project.team_id:
-            raise HTTPException(
-                status_code=422,
-                detail=f"agent version {candidate_in.agent_version_id} is outside goal project team",
-            )
-        evaluation = _evaluate_candidate(
+    assignment_inputs = _planning_assignments(
+        session,
+        goal=goal,
+        explicit=payload.assignments,
+    )
+    requirements_by_assignment = {
+        item.assignment_key: _assignment_requirements(
             session,
+            goal=goal,
+            assignment=item,
+            planning_requirements=required_capabilities,
+        )
+        for item in assignment_inputs
+    }
+
+    candidate_rows: list[tuple[Agent, AgentVersion]] = []
+    if payload.candidates:
+        for candidate_in in payload.candidates:
+            version = session.get(AgentVersion, candidate_in.agent_version_id)
+            agent = session.get(Agent, version.agent_id) if version is not None else None
+            if version is None or agent is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"agent version {candidate_in.agent_version_id} does not exist",
+                )
+            if agent.team_id != project.team_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"agent version {candidate_in.agent_version_id} is outside "
+                        "goal project team"
+                    ),
+                )
+            candidate_rows.append((agent, version))
+    else:
+        candidate_rows = latest_team_agent_versions(session, project.team_id)
+
+    candidate_assignment_evaluations: dict[
+        uuid.UUID, dict[str, dict[str, Any]]
+    ] = {}
+    candidates_payload: list[dict[str, Any]] = []
+    for agent, version in candidate_rows:
+        global_evaluation = _evaluate_candidate(
+            session,
+            project=project,
+            goal=goal,
             agent=agent,
             version=version,
             required_capabilities=required_capabilities,
             constraints=payload.constraints,
         )
-        candidate_eligibility[version.id] = evaluation
-        candidates_payload.append(evaluation)
+        assignment_evaluations = {
+            assignment_key: _evaluate_candidate(
+                session,
+                project=project,
+                goal=goal,
+                agent=agent,
+                version=version,
+                required_capabilities=assignment_requirements,
+                constraints=payload.constraints,
+            )
+            for assignment_key, assignment_requirements in requirements_by_assignment.items()
+        }
+        candidate_assignment_evaluations[version.id] = assignment_evaluations
+        if assignment_evaluations:
+            global_evaluation["eligible"] = any(
+                item["eligible"] for item in assignment_evaluations.values()
+            )
+            if global_evaluation["eligible"]:
+                global_evaluation["rejection_reasons"] = []
+            else:
+                global_evaluation["rejection_reasons"] = list(
+                    dict.fromkeys(
+                        reason
+                        for item in assignment_evaluations.values()
+                        for reason in item["rejection_reasons"]
+                    )
+                )
+            global_evaluation["evidence"]["assignment_evaluations"] = {
+                assignment_key: {
+                    "eligible": item["eligible"],
+                    "matched_capabilities": item["matched_capabilities"],
+                    "missing_capabilities": item["missing_capabilities"],
+                    "rejection_reasons": item["rejection_reasons"],
+                }
+                for assignment_key, item in assignment_evaluations.items()
+            }
+        candidates_payload.append(global_evaluation)
+    candidates_payload = rank_candidate_evaluations(candidates_payload)
+    candidate_eligibility: dict[uuid.UUID, dict[str, Any]] = {}
+    for evaluation in candidates_payload:
+        candidate_eligibility[evaluation["agent_version_id"]] = evaluation
 
     assignments_payload: list[dict[str, Any]] = []
-    for assignment_in in payload.assignments:
+    for assignment_in in assignment_inputs:
         if assignment_in.capability_key is not None and assignment_in.capability_key not in requirement_keys:
             raise HTTPException(
                 status_code=422,
@@ -338,16 +447,35 @@ def preview_goal_plan(
             )
         validation_status = "pending"
         validation_evidence: dict[str, Any] = {}
-        if assignment_in.agent_version_id is not None:
-            evaluation = candidate_eligibility.get(assignment_in.agent_version_id)
-            if evaluation is None:
+        selected_version_id = assignment_in.agent_version_id
+        selected_evaluation = next(
+            (
+                item
+                for item in candidates_payload
+                if candidate_assignment_evaluations[item["agent_version_id"]][
+                    assignment_in.assignment_key
+                ]["eligible"]
+            ),
+            None,
+        )
+        automatically_selected = (
+            selected_version_id is None and selected_evaluation is not None
+        )
+        if automatically_selected:
+            selected_version_id = selected_evaluation["agent_version_id"]
+        if selected_version_id is not None:
+            candidate = candidate_eligibility.get(selected_version_id)
+            if candidate is None:
                 raise HTTPException(
                     status_code=422,
                     detail=(
                         f"assignment {assignment_in.assignment_key!r} selects agent version "
-                        f"{assignment_in.agent_version_id} which is not among the submitted candidates"
+                        f"{selected_version_id} which is not among the submitted candidates"
                     ),
                 )
+            evaluation = candidate_assignment_evaluations[selected_version_id][
+                assignment_in.assignment_key
+            ]
             validation_evidence = {
                 "matched_capabilities": evaluation["matched_capabilities"],
                 "missing_capabilities": evaluation["missing_capabilities"],
@@ -358,7 +486,7 @@ def preview_goal_plan(
                     status_code=422,
                     detail=(
                         f"assignment {assignment_in.assignment_key!r} selects ineligible candidate "
-                        f"{assignment_in.agent_version_id}: {evaluation['rejection_reasons']}"
+                        f"{selected_version_id}: {evaluation['rejection_reasons']}"
                     ),
                 )
             validation_status = "valid"
@@ -366,8 +494,18 @@ def preview_goal_plan(
             {
                 "assignment_key": assignment_in.assignment_key,
                 "capability_key": assignment_in.capability_key,
-                "agent_version_id": assignment_in.agent_version_id,
-                "rationale": assignment_in.rationale,
+                "agent_version_id": selected_version_id,
+                "rationale": (
+                    (
+                        f"{assignment_in.rationale}; " if assignment_in.rationale else ""
+                    )
+                    + (
+                        "selected deterministically by capability coverage and "
+                        "governance eligibility"
+                        if automatically_selected
+                        else ""
+                    )
+                ).strip("; "),
                 "validation_status": validation_status,
                 "validation_evidence": validation_evidence,
             }
@@ -381,7 +519,7 @@ def preview_goal_plan(
             session,
             goal_id=goal.id,
             actor_id=actor.id,
-            requirements=[item.model_dump() for item in payload.requirements],
+            requirements=requirements_payload,
             candidates=candidates_payload,
             assignments=assignments_payload,
             constraints=payload.constraints,
@@ -444,7 +582,13 @@ def override_goal_plan_assignment(
     actor: User = Depends(current_actor),
 ) -> dict[str, Any]:
     goal = _load_goal(session, goal_id)
-    require_resource_access(session, actor, goal, action="goal.planning.override", resource_type="goal")
+    project = require_resource_access(
+        session,
+        actor,
+        goal,
+        action="goal.planning.override",
+        resource_type="goal",
+    )
     planning = _load_planning_session(session, goal_id, planning_session_id)
     if planning.status in TERMINAL_PLANNING_STATUSES:
         raise HTTPException(
@@ -466,16 +610,43 @@ def override_goal_plan_assignment(
     version = session.get(AgentVersion, payload.agent_version_id)
     agent = session.get(Agent, version.agent_id) if version is not None else None
     if version is None or agent is None:
-        raise HTTPException(status_code=422, detail=f"agent version {payload.agent_version_id} does not exist")
-
-    requirements = session.execute(
-        select(PlanningCapabilityRequirement).where(
-            PlanningCapabilityRequirement.planning_session_id == planning.id
+        raise HTTPException(
+            status_code=422,
+            detail=f"agent version {payload.agent_version_id} does not exist",
         )
-    ).scalars()
-    required_capabilities = {item.capability_key: item.required for item in requirements}
+
+    assignment = session.execute(
+        select(PlanningAssignment).where(
+            PlanningAssignment.planning_session_id == planning.id,
+            PlanningAssignment.assignment_key == payload.assignment_key,
+        )
+    ).scalar_one_or_none()
+    if assignment is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"planning assignment {payload.assignment_key!r} does not exist",
+        )
+    requirement = (
+        session.get(PlanningCapabilityRequirement, assignment.requirement_id)
+        if assignment.requirement_id
+        else None
+    )
+    required_capabilities = (
+        {requirement.capability_key: requirement.required}
+        if requirement is not None
+        else {
+            item.capability_key: item.required
+            for item in session.execute(
+                select(PlanningCapabilityRequirement).where(
+                    PlanningCapabilityRequirement.planning_session_id == planning.id
+                )
+            ).scalars()
+        }
+    )
     evaluation = _evaluate_candidate(
         session,
+        project=project,
+        goal=goal,
         agent=agent,
         version=version,
         required_capabilities=required_capabilities,
