@@ -31,7 +31,10 @@ export interface ModelProfileProbe {
   // A capability's evidence can arrive as a bare redacted string (e.g.
   // "[REDACTED]") instead of the usual {status, diagnostic} shape when its
   // key name matches the backend's generic secret-redaction heuristic.
-  capability_evidence: Record<string, { status: string; diagnostic: string } | string>
+  capability_evidence: Record<
+    string,
+    { status: string; diagnostic: string } | string
+  >
   pricing_evidence: {
     status: string
     metered: boolean
@@ -146,6 +149,67 @@ export interface Goal {
   active_graph_revision_number: number
   created_at: string
   updated_at: string
+}
+
+export interface PlanningRequirement {
+  id: Identifier
+  capability_key: string
+  required: boolean
+  rationale: string | null
+  source_evidence: Record<string, unknown>
+}
+
+export interface PlanningCandidate {
+  id: Identifier
+  agent_id: Identifier
+  agent_version_id: Identifier
+  eligible: boolean
+  matched_capabilities: string[]
+  missing_capabilities: string[]
+  rejection_reasons: string[]
+  evidence: Record<string, unknown>
+  constraints_snapshot: Record<string, unknown>
+}
+
+export interface PlanningAssignment {
+  id: Identifier
+  assignment_key: string
+  requirement_id: Identifier | null
+  candidate_id: Identifier | null
+  selected_by: Identifier | null
+  rationale: string | null
+  validation_status: string
+  validation_evidence: Record<string, unknown>
+}
+
+export interface PlanningOverride {
+  id: Identifier
+  assignment_id: Identifier
+  actor_id: Identifier | null
+  requested_candidate_id: Identifier | null
+  reason: string | null
+  prior_candidate_evidence: Record<string, unknown>
+  validation_status: string
+  validation_evidence: Record<string, unknown>
+}
+
+export interface GoalPlanningSession {
+  id: Identifier
+  goal_id: Identifier
+  revision_number: number
+  status: string
+  validation_status: string
+  constraints_snapshot: Record<string, unknown>
+  requirements: PlanningRequirement[]
+  candidates: PlanningCandidate[]
+  assignments: PlanningAssignment[]
+  overrides: PlanningOverride[]
+}
+
+export interface GoalPlanningAcceptance extends GoalPlanningSession {
+  materialized_tasks: Array<{ task_id: Identifier; assignment_key: string }>
+  graph_revision_id: Identifier | null
+  graph_revision_number: number | null
 }
 
 export interface GoalLifecycleCommand {
@@ -853,7 +917,14 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     let message = `Request failed (${response.status})`
     try {
       const body = (await response.json()) as {
-        detail?: string | { code?: string; diagnostics?: Array<{ code?: string }> }
+        detail?:
+          | string
+          | {
+              code?: string
+              message?: string
+              diagnostics?: Array<{ code?: string }>
+              rejection_reasons?: string[]
+            }
         error?: string
       }
       if (typeof body.detail === "string") {
@@ -863,7 +934,16 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
           ?.map((item) => item.code)
           .filter(Boolean)
           .join(", ")
-        message = [body.detail.code, diagnostics].filter(Boolean).join(": ") || message
+        const rejectionReasons = body.detail.rejection_reasons
+          ?.map((item) => item.replaceAll("_", " "))
+          .join(", ")
+        message =
+          [
+            body.detail.message ?? body.detail.code,
+            rejectionReasons ?? diagnostics,
+          ]
+            .filter(Boolean)
+            .join(": ") || message
       } else {
         message = body.error ?? message
       }

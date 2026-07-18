@@ -44,6 +44,7 @@ import { ArtifactWorkspace } from "@/components/artifact-workspace"
 import { ConcurrentWorkspacePanel } from "@/components/concurrent-workspace-panel"
 import { CapabilityLifecycleWorkspace } from "@/components/capability-lifecycle-workspace"
 import { GoalLifecyclePanel } from "@/components/goal-lifecycle-panel"
+import { GoalPlanningPanel } from "@/components/goal-planning-panel"
 import { GovernanceOperations } from "@/components/governance-operations"
 import {
   GovernanceLookups,
@@ -708,6 +709,16 @@ export function OperatorWorkspace() {
             )}
           </CardContent>
         </Card>
+
+        <GoalPlanningPanel
+          goalId={selectedGoalId}
+          tasks={tasks}
+          agents={inventory.agents}
+          onAccepted={async () => {
+            await loadProjectState(selectedProjectId)
+            if (selectedGoalId) await loadGoalState(selectedGoalId)
+          }}
+        />
 
         <ConcurrentWorkspacePanel
           projectId={selectedProjectId}
