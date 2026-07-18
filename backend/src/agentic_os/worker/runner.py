@@ -19,10 +19,12 @@ from agentic_os.domain.models import (
     Artifact,
     AuditEvent,
     Goal,
+    PlanTaskContextPackage,
     Project,
     Run,
     Task,
 )
+from agentic_os.domain.plan_execution import refresh_plan_execution_progress
 from agentic_os.observability import CorrelationContext, record_observability
 from agentic_os.worker.approvals import ensure_action_approvals
 from agentic_os.worker.configuration import ConfigurationSnapshotError, resolve_run_configuration
@@ -51,6 +53,25 @@ from agentic_os.worker.workspace import promote_workspace_changes
 
 class TaskExecutionError(RuntimeError):
     """Raised when a claimed task cannot be executed to completion."""
+
+
+def _refresh_plan_execution_for_task(session: Session, task: Task) -> None:
+    """Recompute the accepted plan's durable progress after a dispatch
+    decision changes this task's status, so ``GoalPlanExecution`` reflects
+    live execution rather than only the value last computed when an
+    operator happened to poll the plan-execution endpoint.
+
+    Most tasks are not part of an accepted capability-aware plan (e.g. the
+    older direct task-graph flow), so this is a no-op unless a
+    ``PlanTaskContextPackage`` links the task to one.
+    """
+    plan_execution_id = session.execute(
+        select(PlanTaskContextPackage.plan_execution_id).where(
+            PlanTaskContextPackage.task_id == task.id
+        )
+    ).scalar_one_or_none()
+    if plan_execution_id is not None:
+        refresh_plan_execution_progress(session, plan_execution_id)
 
 
 def run_task_worker_once(
@@ -86,6 +107,7 @@ def run_task_worker_once(
     task = claim_ready_task(session, worker_id, lease_seconds=lease_seconds)
     if task is None:
         return None
+    _refresh_plan_execution_for_task(session, task)
 
     goal = session.get(Goal, task.goal_id)
     project_id = goal.project_id if goal is not None else None
@@ -101,6 +123,7 @@ def run_task_worker_once(
                 project_id=project_id,
                 decision=decision,
             )
+            _refresh_plan_execution_for_task(session, task)
             return task
 
     _fail_interrupted_previous_attempt(session, task, project_id=project_id)
@@ -148,7 +171,9 @@ def run_task_worker_once(
         )
         release_lease(session, task, worker_id, status="failed")
         session.flush()
+        _refresh_plan_execution_for_task(session, task)
         raise
+    _refresh_plan_execution_for_task(session, task)
     return task
 
 
